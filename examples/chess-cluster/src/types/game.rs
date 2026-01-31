@@ -370,7 +370,6 @@ impl GameState {
     #[must_use]
     pub fn turn(&self) -> Color {
         // In a standard game, white moves on even indices, black on odd
-        #[allow(clippy::manual_is_multiple_of)]
         if self.moves.len() % 2 == 0 {
             Color::White
         } else {

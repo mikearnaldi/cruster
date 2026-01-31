@@ -1,8 +1,6 @@
 //! # Chess Cluster
 //!
 //! A distributed chess server demonstrating all features of `cruster`.
-
-#![allow(unknown_lints)]
 //!
 //! ## Features
 //!

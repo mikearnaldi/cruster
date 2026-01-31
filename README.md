@@ -4,6 +4,8 @@ A Rust framework for building distributed, stateful entity systems with durable 
 
 Cruster provides a distributed actor/entity model with consistent-hashing-based shard assignment, persistent messaging, singleton management, durable workflows, and cron scheduling.
 
+> **Project Status:** This project is under active development and **not yet ready for production use**. The API may change without notice. It is currently being developed alongside an internal project. Feedback and contributions are welcome, but please be aware of the experimental nature of this library.
+
 ## Features
 
 - **Entity System** - Define stateful actors with automatic persistence and lifecycle management

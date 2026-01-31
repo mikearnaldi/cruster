@@ -5,10 +5,10 @@
 //! - Activities replay correctly (not re-executed)
 //! - Activity state mutations are transactional
 
+use chrono::{DateTime, Utc};
 use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Record of a single activity.

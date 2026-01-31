@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use clap::Parser;
 use cruster::config::ShardingConfig;
 use cruster::metrics::ClusterMetrics;
 use cruster::sharding::Sharding;
@@ -25,7 +26,6 @@ use cruster::storage::sql_workflow::SqlWorkflowStorage;
 use cruster::storage::sql_workflow_engine::SqlWorkflowEngine;
 use cruster::transport::grpc::{GrpcRunnerHealth, GrpcRunnerServer, GrpcRunners};
 use cruster::types::RunnerAddress;
-use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 

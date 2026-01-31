@@ -6,10 +6,10 @@
 //! - Multiple traits compose correctly
 //! - Trait state persists alongside entity state
 
+use chrono::{DateTime, Utc};
 use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // ================== Auditable Trait ==================

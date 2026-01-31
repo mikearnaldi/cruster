@@ -1,7 +1,5 @@
 //! HTTP API route handlers for cluster tests.
 
-use cruster::sharding::Sharding;
-use cruster::types::EntityId;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -9,6 +7,8 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use cruster::sharding::Sharding;
+use cruster::types::EntityId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

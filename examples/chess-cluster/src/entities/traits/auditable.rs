@@ -28,9 +28,9 @@
 
 use std::collections::VecDeque;
 
+use chrono::{DateTime, Utc};
 use cruster::error::ClusterError;
 use cruster::prelude::*;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 

@@ -5,10 +5,10 @@
 //! - Circular calls handled (A -> B -> A)
 //! - Cross-shard communication works
 
+use chrono::{DateTime, Utc};
 use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// A message received from another entity.

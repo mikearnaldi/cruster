@@ -6,10 +6,10 @@
 //! The entity uses the `Auditable` trait for comprehensive audit logging of all
 //! game actions.
 
+use chrono::{Duration as ChronoDuration, Utc};
 use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
-use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::chess::engine::{ChessError, ChessPosition};

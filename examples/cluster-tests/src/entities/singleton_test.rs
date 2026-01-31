@@ -18,10 +18,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use cruster::error::ClusterError;
 use cruster::sharding::Sharding;
 use cruster::singleton::register_singleton;
-use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;

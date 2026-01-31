@@ -7,10 +7,10 @@
 //! Note: In a production system, the queue state would be distributed across nodes.
 //! For this demo, we use a simple in-memory queue per entity instance.
 
+use chrono::{DateTime, Utc};
 use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::game::{GameId, TimeControl};

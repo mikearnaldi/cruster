@@ -96,9 +96,7 @@ pub mod prelude {
     pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
 
     // Helper attribute macros (for IDE autocomplete and documentation)
-    pub use cruster_macros::{
-        activity, private, protected, public, rpc, state, workflow,
-    };
+    pub use cruster_macros::{activity, private, protected, public, rpc, state, workflow};
 
     // Common types
     pub use crate::entity::{Entity, EntityContext, EntityHandler};

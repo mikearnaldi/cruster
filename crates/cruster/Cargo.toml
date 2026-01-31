@@ -3,6 +3,13 @@ name = "cruster"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "A Rust framework for building distributed, stateful entity systems with durable workflows"
+readme = "../../README.md"
 
 [dependencies]
 # Async
@@ -43,7 +50,7 @@ cron = "0.13"
 tracing = { workspace = true }
 
 # Macros
-cruster-macros = { path = "../cruster-macros" }
+cruster-macros = { path = "../cruster-macros", version = "0.1.0" }
 
 # SQL storage (optional)
 sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "chrono"], optional = true }

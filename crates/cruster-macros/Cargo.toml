@@ -3,6 +3,13 @@ name = "cruster-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Procedural macros for the cruster distributed entity framework"
+readme = "../../README.md"
 
 [lib]
 proc-macro = true

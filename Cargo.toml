@@ -11,6 +11,11 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+authors = ["Michael Arnaldi <michael.arnaldi@effectful.co>"]
+repository = "https://github.com/mikearnaldi/cruster"
+homepage = "https://github.com/mikearnaldi/cruster"
+keywords = ["distributed", "actor", "cluster", "workflow", "durable"]
+categories = ["asynchronous", "network-programming"]
 
 [workspace.dependencies]
 # Async runtime

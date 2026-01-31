@@ -9,3 +9,4 @@ Cargo.lock
 node_modules/
 .direnv/
 .opencode/
+.claude/

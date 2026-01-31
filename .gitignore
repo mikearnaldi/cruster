@@ -6,3 +6,5 @@ Cargo.lock
 *.swp
 *.swo
 .DS_Store
+node_modules/
+.direnv/

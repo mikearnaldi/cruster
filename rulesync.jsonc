@@ -1,0 +1,7 @@
+{
+  "$schema": "https://raw.githubusercontent.com/dyoshikawa/rulesync/refs/heads/main/config-schema.json",
+  // Generate rules for Claude Code
+  "targets": ["claudecode", "opencode"],
+  // Features to generate
+  "features": ["rules"]
+}

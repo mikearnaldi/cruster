@@ -23,7 +23,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86"
+          toolchain: "1.93"
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -45,7 +45,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86"
+          toolchain: "1.93"
           components: clippy
       
       - name: Cache Rust dependencies
@@ -65,7 +65,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86"
+          toolchain: "1.93"
           components: rustfmt
       
       - name: Check formatting
@@ -83,7 +83,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86"
+          toolchain: "1.93"
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -105,7 +105,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86"
+          toolchain: "1.93"
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

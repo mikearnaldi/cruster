@@ -2,8 +2,13 @@ error[E0277]: the trait bound `BadState: serde::Deserialize<'de>` is not satisfi
   --> tests/ui/persisted_state_requires_serde.rs:13:1
    |
 13 | #[entity_impl]
-   | ^^^^^^^^^^^^^^ the trait `Deserialize<'_>` is not implemented for `BadState`
+   | ^^^^^^^^^^^^^^ unsatisfied trait bound
    |
+help: the trait `Deserialize<'_>` is not implemented for `BadState`
+  --> tests/ui/persisted_state_requires_serde.rs:5:1
+   |
+ 5 | struct BadState {
+   | ^^^^^^^^^^^^^^^
    = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `BadState` type
    = note: for types from other crates check whether the crate offers a `serde` feature flag
    = help: the following other types implement trait `Deserialize<'de>`:

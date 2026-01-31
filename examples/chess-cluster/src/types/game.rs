@@ -370,7 +370,7 @@ impl GameState {
     #[must_use]
     pub fn turn(&self) -> Color {
         // In a standard game, white moves on even indices, black on odd
-        if self.moves.len() % 2 == 0 {
+        if self.moves.len().is_multiple_of(2) {
             Color::White
         } else {
             Color::Black

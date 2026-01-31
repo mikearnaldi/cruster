@@ -17,6 +17,23 @@ Cruster provides a distributed actor/entity model with consistent-hashing-based 
 
 ## Installation
 
+### Prerequisites
+
+Cruster requires the Protocol Buffers compiler (`protoc`) to be installed for building gRPC support:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install protobuf-compiler
+
+# macOS
+brew install protobuf
+
+# Windows (with Chocolatey)
+choco install protoc
+```
+
+### Cargo
+
 Add to your `Cargo.toml`:
 
 ```toml

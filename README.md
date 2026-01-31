@@ -50,8 +50,6 @@ cruster-macros = "0.1"
 
 ```rust
 use cruster::prelude::*;
-use cruster::entity::EntityContext;
-use cruster::error::ClusterError;
 use serde::{Deserialize, Serialize};
 
 // Define the entity's state

@@ -27,8 +27,6 @@ globs: ["crates/**/*.rs"]
 
 ```rust
 use cruster::prelude::*;
-use cruster::entity::EntityContext;
-use cruster::error::ClusterError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -90,11 +88,9 @@ impl MyEntity { ... }
 
 ### Error Handling
 
-Use `ClusterError` for entity errors:
+Use `ClusterError` for entity errors (already in prelude):
 
 ```rust
-use cruster::error::ClusterError;
-
 #[rpc]
 async fn validate(&self, input: String) -> Result<(), ClusterError> {
     if input.is_empty() {

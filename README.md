@@ -363,28 +363,47 @@ async fn test_counter() {
 
 ### cluster-tests
 
-E2E test suite demonstrating all features:
+E2E test suite demonstrating all features. Requires PostgreSQL and etcd:
 
 ```bash
+# Start infrastructure (Postgres and etcd)
+docker run -d --name postgres -p 5432:5432 \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=cluster \
+  postgres:16
+
+docker run -d --name etcd -p 2379:2379 \
+  quay.io/coreos/etcd:v3.5.9 \
+  /usr/local/bin/etcd \
+  --advertise-client-urls http://0.0.0.0:2379 \
+  --listen-client-urls http://0.0.0.0:2379
+
+# Run the test runner
 cd examples/cluster-tests
+POSTGRES_URL=postgres://postgres:postgres@localhost/cluster \
+ETCD_ENDPOINTS=localhost:2379 \
+RUNNER_ADDRESS=localhost:9000 \
 cargo run
-# In another terminal:
+
+# In another terminal, run the bash tests:
 ./tests/e2e.sh
 ```
 
 ### chess-cluster
 
-Distributed chess server with:
-- Player sessions
-- Game state persistence
-- Matchmaking
+Distributed chess server demonstrating:
+- Player sessions (in-memory state)
+- Game state persistence (workflows)
+- Matchmaking service (stateless entity)
 - Leaderboard singleton
-- Move timeouts
+- Move timeouts (scheduled messages)
+- Auditable trait composition
+
+**Note:** The HTTP API layer (M3) is not yet implemented. Currently only the entity layer is complete and can be tested via `TestCluster`:
 
 ```bash
 cd examples/chess-cluster
-docker-compose up -d  # Start Postgres
-cargo run
+cargo test
 ```
 
 ## Architecture

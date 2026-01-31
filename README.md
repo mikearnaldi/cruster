@@ -201,16 +201,28 @@ impl MyEntity {
 Singletons are cluster-wide unique instances. Only one instance runs at a time, with automatic failover if the hosting node fails.
 
 ```rust
-// Register a singleton
-sharding.register_singleton("leaderboard", Arc::new(|| {
-    Box::pin(async {
-        // Singleton logic runs on exactly one node
-        loop {
-            // Process leaderboard updates...
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    })
-})).await?;
+use cruster::singleton::singleton;
+
+// Register a singleton using the builder API
+singleton("leaderboard", || async {
+    // Singleton logic runs on exactly one node
+    loop {
+        // Process leaderboard updates...
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+})
+.register(&*sharding)
+.await?;
+
+// Or use the direct function
+use cruster::singleton::register_singleton;
+
+register_singleton(&*sharding, "metrics-collector", || async {
+    loop {
+        collect_metrics().await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}).await?;
 ```
 
 ### Deferreds (Async Coordination)

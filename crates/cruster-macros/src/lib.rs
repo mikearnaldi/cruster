@@ -924,6 +924,7 @@ struct RpcMethod {
     params: Vec<RpcParam>,
     response_type: syn::Type,
     is_mut: bool,
+    #[allow(dead_code)]
     is_async: bool,
     kind: RpcKind,
     visibility: RpcVisibility,
@@ -1301,7 +1302,7 @@ fn entity_trait_impl_inner(
     {
         let method_name = &method.sig.ident;
         let rpc_info = rpcs.iter().find(|r| r.name == *method_name);
-        let is_activity = rpc_info.map_or(false, |r| matches!(r.kind, RpcKind::Activity));
+        let is_activity = rpc_info.is_some_and(|r| matches!(r.kind, RpcKind::Activity));
 
         let block = &method.block;
         let output = &method.sig.output;

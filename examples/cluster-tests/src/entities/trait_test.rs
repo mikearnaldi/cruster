@@ -81,6 +81,7 @@ impl Auditable {
     }
 
     /// Clear the audit log.
+    #[allow(dead_code)]
     #[activity]
     #[protected]
     pub async fn clear_audit_log(&mut self) -> Result<(), ClusterError> {

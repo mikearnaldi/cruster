@@ -227,21 +227,30 @@ register_singleton(&*sharding, "metrics-collector", || async {
 
 ### Deferreds (Async Coordination)
 
-Deferreds allow workflows to wait for external events:
+Deferreds allow workflows to wait for signals from other parts of the system:
 
 ```rust
-#[workflow]
-async fn wait_for_approval(&mut self, request_id: String) -> Result<bool, ClusterError> {
-    let deferred = Deferred::<bool>::new(format!("approval/{}", request_id));
-    
-    // This suspends the workflow until resolved
-    let approved = self.await_deferred(deferred).await?;
-    
-    Ok(approved)
-}
+#[entity_impl]
+#[state(ApprovalState)]
+impl ApprovalWorkflow {
+    #[workflow]
+    async fn wait_for_approval(&mut self, request_id: String) -> Result<bool, ClusterError> {
+        let signal_name = format!("approval/{}", request_id);
+        
+        // This suspends the workflow until resolved
+        let approved: bool = self.await_deferred(&signal_name).await?;
+        
+        Ok(approved)
+    }
 
-// From another entity or external system:
-workflow_engine.resolve_deferred(deferred_token, true).await?;
+    // Called by another workflow or RPC to resolve the deferred
+    #[activity]
+    async fn approve_request(&mut self, request_id: String) -> Result<(), ClusterError> {
+        let signal_name = format!("approval/{}", request_id);
+        self.resolve_deferred(&signal_name, &true).await?;
+        Ok(())
+    }
+}
 ```
 
 ### Timers and Sleep

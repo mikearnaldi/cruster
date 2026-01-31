@@ -65,7 +65,7 @@ pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```text
 /// use cruster::prelude::*;
 ///
 /// #[entity]

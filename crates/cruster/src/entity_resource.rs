@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```text
 /// let resource = EntityResource::new(MyConnection::new().await?);
 /// // Use the resource
 /// let conn = resource.read().await;

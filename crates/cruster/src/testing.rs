@@ -24,7 +24,7 @@ use crate::storage::noop_runners::NoopRunners;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let cluster = TestCluster::new().await;
 /// let client = cluster.register(MyEntity).await.unwrap();
 /// let response: String = client.send(&EntityId::new("e-1"), "greet", &"hello").await.unwrap();

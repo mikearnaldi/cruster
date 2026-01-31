@@ -53,7 +53,7 @@ struct ActiveTransaction {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// #[activity]
 /// async fn increment(&mut self, amount: i32) -> Result<i32, ClusterError> {
 ///     // State mutations inside activities are automatically transactional
@@ -182,7 +182,7 @@ impl ActivityScope {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// #[activity]
 /// async fn increment(&mut self, amount: i32) -> Result<i32, ClusterError> {
 ///     self.state.count += amount;
@@ -356,7 +356,7 @@ where
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// #[activity]
 /// #[protected]
 /// async fn increment(&mut self, amount: i32) -> Result<i32, ClusterError> {

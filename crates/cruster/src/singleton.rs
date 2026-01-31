@@ -21,7 +21,7 @@ use std::sync::Arc;
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use cruster::singleton::register_singleton;
 ///
 /// register_singleton(&*sharding, "leader-election", || async {
@@ -78,7 +78,7 @@ where
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use cruster::singleton::singleton;
 ///
 /// singleton("metrics-aggregator", || async {

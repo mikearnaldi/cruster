@@ -421,7 +421,7 @@ pub trait WorkflowEngine: Send + Sync {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// use std::sync::Arc;
 /// use cruster::testing::TestCluster;
 ///

@@ -1,30 +1,9 @@
 //! Auditable entity trait - shared audit logging capability for entities.
 //!
 //! This trait provides a composable audit logging capability that can be
-//! added to entities that need audit trails. When an entity uses this trait,
-//! it gains audit logging methods that can be called directly on `self`.
-//!
-//! # Example
-//!
-//! ```ignore
-//! #[entity_impl(traits(Auditable))]
-//! #[state(MyEntityState)]
-//! impl MyEntity {
-//!     #[workflow]
-//!     async fn do_something(&self) -> Result<(), ClusterError> {
-//!         // ... do something ...
-//!         
-//!         // Log the action via the Auditable trait
-//!         self.log_player_action(LogPlayerActionRequest {
-//!             action: "did_something".to_string(),
-//!             actor: player_id,
-//!             details: json!({"key": "value"}),
-//!         }).await?;
-//!         
-//!         Ok(())
-//!     }
-//! }
-//! ```
+//! added to entities that need audit trails. When an entity uses this trait
+//! via `#[entity_impl(traits(Auditable))]`, it gains audit logging methods
+//! like `log_player_action` that can be called directly on `self`.
 
 use std::collections::VecDeque;
 

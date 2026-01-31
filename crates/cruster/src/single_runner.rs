@@ -8,7 +8,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```text
 //! let pool = PgPool::connect("postgres://localhost/cluster").await?;
 //! let runner = SingleRunner::new(pool).await?;
 //! let client = runner.register(MyEntity).await?;

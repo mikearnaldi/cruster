@@ -6,7 +6,7 @@
 //!
 //! # Stateless Entity Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use cruster_macros::{entity, entity_impl};
 //!
 //! #[entity]
@@ -25,7 +25,7 @@
 //!
 //! # Stateful Entity Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use cruster_macros::{entity, entity_impl};
 //!
 //! struct CounterState { count: i32 }
@@ -99,7 +99,7 @@ pub fn entity(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Use `#[state(Type)]` on the impl block to define per-instance persistent state:
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// #[state(MyState)]
 /// impl MyEntity {
@@ -176,7 +176,7 @@ pub fn entity_trait(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_trait_impl]
 /// #[state(AuditLog)]
 /// impl Auditable {
@@ -215,7 +215,7 @@ pub fn entity_trait_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// #[derive(Clone, Serialize, Deserialize)]
 /// struct CounterState {
 ///     count: i32,
@@ -281,7 +281,7 @@ pub fn state(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// #[state(MyState)]
 /// impl MyEntity {
@@ -325,7 +325,7 @@ pub fn rpc(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// #[state(CounterState)]
 /// impl Counter {
@@ -356,7 +356,7 @@ pub fn rpc(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// For workflows that need to perform external side effects (API calls, emails, etc.),
 /// use `#[activity]` methods and call them via `DurableContext`:
 ///
-/// ```rust,ignore
+/// ```text
 /// #[workflow]
 /// async fn process_order(&self, ctx: &DurableContext, order: Order) -> Result<Receipt, ClusterError> {
 ///     // State mutation
@@ -380,7 +380,7 @@ pub fn rpc(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Use `#[workflow(key = |req| ...)]` to deduplicate repeated calls:
 ///
-/// ```rust,ignore
+/// ```text
 /// #[workflow(key = |order| order.id.clone())]
 /// async fn process_order(&self, order: Order) -> Result<Receipt, ClusterError> {
 ///     // Duplicate calls with same order.id return cached result
@@ -401,7 +401,7 @@ pub fn workflow(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// #[state(OrderState)]
 /// impl OrderProcessor {
@@ -443,7 +443,7 @@ pub fn workflow(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Use `#[activity(key = |req| ...)]` to deduplicate:
 ///
-/// ```rust,ignore
+/// ```text
 /// #[activity(key = |to, _body| to.clone())]
 /// async fn send_email(&self, to: String, body: String) -> Result<(), ClusterError> {
 ///     // Only sends once per recipient within the workflow
@@ -463,7 +463,7 @@ pub fn activity(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// impl MyEntity {
 ///     #[rpc]
@@ -494,7 +494,7 @@ pub fn public(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// impl MyEntity {
 ///     #[rpc]
@@ -523,7 +523,7 @@ pub fn protected(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// impl MyEntity {
 ///     #[rpc]
@@ -563,7 +563,7 @@ pub fn private(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```text
 /// #[entity_impl]
 /// #[state(MyState)]
 /// impl MyEntity {

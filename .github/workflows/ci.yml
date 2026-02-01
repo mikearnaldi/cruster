@@ -143,17 +143,19 @@ jobs:
         working-directory: examples/cluster-tests
         run: cp ../../target/release/cluster-tests .
       
-      - name: Build Docker images
+      - name: Build Docker image
         working-directory: examples/cluster-tests
-        run: |
-          docker build --target ci -t cluster-tests:latest .
-          docker build -f Dockerfile.e2e -t e2e-tests:latest ../..
+        run: docker build --target ci -t cluster-tests:latest .
+      
+      - name: Start cluster
+        working-directory: examples/cluster-tests
+        run: docker compose up -d --wait
       
       - name: Run E2E tests
         working-directory: examples/cluster-tests
-        run: |
-          docker compose up -d --wait
-          docker compose --profile test run --rm e2e-tests
+        run: ./tests/e2e.sh
+        env:
+          CLUSTER_TESTS_URL: http://localhost:8080
       
       - name: Show logs on failure
         if: failure()

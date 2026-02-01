@@ -122,16 +122,6 @@ services:
       timeout: 10s
       retries: 12
 
-  e2e-tests:
-    image: e2e-tests:latest
-    environment:
-      CLUSTER_TESTS_URL: http://nginx:80
-    depends_on:
-      nginx:
-        condition: service_healthy
-    profiles:
-      - test
-
 volumes:
   postgres_data:
   etcd_data:

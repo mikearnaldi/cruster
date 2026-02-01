@@ -32,7 +32,7 @@ use crate::runner_storage::RunnerStorage;
 use crate::runners::Runners;
 use crate::shard_assigner::ShardAssigner;
 use crate::sharding::{Sharding, ShardingRegistrationEvent};
-use crate::snowflake::SnowflakeGenerator;
+use crate::snowflake::{Snowflake, SnowflakeGenerator};
 use crate::types::{EntityId, EntityType, RunnerAddress, ShardId};
 
 /// Implementation of the core sharding orchestrator.
@@ -1519,6 +1519,71 @@ impl ShardingImpl {
                 .count() as i64,
         );
     }
+
+    /// Poll storage for a reply to a persisted message.
+    ///
+    /// This is used as a fallback when the gRPC streaming connection to the
+    /// remote node fails. The message was already saved to storage, so another
+    /// node may process it and save the reply there.
+    ///
+    /// Polls at `storage_poll_interval` until an exit reply is found.
+    async fn reply_from_storage(
+        &self,
+        request_id: Snowflake,
+    ) -> Result<ReplyReceiver, ClusterError> {
+        let storage = self.message_storage.as_ref().ok_or_else(|| {
+            ClusterError::PersistenceError {
+                reason: "no message storage configured for reply polling".into(),
+                source: None,
+            }
+        })?;
+
+        let poll_interval = self.config.storage_poll_interval;
+        let (tx, rx) = mpsc::channel(16);
+
+        let storage = Arc::clone(storage);
+        let cancel = self.cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        tracing::debug!(request_id = request_id.0, "reply_from_storage: cancelled");
+                        break;
+                    }
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+
+                match storage.replies_for(request_id).await {
+                    Ok(replies) => {
+                        for reply in replies {
+                            let is_exit = matches!(reply, Reply::WithExit(_));
+                            if tx.send(reply).await.is_err() {
+                                // Receiver dropped
+                                return;
+                            }
+                            if is_exit {
+                                tracing::debug!(
+                                    request_id = request_id.0,
+                                    "reply_from_storage: delivered exit reply"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            request_id = request_id.0,
+                            error = %e,
+                            "reply_from_storage: failed to poll replies"
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
 }
 
 #[async_trait]
@@ -1805,11 +1870,20 @@ impl Sharding for ShardingImpl {
                 }
             } else if let Some(owner) = self.get_shard_owner_async(&shard_id).await {
                 // Remote delivery via the Runners transport.
-                // Both persisted and non-persisted messages use send() to get
-                // streaming replies. The remote node's GrpcRunnerServer::send()
-                // handler will process the message and stream replies back.
+                // Use send() to get streaming replies from the remote node.
                 match self.runners.send(&owner, envelope.clone()).await {
                     Ok(rx) => return Ok(rx),
+                    Err(e) if envelope.persisted => {
+                        // For persisted messages, fall back to polling storage for replies.
+                        // The message was already saved to storage, so another node may
+                        // process it and save the reply there.
+                        tracing::debug!(
+                            attempt,
+                            error = %e,
+                            "send: remote send failed for persisted message, falling back to storage polling"
+                        );
+                        return self.reply_from_storage(envelope.request_id).await;
+                    }
                     Err(e) if Self::is_retryable(&e) && !is_last => {
                         tracing::debug!(attempt, error = %e, "send: retryable error on remote, will retry");
                         last_err = Some(e);

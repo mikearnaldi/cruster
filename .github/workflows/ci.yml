@@ -130,7 +130,7 @@ jobs:
         uses: docker/bake-action@v6
         with:
           workdir: examples/cluster-tests
-          files: docker-compose.yml
+          files: examples/cluster-tests/docker-compose.yml
           load: true
           set: |
             *.cache-from=type=gha

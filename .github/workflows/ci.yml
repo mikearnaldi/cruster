@@ -11,8 +11,8 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  check:
-    name: Check
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,11 +27,16 @@ jobs:
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: check
       
-      - name: Run cargo check
-        run: cargo check --all-targets --all-features --locked
+      - name: Build release binary
+        run: cargo build --release --all-features --locked
+      
+      - name: Upload cluster-tests binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-tests
+          path: target/release/cluster-tests
+          retention-days: 1
 
   clippy:
     name: Clippy
@@ -50,8 +55,6 @@ jobs:
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: clippy
       
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -87,8 +90,6 @@ jobs:
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test
       
       - name: Run tests
         run: cargo test --all-features --locked
@@ -109,8 +110,6 @@ jobs:
       
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: doc
       
       - name: Check documentation
         run: cargo doc --no-deps --all-features --locked
@@ -119,33 +118,22 @@ jobs:
 
   e2e:
     name: E2E Tests
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Download cluster-tests binary
+        uses: actions/download-artifact@v4
         with:
-          toolchain: "1.93"
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: e2e
-      
-      - name: Build cluster-tests binary
-        run: cargo build --release --package cluster-tests --all-features
-      
-      - name: Prepare Docker build context
-        working-directory: examples/cluster-tests
-        run: cp ../../target/release/cluster-tests .
+          name: cluster-tests
+          path: examples/cluster-tests
       
       - name: Build Docker image
         working-directory: examples/cluster-tests
-        run: docker build --target ci -t cluster-tests:latest .
+        run: |
+          chmod +x cluster-tests
+          docker build --target ci -t cluster-tests:latest .
       
       - name: Start cluster
         working-directory: examples/cluster-tests
@@ -170,13 +158,13 @@ jobs:
   # Ensure all jobs pass before merging
   ci-success:
     name: CI Success
-    needs: [check, clippy, fmt, test, doc, e2e]
+    needs: [build, clippy, fmt, test, doc, e2e]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
-          if [[ "${{ needs.check.result }}" != "success" ]] || \
+          if [[ "${{ needs.build.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.test.result }}" != "success" ]] || \

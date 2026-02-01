@@ -1,0 +1,24 @@
+# Runtime-only image for CI (binary built externally)
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy prebuilt binary (passed via build context)
+COPY cluster-tests /app/cluster-tests
+
+# Copy test scripts
+COPY tests /app/tests
+
+# Make test scripts executable
+RUN chmod +x /app/tests/*.sh /app/tests/lib/*.sh
+
+ENV RUST_LOG=info
+
+EXPOSE 8080 9000
+
+ENTRYPOINT ["/app/cluster-tests"]

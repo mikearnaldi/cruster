@@ -1,0 +1,129 @@
+# Docker Compose for CI - uses prebuilt images
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cruster
+      POSTGRES_PASSWORD: cruster
+      POSTGRES_DB: cruster
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cruster -d cruster"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    command:
+      - etcd
+      - --name=etcd0
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=etcd0=http://etcd:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=cruster-etcd
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  node1:
+    image: cluster-tests:ci
+    environment:
+      POSTGRES_URL: postgres://cruster:cruster@postgres:5432/cruster
+      ETCD_ENDPOINTS: etcd:2379
+      RUNNER_ADDRESS: node1:9000
+      LISTEN_ADDR: 0.0.0.0:8080
+      GRPC_PORT: 9000
+      RUST_LOG: info,cruster=trace,cluster_tests=trace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+  node2:
+    image: cluster-tests:ci
+    environment:
+      POSTGRES_URL: postgres://cruster:cruster@postgres:5432/cruster
+      ETCD_ENDPOINTS: etcd:2379
+      RUNNER_ADDRESS: node2:9000
+      LISTEN_ADDR: 0.0.0.0:8080
+      GRPC_PORT: 9000
+      RUST_LOG: info,cruster=trace,cluster_tests=trace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      etcd:
+        condition: service_healthy
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+  node3:
+    image: cluster-tests:ci
+    environment:
+      POSTGRES_URL: postgres://cruster:cruster@postgres:5432/cruster
+      ETCD_ENDPOINTS: etcd:2379
+      RUNNER_ADDRESS: node3:9000
+      LISTEN_ADDR: 0.0.0.0:8080
+      GRPC_PORT: 9000
+      RUST_LOG: info,cruster=trace,cluster_tests=trace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      etcd:
+        condition: service_healthy
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+  e2e-tests:
+    image: e2e-tests:ci
+    environment:
+      CLUSTER_TESTS_URL: http://nginx:80
+    depends_on:
+      nginx:
+        condition: service_healthy
+    profiles:
+      - test

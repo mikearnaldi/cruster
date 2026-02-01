@@ -1,0 +1,38 @@
+# Knope configuration for cruster
+# Uses changeset files for versioning and releases
+# See: https://knope.tech
+
+[package]
+versioned_files = [
+    "Cargo.toml",  # workspace version
+    { path = "Cargo.lock", dependency = "cruster" },
+]
+changelog = "CHANGELOG.md"
+
+[github]
+owner = "mikearnaldi"
+repo = "cruster"
+
+# Workflow to prepare a release (creates/updates PR)
+[[workflows]]
+name = "prepare-release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows.steps]]
+type = "CreatePullRequest"
+base = "main"
+
+[workflows.steps.title]
+template = "chore: prepare release v{{ version }}"
+
+[workflows.steps.body]
+template = """
+## Release v{{ version }}
+
+{{ changelog }}
+
+---
+*Merging this PR will publish to crates.io*
+"""

@@ -126,19 +126,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
-      - name: Build images with cache
-        uses: docker/bake-action@v6
-        with:
-          workdir: examples/cluster-tests
-          files: examples/cluster-tests/docker-compose.yml
-          load: true
-          set: |
-            *.cache-from=type=gha
-            *.cache-to=type=gha,mode=max
-      
-      - name: Run E2E tests
+      - name: Build and run E2E tests
         working-directory: examples/cluster-tests
         run: |
+          docker compose build
           docker compose up -d --wait
           docker compose --profile test run --rm e2e-tests
       
@@ -172,28 +163,74 @@ jobs:
           fi
           echo "All jobs passed"
 
-  release-plz:
-    name: Release-plz
+  # Create/update release PR when changesets are present
+  prepare-release:
+    name: Prepare Release
     needs: ci-success
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Run on push to main, but NOT when the release PR itself is merged
+    if: |
+      github.event_name == 'push' && 
+      github.ref == 'refs/heads/main' &&
+      !contains(github.event.head_commit.message, 'chore: prepare release')
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
       contents: write
+      pull-requests: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run release-plz
-        uses: release-plz/action@v0.5
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Install knope
+        uses: knope-dev/action@v2
+        with:
+          version: 0.22.1
+      
+      - name: Prepare release
+        run: knope prepare-release --verbose
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish to crates.io when release PR is merged
+  publish:
+    name: Publish to crates.io
+    needs: ci-success
+    # Only run when the release PR is merged (commit message from knope)
+    if: |
+      github.event_name == 'push' && 
+      github.ref == 'refs/heads/main' &&
+      contains(github.event.head_commit.message, 'chore: prepare release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      
+      # Publish cruster-macros first (dependency of cruster)
+      - name: Publish cruster-macros
+        run: cargo publish -p cruster-macros --all-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      
+      # Wait for crates.io to index the new version
+      - name: Wait for crates.io indexing
+        run: sleep 30
+      
+      # Then publish cruster
+      - name: Publish cruster
+        run: cargo publish -p cruster --all-features
+        env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

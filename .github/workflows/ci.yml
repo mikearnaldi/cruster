@@ -123,6 +123,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build images with cache
+        working-directory: examples/cluster-tests
+        run: |
+          docker buildx bake --file docker-compose.yml \
+            --set '*.cache-from=type=gha' \
+            --set '*.cache-to=type=gha,mode=max' \
+            --load
+      
       - name: Start cluster and run E2E tests
         working-directory: examples/cluster-tests
         run: |

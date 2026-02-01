@@ -44,5 +44,9 @@ prometheus = "0.13"
 # Testing
 proptest = "1.4"
 
+# Faster dev builds: disable debuginfo
+[profile.dev]
+debug = 0
+
 [profile.release]
 lto = true

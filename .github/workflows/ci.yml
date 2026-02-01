@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   RUSTFLAGS: -Dwarnings
 
 jobs:
@@ -28,23 +29,21 @@ jobs:
       
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-all-crates: "true"
       
       - name: Check formatting
         run: cargo fmt --all -- --check
       
-      # Build everything first (test binaries included)
-      - name: Build
-        run: cargo test --release --all-features --locked --no-run
-      
-      # Clippy reuses built artifacts
       - name: Clippy
-        run: cargo clippy --release --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
       
-      # Tests reuse built artifacts
-      - name: Test
-        run: cargo test --release --all-features --locked
+      - name: Compile tests
+        run: cargo test --all-features --locked --no-run
+      
+      - name: Run tests
+        run: cargo test --all-features --locked
+      
+      - name: Build release binary
+        run: cargo build --release --all-features --locked -p cluster-tests
       
       - name: Documentation
         run: cargo doc --no-deps --all-features --locked

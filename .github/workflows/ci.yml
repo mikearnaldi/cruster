@@ -125,18 +125,20 @@ jobs:
       
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
       
-      - name: Build images with cache
+      - name: Build and run E2E tests
         working-directory: examples/cluster-tests
+        env:
+          DOCKER_BUILDKIT: 1
+          COMPOSE_DOCKER_CLI_BUILD: 1
+          BUILDX_BAKE_ENTITLEMENTS_FS: 0
         run: |
-          docker buildx bake --file docker-compose.yml \
-            --set '*.cache-from=type=gha' \
-            --set '*.cache-to=type=gha,mode=max' \
-            --load
-      
-      - name: Start cluster and run E2E tests
-        working-directory: examples/cluster-tests
-        run: |
+          docker compose build
           docker compose up -d --wait
           docker compose --profile test run --rm e2e-tests
       

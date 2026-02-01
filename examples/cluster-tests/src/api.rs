@@ -15,8 +15,8 @@ use std::sync::Arc;
 use crate::entities::{
     ActivityRecord, ActivityTestClient, AuditEntry, CancelTimerRequest, ClearFiresRequest,
     ClearMessagesRequest, CounterClient, CrossEntityClient, DecrementRequest, DeleteRequest,
-    GetExecutionRequest, GetRequest, IncrementRequest, KVStoreClient, Message,
-    PendingTimer, PingRequest, ReceiveRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
+    GetExecutionRequest, GetRequest, IncrementRequest, KVStoreClient, Message, PendingTimer,
+    PingRequest, ReceiveRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
     RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
     ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState, TimerFire, TimerTestClient,
     TraitTestClient, UpdateRequest, WorkflowExecution, WorkflowTestClient,

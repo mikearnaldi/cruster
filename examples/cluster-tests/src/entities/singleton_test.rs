@@ -166,12 +166,14 @@ impl SingletonManager {
             source: Some(Box::new(e)),
         })?;
 
-        Ok(row.map(|(runner_id, tick_count, last_tick_at, became_leader_at)| SingletonState {
-            runner_id,
-            tick_count,
-            last_tick_at,
-            became_leader_at,
-        }))
+        Ok(row.map(
+            |(runner_id, tick_count, last_tick_at, became_leader_at)| SingletonState {
+                runner_id,
+                tick_count,
+                last_tick_at,
+                became_leader_at,
+            },
+        ))
     }
 
     /// Get the current tick count.

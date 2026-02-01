@@ -1531,12 +1531,13 @@ impl ShardingImpl {
         &self,
         request_id: Snowflake,
     ) -> Result<ReplyReceiver, ClusterError> {
-        let storage = self.message_storage.as_ref().ok_or_else(|| {
-            ClusterError::PersistenceError {
-                reason: "no message storage configured for reply polling".into(),
-                source: None,
-            }
-        })?;
+        let storage =
+            self.message_storage
+                .as_ref()
+                .ok_or_else(|| ClusterError::PersistenceError {
+                    reason: "no message storage configured for reply polling".into(),
+                    source: None,
+                })?;
 
         let poll_interval = self.config.storage_poll_interval;
         let (tx, rx) = mpsc::channel(16);

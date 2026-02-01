@@ -31,7 +31,9 @@ jobs:
           shared-key: rust-build
       
       - name: Build
-        run: cargo build --release --all-features --locked
+        run: |
+          cargo build --release --all-features --locked
+          cargo test --release --all-features --locked --no-run
       
       - name: Upload cluster-tests binary
         uses: actions/upload-artifact@v4

@@ -8,9 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings -Clinker=clang -Clink-arg=-fuse-ld=mold
-  SCCACHE_GHA_ENABLED: true
-  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: -Dwarnings
 
 jobs:
   ci:
@@ -19,8 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -30,19 +28,15 @@ jobs:
       
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
-      
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          cache-all-crates: "true"
       
       - name: Check formatting
         run: cargo fmt --all -- --check
       
-      # Build everything including tests and dev-deps in one go
-      - name: Build and check
-        run: |
-          cargo clippy --release --all-targets --all-features --locked -- -D warnings
+      - name: Clippy (builds everything including tests)
+        run: cargo clippy --release --all-targets --all-features --locked -- -D warnings
       
-      # Tests reuse the clippy build artifacts
       - name: Test
         run: cargo test --release --all-features --locked
       
@@ -140,17 +134,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
-      
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
       
       - name: Publish cruster-macros
         run: cargo publish -p cruster-macros --all-features

@@ -34,9 +34,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       
-      - name: Clippy (builds everything including tests)
+      # Build everything first (test binaries included)
+      - name: Build
+        run: cargo test --release --all-features --locked --no-run
+      
+      # Clippy reuses built artifacts
+      - name: Clippy
         run: cargo clippy --release --all-targets --all-features --locked -- -D warnings
       
+      # Tests reuse built artifacts
       - name: Test
         run: cargo test --release --all-features --locked
       

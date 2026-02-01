@@ -9,17 +9,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Run CI checks first
-  ci:
-    name: CI Checks
-    uses: ./.github/workflows/ci.yml
-
   publish:
     name: Publish to crates.io
-    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check CI passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo "Checking CI status for commit $COMMIT_SHA"
+          
+          # Get the check runs for this commit
+          STATUS=$(gh api repos/${{ github.repository }}/commits/$COMMIT_SHA/check-runs \
+            --jq '.check_runs[] | select(.name == "CI Success") | .conclusion')
+          
+          if [ "$STATUS" != "success" ]; then
+            echo "CI has not passed for this commit. Status: $STATUS"
+            echo "Please ensure CI passes before tagging a release."
+            exit 1
+          fi
+          echo "CI passed!"
 
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

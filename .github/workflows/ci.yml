@@ -149,7 +149,7 @@ jobs:
       
       - name: Start cluster
         working-directory: examples/cluster-tests
-        run: docker compose up -d --wait
+        run: docker compose up -d --no-build --wait
       
       - name: Run E2E tests
         working-directory: examples/cluster-tests

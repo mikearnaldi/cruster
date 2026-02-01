@@ -39,6 +39,7 @@ services:
       retries: 10
 
   node1:
+    image: cluster-tests:latest
     build:
       context: ../..
       dockerfile: examples/cluster-tests/Dockerfile
@@ -62,6 +63,7 @@ services:
       retries: 12
 
   node2:
+    image: cluster-tests:latest
     build:
       context: ../..
       dockerfile: examples/cluster-tests/Dockerfile
@@ -87,6 +89,7 @@ services:
       retries: 12
 
   node3:
+    image: cluster-tests:latest
     build:
       context: ../..
       dockerfile: examples/cluster-tests/Dockerfile

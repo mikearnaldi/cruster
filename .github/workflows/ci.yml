@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+  RUSTFLAGS: -Dwarnings -Clinker=clang -Clink-arg=-fuse-ld=mold
   SCCACHE_GHA_ENABLED: true
   RUSTC_WRAPPER: sccache
 
@@ -19,8 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -47,8 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -84,8 +84,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -105,8 +105,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -227,8 +227,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold clang
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

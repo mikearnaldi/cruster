@@ -40,7 +40,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "clippy"
+          cache-all-crates: "true"
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
@@ -55,7 +55,7 @@ jobs:
           toolchain: "1.93"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "test"
+          cache-all-crates: "true"
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --all-features --locked
 
@@ -71,7 +71,7 @@ jobs:
           toolchain: "1.93"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "docs"
+          cache-all-crates: "true"
       - run: cargo doc --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -Dwarnings
@@ -88,8 +88,8 @@ jobs:
           toolchain: "1.93"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "build"
-      - run: cargo build --release --all-features --locked -p cluster-tests
+          cache-all-crates: "true"
+      - run: cargo build --release --all-features --locked
       - uses: actions/upload-artifact@v4
         with:
           name: cluster-tests

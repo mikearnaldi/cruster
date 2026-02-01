@@ -31,9 +31,7 @@ jobs:
           shared-key: rust-build
       
       - name: Build
-        run: |
-          cargo build --all-features --locked
-          cargo build --release --all-features --locked
+        run: cargo build --release --all-features --locked
       
       - name: Upload cluster-tests binary
         uses: actions/upload-artifact@v4
@@ -65,7 +63,7 @@ jobs:
           save-if: false
       
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --release --all-targets --all-features --locked -- -D warnings
 
   fmt:
     name: Format
@@ -104,7 +102,7 @@ jobs:
           save-if: false
       
       - name: Run tests
-        run: cargo test --all-features --locked
+        run: cargo test --release --all-features --locked
 
   doc:
     name: Documentation

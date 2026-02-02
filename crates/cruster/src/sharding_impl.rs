@@ -356,9 +356,10 @@ impl ShardingImpl {
             let this = Arc::clone(self);
             // We cannot call async register_singleton from a sync fn, so insert directly.
             let cancel = tokio_util::sync::CancellationToken::new();
-            let factory: SingletonFactory = Arc::new(move |_ctx| {
+            let factory: SingletonFactory = Arc::new(move |ctx| {
                 let this = Arc::clone(&this);
-                Box::pin(async move { this.runner_health_loop().await })
+                let cancel = ctx.cancellation();
+                Box::pin(async move { this.runner_health_loop(cancel).await })
             });
             self.singletons.insert(
                 "cluster/RunnerHealth".to_string(),
@@ -573,8 +574,15 @@ impl ShardingImpl {
             return Ok(false);
         }
 
-        // 1. Get current runners
-        let runners = runner_storage.get_runners().await?;
+        // 1. Get current runners (with cancellation support)
+        let runners = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                tracing::debug!("rebalance_shards cancelled during get_runners");
+                return Ok(false);
+            }
+            result = runner_storage.get_runners() => result?,
+        };
         self.metrics.runners.set(runners.len() as i64);
         self.metrics
             .runners_healthy
@@ -614,11 +622,16 @@ impl ShardingImpl {
                 entry.value().interrupt_shard(shard_id).await;
             }
 
-            // Release lock in storage
-            if let Err(e) = runner_storage
-                .release(shard_id, &self.config.runner_address)
-                .await
-            {
+            // Release lock in storage (with cancellation support)
+            let release_result = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {
+                    tracing::debug!("rebalance_shards cancelled during shard release");
+                    return Ok(false);
+                }
+                result = runner_storage.release(shard_id, &self.config.runner_address) => result,
+            };
+            if let Err(e) = release_result {
                 tracing::warn!(shard_id = %shard_id, error = %e, "failed to release shard lock, keeping shard in owned set for retry");
                 // Keep shard in owned_shards so the next rebalance cycle retries the release.
                 // Remove from releasing set so it can be re-added to to_release next cycle.
@@ -649,9 +662,15 @@ impl ShardingImpl {
             .collect();
         drop(releasing);
 
-        let batch_result = runner_storage
-            .acquire_batch(&to_acquire_filtered, &self.config.runner_address)
-            .await?;
+        // Acquire shards (with cancellation support)
+        let batch_result = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                tracing::debug!("rebalance_shards cancelled during acquire_batch");
+                return Ok(!to_release.is_empty());
+            }
+            result = runner_storage.acquire_batch(&to_acquire_filtered, &self.config.runner_address) => result?,
+        };
 
         let failure_count = batch_result.failures.len();
         if failure_count > 0 {
@@ -750,14 +769,20 @@ impl ShardingImpl {
             // Batch refresh all shards in a single storage round-trip (or single
             // mutex hold for etcd), avoiding N sequential network calls.
             let all_shard_vec: Vec<ShardId> = all_shards.iter().cloned().collect();
-            let batch_result = match runner_storage
-                .refresh_batch(&all_shard_vec, &self.config.runner_address)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "batch refresh failed entirely");
-                    continue;
+            let batch_result = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {
+                    tracing::debug!("lock_refresh_loop cancelled during refresh_batch");
+                    break;
+                }
+                result = runner_storage.refresh_batch(&all_shard_vec, &self.config.runner_address) => {
+                    match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "batch refresh failed entirely");
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -1262,8 +1287,11 @@ impl ShardingImpl {
     /// - Updates `runner_storage.set_runner_health()`
     /// - Never marks the last healthy runner as unhealthy (prevents deadlock)
     /// - If zero healthy runners: force-marks self as healthy
-    #[instrument(skip(self))]
-    async fn runner_health_loop(&self) -> Result<(), ClusterError> {
+    #[instrument(skip(self, cancel))]
+    async fn runner_health_loop(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), ClusterError> {
         let runner_storage = match &self.runner_storage {
             Some(s) => Arc::clone(s),
             None => return Ok(()),
@@ -1275,12 +1303,18 @@ impl ShardingImpl {
 
         loop {
             tokio::select! {
-                _ = self.cancel.cancelled() => break,
+                biased;
+                _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(self.config.runner_poll_interval) => {},
             }
 
+            // Check cancellation after waking up
+            if cancel.is_cancelled() {
+                break;
+            }
+
             if let Err(e) = self
-                .check_runner_health(&runner_storage, &runner_health)
+                .check_runner_health(&runner_storage, &runner_health, &cancel)
                 .await
             {
                 tracing::warn!(error = %e, "runner health check failed");
@@ -1294,21 +1328,37 @@ impl ShardingImpl {
         &self,
         runner_storage: &Arc<dyn RunnerStorage>,
         runner_health: &Arc<dyn RunnerHealth>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(), ClusterError> {
         use futures::stream::StreamExt;
 
-        let runners = runner_storage.get_runners().await?;
+        // Check cancellation early
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let runners = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            result = runner_storage.get_runners() => result?,
+        };
         if runners.is_empty() {
             return Ok(());
         }
 
-        // Check health with concurrency limit of 10
+        // Check health with concurrency limit of 10 (with cancellation support)
+        let cancel_clone = cancel.clone();
         let checks: Vec<_> = runners
             .iter()
             .map(|runner| {
                 let addr = runner.address.clone();
                 let health = Arc::clone(runner_health);
+                let cancel = cancel_clone.clone();
                 async move {
+                    // Check cancellation before each health check
+                    if cancel.is_cancelled() {
+                        return None;
+                    }
                     let alive = match health.is_alive(&addr).await {
                         Ok(alive) => alive,
                         Err(e) => {
@@ -1316,20 +1366,30 @@ impl ShardingImpl {
                             false
                         }
                     };
-                    (addr, alive)
+                    Some((addr, alive))
                 }
             })
             .collect();
         let health_results: Vec<_> = futures::stream::iter(checks)
             .buffer_unordered(10)
+            .filter_map(|x| async { x })
             .collect()
             .await;
+
+        // Check cancellation after health checks
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
 
         // Apply health updates with the "last healthy runner" guard.
         // Track runners marked unhealthy in this iteration so each successive
         // decision reflects prior decisions in the same loop.
         let mut marked_unhealthy_this_cycle: Vec<&RunnerAddress> = Vec::new();
         for (addr, alive) in &health_results {
+            // Check cancellation before each update
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             let runner = runners.iter().find(|r| &r.address == addr);
             let was_healthy = runner.map(|r| r.healthy).unwrap_or(false);
 
@@ -3807,9 +3867,11 @@ mod tests {
         .unwrap();
 
         // Perform a health check round — NoopRunnerHealth reports all alive
+        let cancel = tokio_util::sync::CancellationToken::new();
         s.check_runner_health(
             &(runner_storage.clone() as Arc<dyn RunnerStorage>),
             &(Arc::new(NoopRunnerHealth) as Arc<dyn RunnerHealth>),
+            &cancel,
         )
         .await
         .unwrap();
@@ -3869,9 +3931,11 @@ mod tests {
         )
         .unwrap();
 
+        let cancel = tokio_util::sync::CancellationToken::new();
         s.check_runner_health(
             &(runner_storage.clone() as Arc<dyn RunnerStorage>),
             &dead_health,
+            &cancel,
         )
         .await
         .unwrap();
@@ -3924,9 +3988,14 @@ mod tests {
         )
         .unwrap();
 
-        s.check_runner_health(&(runner_storage.clone() as Arc<dyn RunnerStorage>), &health)
-            .await
-            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        s.check_runner_health(
+            &(runner_storage.clone() as Arc<dyn RunnerStorage>),
+            &health,
+            &cancel,
+        )
+        .await
+        .unwrap();
 
         // The runner should still be healthy because the guard prevents
         // marking the last healthy runner as unhealthy, AND the force-mark

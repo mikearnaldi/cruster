@@ -270,6 +270,7 @@ mod tests {
             tick_count: 42,
             last_tick_at: Utc::now(),
             became_leader_at: Utc::now(),
+            graceful_shutdown_at: None,
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -277,5 +278,6 @@ mod tests {
 
         assert_eq!(parsed.runner_id, "node1:9000");
         assert_eq!(parsed.tick_count, 42);
+        assert!(parsed.graceful_shutdown_at.is_none());
     }
 }

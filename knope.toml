@@ -21,6 +21,18 @@ name = "prepare-release"
 type = "PrepareRelease"
 
 [[workflows.steps]]
+type = "Command"
+command = "git switch -c release/v{{ version }} || git switch release/v{{ version }}"
+
+[[workflows.steps]]
+type = "Command"
+command = "git add -A && git commit -m 'chore: prepare release v{{ version }}' || true"
+
+[[workflows.steps]]
+type = "Command"
+command = "git push -u origin release/v{{ version }} --force"
+
+[[workflows.steps]]
 type = "CreatePullRequest"
 base = "main"
 

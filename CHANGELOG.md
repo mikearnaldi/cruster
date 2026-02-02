@@ -1,3 +1,27 @@
+## 0.0.5 (2026-02-02)
+
+### Features
+
+- add SQL transaction support for activities
+- add SingletonContext for graceful singleton shutdown
+
+### Fixes
+
+- correct visibility modifier documentation in README
+- correct entity registration examples in README
+- knope release workflow - create branch before PR
+- knope config - use release branch and correct variable syntax
+- knope config - use git checkout -B for release branch
+- knope config - split git add and commit into separate steps
+- add graceful_shutdown_at to singleton test
+- sync cruster-macros version via workspace dependencies
+- include all workspace crates in Cargo.lock versioning
+- sync Cargo.lock versions with workspace
+
+#### Fix Cargo.lock versioning for all workspace crates
+
+Configure knope to update all workspace crate versions in Cargo.lock during releases, not just `cruster`. This ensures CI passes with `--locked` flag after version bumps.
+
 ## 0.0.4 (2026-02-02)
 
 ### Features

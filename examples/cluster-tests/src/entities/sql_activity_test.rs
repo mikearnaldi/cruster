@@ -72,11 +72,7 @@ impl SqlActivityTest {
     /// - State update (transfer_count, total_transferred)
     /// - SQL INSERT into sql_activity_test_transfers table
     #[activity]
-    async fn do_transfer(
-        &mut self,
-        to_entity: String,
-        amount: i64,
-    ) -> Result<i64, ClusterError> {
+    async fn do_transfer(&mut self, to_entity: String, amount: i64) -> Result<i64, ClusterError> {
         // Update entity state
         self.state.transfer_count += 1;
         self.state.total_transferred += amount;

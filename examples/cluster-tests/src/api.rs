@@ -481,10 +481,7 @@ async fn sql_activity_get_state(
     Path(id): Path<String>,
 ) -> Result<Json<SqlActivityTestState>, AppError> {
     let entity_id = EntityId::new(&id);
-    let entity_state = state
-        .sql_activity_test_client
-        .get_state(&entity_id)
-        .await?;
+    let entity_state = state.sql_activity_test_client.get_state(&entity_id).await?;
     Ok(Json(entity_state))
 }
 
@@ -495,7 +492,10 @@ async fn sql_activity_get_sql_count(
 ) -> Result<Json<i64>, AppError> {
     let entity_id = EntityId::new(&id);
     // Generate unique query ID to prevent workflow caching
-    let query_id = format!("query-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let query_id = format!(
+        "query-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
     let count = state
         .sql_activity_test_client
         .get_transfer_count_from_sql(&entity_id, &GetSqlCountRequest { query_id })

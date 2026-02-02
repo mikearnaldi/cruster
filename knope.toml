@@ -18,33 +18,40 @@ repo = "cruster"
 name = "prepare-release"
 
 [[workflows.steps]]
+type = "Command"
+command = "git switch -c release || git switch release && git reset --hard origin/main"
+
+[[workflows.steps]]
 type = "PrepareRelease"
 
 [[workflows.steps]]
 type = "Command"
-command = "git switch -c release/v{{ version }} || git switch release/v{{ version }}"
+command = "git add -A && git commit -m 'chore: prepare release $version'"
 
 [[workflows.steps]]
 type = "Command"
-command = "git add -A && git commit -m 'chore: prepare release v{{ version }}' || true"
-
-[[workflows.steps]]
-type = "Command"
-command = "git push -u origin release/v{{ version }} --force"
+command = "git push --force --set-upstream origin release"
 
 [[workflows.steps]]
 type = "CreatePullRequest"
 base = "main"
 
 [workflows.steps.title]
-template = "chore: prepare release v{{ version }}"
+template = "chore: prepare release $version"
 
 [workflows.steps.body]
 template = """
-## Release v{{ version }}
+## Release $version
 
-{{ changelog }}
+$changelog
 
 ---
 *Merging this PR will publish to crates.io*
 """
+
+# Workflow to create a release (runs after PR merge)
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "Release"

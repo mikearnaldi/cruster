@@ -568,6 +568,11 @@ impl ShardingImpl {
         &self,
         runner_storage: &Arc<dyn RunnerStorage>,
     ) -> Result<bool, ClusterError> {
+        // Check cancellation before doing any work
+        if self.cancel.is_cancelled() {
+            return Ok(false);
+        }
+
         // 1. Get current runners
         let runners = runner_storage.get_runners().await?;
         self.metrics.runners.set(runners.len() as i64);
@@ -595,6 +600,12 @@ impl ShardingImpl {
 
         // 4. Release phase: release shards no longer assigned to us
         for shard_id in &to_release {
+            // Check cancellation before each shard release
+            if self.cancel.is_cancelled() {
+                tracing::debug!("rebalance_shards cancelled during release phase");
+                return Ok(false);
+            }
+
             // Mark as releasing to prevent re-acquisition
             self.releasing_shards.write().await.insert(shard_id.clone());
 
@@ -620,6 +631,12 @@ impl ShardingImpl {
             self.releasing_shards.write().await.remove(shard_id);
 
             tracing::debug!(shard_id = %shard_id, "released shard");
+        }
+
+        // Check cancellation before acquire phase
+        if self.cancel.is_cancelled() {
+            tracing::debug!("rebalance_shards cancelled before acquire phase");
+            return Ok(!to_release.is_empty());
         }
 
         // 5. Acquire phase: batch acquire newly assigned shards
@@ -670,7 +687,7 @@ impl ShardingImpl {
         self.metrics.shards.set(owned_count as i64);
 
         // 6. If we acquired new shards, reset them in message storage and trigger poll
-        if !newly_acquired.is_empty() {
+        if !newly_acquired.is_empty() && !self.cancel.is_cancelled() {
             if let Some(ref storage) = self.message_storage {
                 if let Err(e) = storage.reset_shards(&newly_acquired).await {
                     tracing::warn!(error = %e, "failed to reset shards in message storage");
@@ -680,8 +697,8 @@ impl ShardingImpl {
             self.sync_singletons().await;
         }
 
-        // Also sync singletons if shards were released
-        if !to_release.is_empty() {
+        // Also sync singletons if shards were released (skip if cancelled)
+        if !to_release.is_empty() && !self.cancel.is_cancelled() {
             self.sync_singletons().await;
         }
 
@@ -708,6 +725,11 @@ impl ShardingImpl {
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
                 _ = tokio::time::sleep(self.config.runner_lock_refresh_interval) => {},
+            }
+
+            // Check cancellation after waking up
+            if self.cancel.is_cancelled() {
+                break;
             }
 
             let owned: std::collections::HashSet<ShardId> =
@@ -746,8 +768,11 @@ impl ShardingImpl {
                 }
             }
 
-            // Process lost locks.
+            // Process lost locks (skip if cancelled)
             for shard_id in &batch_result.lost {
+                if self.cancel.is_cancelled() {
+                    break;
+                }
                 if releasing.contains(shard_id) {
                     tracing::warn!(shard_id = %shard_id, "releasing shard lock lost during refresh");
                     continue;
@@ -765,8 +790,11 @@ impl ShardingImpl {
                 self.sync_singletons().await;
             }
 
-            // Process per-shard errors.
+            // Process per-shard errors (skip if cancelled)
             for (shard_id, e) in &batch_result.failures {
+                if self.cancel.is_cancelled() {
+                    break;
+                }
                 if releasing.contains(shard_id) {
                     tracing::warn!(
                         shard_id = %shard_id,
@@ -806,8 +834,10 @@ impl ShardingImpl {
             }
 
             // Periodically re-sync singletons so that normally-completed singletons
-            // are re-spawned without waiting for a shard topology change.
-            self.sync_singletons().await;
+            // are re-spawned without waiting for a shard topology change (skip if cancelled)
+            if !self.cancel.is_cancelled() {
+                self.sync_singletons().await;
+            }
         }
     }
 
@@ -820,6 +850,11 @@ impl ShardingImpl {
                 _ = tokio::time::sleep(self.config.storage_poll_interval) => {},
             }
 
+            // Check cancellation after waking up
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
             if let Err(e) = self.poll_storage_inner().await {
                 tracing::warn!(error = %e, "storage poll failed");
             }
@@ -828,6 +863,11 @@ impl ShardingImpl {
 
     /// Internal implementation of storage polling.
     async fn poll_storage_inner(&self) -> Result<(), ClusterError> {
+        // Check cancellation early
+        if self.cancel.is_cancelled() {
+            return Ok(());
+        }
+
         let _poll_lock = self.storage_poll_lock.lock().await;
         let storage = match &self.message_storage {
             Some(s) => s,
@@ -870,6 +910,11 @@ impl ShardingImpl {
             .expect("semaphore not closed");
 
         for envelope in messages {
+            // Check cancellation during message dispatch
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
             let entity_type = &envelope.address.entity_type;
 
             let manager = match self.entity_managers.get(entity_type) {
@@ -1445,6 +1490,11 @@ impl ShardingImpl {
     /// across `.await` points which would cause contention with concurrent
     /// `register_singleton`, `shutdown`, or other `sync_singletons` calls.
     async fn sync_singletons(&self) {
+        // Check cancellation early
+        if self.cancel.is_cancelled() {
+            return;
+        }
+
         // Serialize with register_singleton to prevent races.
         // Matches the TS `withSingletonLock` (Sharding.ts).
         let _singleton_guard = self.singleton_lock.lock().await;

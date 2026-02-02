@@ -175,6 +175,8 @@ jobs:
       github.ref == 'refs/heads/main' &&
       contains(github.event.head_commit.message, 'chore: prepare release')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required for creating releases and tags
     steps:
       - uses: actions/checkout@v4
       

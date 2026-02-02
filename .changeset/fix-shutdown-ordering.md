@@ -1,5 +1,5 @@
 ---
-cruster: patch
+default: patch
 ---
 
 fix: reorder shutdown to release shard locks after background tasks stop

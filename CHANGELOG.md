@@ -1,3 +1,29 @@
+## 0.0.4 (2026-02-02)
+
+### Features
+
+- add SQL transaction support for activities
+- add SingletonContext for graceful singleton shutdown
+
+### Fixes
+
+- correct visibility modifier documentation in README
+- correct entity registration examples in README
+- knope release workflow - create branch before PR
+- knope config - use release branch and correct variable syntax
+- knope config - use git checkout -B for release branch
+- knope config - split git add and commit into separate steps
+- add graceful_shutdown_at to singleton test
+- sync cruster-macros version via workspace dependencies
+
+#### Fix cruster-macros version sync in release workflow
+
+Move `cruster-macros` dependency to workspace dependencies and configure knope to automatically bump its version during releases. This ensures the `cruster-macros` version stays in sync with the workspace version when publishing to crates.io.
+
+- Add `cruster-macros` to `[workspace.dependencies]` in root `Cargo.toml`
+- Update `crates/cruster/Cargo.toml` to use `cruster-macros = { workspace = true }`
+- Configure `knope.toml` to version the `cruster-macros` dependency in workspace
+
 ## 0.0.3 (2026-02-02)
 
 ### Features

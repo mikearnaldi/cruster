@@ -1341,6 +1341,7 @@ impl ShardingImpl {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_singleton_task(
         &self,
         name: String,

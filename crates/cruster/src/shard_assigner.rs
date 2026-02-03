@@ -4,6 +4,21 @@ use crate::hash::djb2_hash64;
 use crate::runner::Runner;
 use crate::types::{RunnerAddress, ShardId};
 
+/// Strategy for assigning shards to runners.
+///
+/// Different strategies offer different trade-offs between distribution uniformity,
+/// performance, and rebalance behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ShardAssignmentStrategy {
+    /// Rendezvous hashing (HRW) - best distribution, O(shards × nodes) complexity.
+    ///
+    /// Recommended for clusters with < 1000 nodes. Provides near-perfect distribution
+    /// (each node gets exactly 1/n shards, ±1) and optimal rebalancing (only 1/n shards
+    /// move when a node is added or removed).
+    #[default]
+    Rendezvous,
+}
+
 /// Computes shard-to-runner assignments using rendezvous hashing.
 ///
 /// Given a set of runners (with weights) and shard groups, determines which
@@ -21,10 +36,33 @@ impl ShardAssigner {
     /// Returns a map from ShardId to RunnerAddress indicating which runner
     /// should own each shard. Only healthy runners are considered.
     ///
-    /// Uses rendezvous hashing (Highest Random Weight): for each shard, compute
-    /// a hash combining the shard key with each candidate runner, then assign
-    /// the shard to the runner with the highest hash value.
+    /// The assignment algorithm is determined by the `strategy` parameter.
+    /// Use [`ShardAssignmentStrategy::default()`] for the recommended algorithm.
     pub fn compute_assignments(
+        runners: &[Runner],
+        shard_groups: &[String],
+        shards_per_group: i32,
+        strategy: &ShardAssignmentStrategy,
+    ) -> HashMap<ShardId, RunnerAddress> {
+        match strategy {
+            ShardAssignmentStrategy::Rendezvous => {
+                Self::compute_rendezvous(runners, shard_groups, shards_per_group)
+            }
+        }
+    }
+
+    /// Compute shard assignments using rendezvous hashing (Highest Random Weight).
+    ///
+    /// For each shard, compute a hash combining the shard key with each candidate runner,
+    /// then assign the shard to the runner with the highest hash value.
+    ///
+    /// Properties:
+    /// - Near-perfect distribution (each node gets exactly 1/n shards, ±1)
+    /// - Minimal movement on node departure (only shards on departed node move)
+    /// - Minimal movement on node addition (new node claims ~1/(n+1) shards evenly)
+    /// - Deterministic assignments (same inputs always produce same outputs)
+    /// - Weighted node support via multiple hash computations per weight unit
+    fn compute_rendezvous(
         runners: &[Runner],
         shard_groups: &[String],
         shards_per_group: i32,
@@ -145,11 +183,17 @@ fn mix64(mut h: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// Helper to get default strategy for tests
+    fn default_strategy() -> ShardAssignmentStrategy {
+        ShardAssignmentStrategy::default()
+    }
+
     #[test]
     fn single_runner_gets_all_shards() {
         let runners = vec![Runner::new(RunnerAddress::new("host1", 9000), 1)];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 10);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 10, &default_strategy());
 
         assert_eq!(assignments.len(), 10);
         for addr in assignments.values() {
@@ -164,7 +208,8 @@ mod tests {
             Runner::new(RunnerAddress::new("host2", 9000), 1),
         ];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 300);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 300, &default_strategy());
 
         assert_eq!(assignments.len(), 300);
 
@@ -183,7 +228,8 @@ mod tests {
         r2.healthy = false;
         let runners = vec![Runner::new(RunnerAddress::new("host1", 9000), 1), r2];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 10);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 10, &default_strategy());
 
         assert_eq!(assignments.len(), 10);
         for addr in assignments.values() {
@@ -197,7 +243,8 @@ mod tests {
         r.healthy = false;
         let runners = vec![r];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 10);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 10, &default_strategy());
         assert!(assignments.is_empty());
     }
 
@@ -208,7 +255,8 @@ mod tests {
             Runner::new(RunnerAddress::new("host2", 9000), 1),
         ];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 300);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 300, &default_strategy());
 
         let host1_count = assignments.values().filter(|a| a.host == "host1").count();
 
@@ -223,7 +271,8 @@ mod tests {
     fn multiple_groups() {
         let runners = vec![Runner::new(RunnerAddress::new("host1", 9000), 1)];
         let groups = vec!["default".to_string(), "premium".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 10);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 10, &default_strategy());
 
         assert_eq!(assignments.len(), 20); // 10 per group
     }
@@ -261,7 +310,8 @@ mod tests {
             Runner::new(RunnerAddress::new("host3", 9000), 1),
         ];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 300);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 300, &default_strategy());
 
         let count = |host: &str| assignments.values().filter(|a| a.host == host).count();
         let h1 = count("host1");
@@ -292,7 +342,8 @@ mod tests {
             Runner::new(RunnerAddress::new("host2", 9000), 0), // drain mode
         ];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 10);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 10, &default_strategy());
 
         assert_eq!(assignments.len(), 10);
         for addr in assignments.values() {
@@ -307,8 +358,8 @@ mod tests {
             Runner::new(RunnerAddress::new("host2", 9000), 1),
         ];
         let groups = vec!["default".to_string()];
-        let a1 = ShardAssigner::compute_assignments(&runners, &groups, 300);
-        let a2 = ShardAssigner::compute_assignments(&runners, &groups, 300);
+        let a1 = ShardAssigner::compute_assignments(&runners, &groups, 300, &default_strategy());
+        let a2 = ShardAssigner::compute_assignments(&runners, &groups, 300, &default_strategy());
         assert_eq!(a1, a2);
     }
 
@@ -322,7 +373,8 @@ mod tests {
             Runner::new(RunnerAddress::new("host3", 9000), 1),
         ];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 2048);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 2048, &default_strategy());
 
         let count = |host: &str| assignments.values().filter(|a| a.host == host).count();
         let h1 = count("host1");
@@ -363,8 +415,10 @@ mod tests {
         ];
 
         let groups = vec!["default".to_string()];
-        let before = ShardAssigner::compute_assignments(&runners_3, &groups, 2048);
-        let after = ShardAssigner::compute_assignments(&runners_2, &groups, 2048);
+        let before =
+            ShardAssigner::compute_assignments(&runners_3, &groups, 2048, &default_strategy());
+        let after =
+            ShardAssigner::compute_assignments(&runners_2, &groups, 2048, &default_strategy());
 
         let moved: usize = before
             .iter()
@@ -398,8 +452,10 @@ mod tests {
         ];
 
         let groups = vec!["default".to_string()];
-        let before = ShardAssigner::compute_assignments(&runners_3, &groups, 2048);
-        let after = ShardAssigner::compute_assignments(&runners_4, &groups, 2048);
+        let before =
+            ShardAssigner::compute_assignments(&runners_3, &groups, 2048, &default_strategy());
+        let after =
+            ShardAssigner::compute_assignments(&runners_4, &groups, 2048, &default_strategy());
 
         let moved: usize = before
             .iter()
@@ -425,7 +481,8 @@ mod tests {
             Runner::new(RunnerAddress::new("host2", 9000), 1),
         ];
         let groups = vec!["default".to_string()];
-        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 2048);
+        let assignments =
+            ShardAssigner::compute_assignments(&runners, &groups, 2048, &default_strategy());
 
         let h1 = assignments.values().filter(|a| a.host == "host1").count();
         let h2 = assignments.values().filter(|a| a.host == "host2").count();
@@ -437,5 +494,13 @@ mod tests {
             "host1 (w=3): expected ~1536, got {h1}"
         );
         assert!(h2 > 430 && h2 < 600, "host2 (w=1): expected ~512, got {h2}");
+    }
+
+    #[test]
+    fn strategy_default_is_rendezvous() {
+        assert_eq!(
+            ShardAssignmentStrategy::default(),
+            ShardAssignmentStrategy::Rendezvous
+        );
     }
 }

@@ -588,11 +588,12 @@ impl ShardingImpl {
             .runners_healthy
             .set(runners.iter().filter(|r| r.healthy).count() as i64);
 
-        // 2. Compute desired assignments via HashRing
+        // 2. Compute desired assignments via configured strategy
         let desired = ShardAssigner::compute_assignments(
             &runners,
             &self.config.shard_groups,
             self.config.shards_per_group,
+            &self.config.shard_assignment_strategy,
         );
 
         // Update shard assignments map (used for remote routing)

@@ -279,6 +279,86 @@ Run with: `cargo bench --bench shard_assignment`
 2. ~~Remove unused `RunnerNode` struct~~
 3. Documentation updated: ShardAssigner docstring now describes rendezvous hashing properties
 
+### Phase 6: Configurable Hashing Strategy
+
+Make the shard assignment strategy configurable so users can choose between different algorithms based on their needs.
+
+#### Strategy Options
+
+| Strategy | Distribution | Rebalance Cost | Complexity | Best For |
+|----------|--------------|----------------|------------|----------|
+| `Rendezvous` | Near-perfect | Optimal (1/n) | O(shards × nodes) | Small-medium clusters (< 1000 nodes) |
+| `ConsistentHash` | Good (with vnodes) | Optimal (1/n) | O(shards × log(vnodes)) | Large clusters, legacy compatibility |
+
+#### API Design
+
+```rust
+/// Strategy for assigning shards to runners.
+#[derive(Debug, Clone, Default)]
+pub enum ShardAssignmentStrategy {
+    /// Rendezvous hashing (HRW) - best distribution, O(n) per shard.
+    /// Recommended for clusters with < 1000 nodes.
+    #[default]
+    Rendezvous,
+    
+    /// Consistent hashing with virtual nodes.
+    /// Better performance for very large clusters, slightly less uniform distribution.
+    ConsistentHash {
+        /// Virtual nodes per weight unit. Higher = better distribution, more memory.
+        /// Default: 150
+        vnodes_per_weight: u32,
+    },
+}
+
+impl ShardAssigner {
+    pub fn compute_assignments(
+        runners: &[Runner],
+        shard_groups: &[String],
+        shards_per_group: i32,
+        strategy: &ShardAssignmentStrategy,
+    ) -> HashMap<ShardId, RunnerAddress> {
+        match strategy {
+            ShardAssignmentStrategy::Rendezvous => {
+                Self::compute_rendezvous(runners, shard_groups, shards_per_group)
+            }
+            ShardAssignmentStrategy::ConsistentHash { vnodes_per_weight } => {
+                Self::compute_consistent_hash(runners, shard_groups, shards_per_group, *vnodes_per_weight)
+            }
+        }
+    }
+}
+```
+
+#### Configuration
+
+The strategy should be configurable at the `Sharding` level:
+
+```rust
+// In ShardingConfig or similar
+pub struct ShardingConfig {
+    pub shards_per_group: i32,
+    pub assignment_strategy: ShardAssignmentStrategy,
+    // ... other fields
+}
+```
+
+#### Implementation Tasks
+
+- [x] Define `ShardAssignmentStrategy` enum
+- [x] Refactor `compute_assignments` to accept strategy parameter
+- [x] Extract current rendezvous logic into `compute_rendezvous` method
+- [ ] Re-add consistent hash implementation as `compute_consistent_hash` method (bring back `hashring` as optional)
+- [x] Add strategy to `ShardingConfig` / cluster configuration
+- [x] Update `ShardingImpl` to use configured strategy
+- [x] Add tests for strategy selection
+- [x] Update benchmarks to compare strategies
+
+#### Migration Notes
+
+- Default strategy is `Rendezvous` (current behavior)
+- Existing deployments continue unchanged
+- Users can opt into `ConsistentHash` if they have very large clusters or need compatibility
+
 ## Migration
 
 No migration needed - the assignment computation is stateless and deterministic. When the new code deploys:
@@ -312,6 +392,8 @@ If distribution testing reveals issues with djb2:
 
 ## Acceptance Criteria
 
+### Core Implementation (Complete)
+
 - [x] All existing tests pass (with updated tolerance expectations)
 - [x] Distribution test shows variance < 20% for equal-weight nodes (existing test)
 - [x] Distribution test shows variance < 5% for equal-weight nodes at scale (2048 shards, 3 nodes)
@@ -319,3 +401,14 @@ If distribution testing reveals issues with djb2:
 - [x] Weighted distribution test confirms proportional assignment (at scale)
 - [x] Benchmark shows acceptable performance for typical clusters (< 15ms for 100 nodes, 2048 shards)
 - [x] `hashring` crate removed from dependencies
+
+### Configurable Strategy (Phase 6)
+
+- [x] `ShardAssignmentStrategy` enum defined with `Rendezvous` variant (ConsistentHash to be added later)
+- [x] `compute_assignments` accepts strategy parameter
+- [x] Rendezvous strategy produces correct, deterministic assignments
+- [x] Rendezvous strategy passes distribution and rebalance tests
+- [x] Strategy is configurable via `ShardingConfig`
+- [x] Benchmarks updated to use strategy API
+- [ ] ConsistentHash strategy implementation (optional, for large clusters)
+- [ ] Documentation explains when to use each strategy

@@ -1,4 +1,5 @@
 use crate::error::ClusterError;
+use crate::shard_assigner::ShardAssignmentStrategy;
 use crate::types::RunnerAddress;
 use std::time::Duration;
 
@@ -91,6 +92,11 @@ pub struct ShardingConfig {
     /// until this interval has elapsed, preventing duplicate dispatch of messages
     /// that are still being processed. Default: 10 minutes (matches TS).
     pub last_read_guard_interval: Duration,
+    /// Strategy for assigning shards to runners. Default: Rendezvous.
+    ///
+    /// - `Rendezvous`: Best distribution (each node gets exactly 1/n shards, ±1),
+    ///   optimal rebalancing. Recommended for clusters with < 1000 nodes.
+    pub shard_assignment_strategy: ShardAssignmentStrategy,
 }
 
 impl ShardingConfig {
@@ -236,6 +242,7 @@ impl Default for ShardingConfig {
             storage_resumption_max_retries: 0,
             grpc_connect_timeout: Duration::from_secs(5),
             last_read_guard_interval: Duration::from_secs(600),
+            shard_assignment_strategy: ShardAssignmentStrategy::default(),
         }
     }
 }

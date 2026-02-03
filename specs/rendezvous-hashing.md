@@ -411,4 +411,4 @@ If distribution testing reveals issues with djb2:
 - [x] Strategy is configurable via `ShardingConfig`
 - [x] Benchmarks updated to use strategy API
 - [ ] ConsistentHash strategy implementation (optional, for large clusters)
-- [ ] Documentation explains when to use each strategy
+- [x] Documentation explains when to use each strategy (module-level doc in shard_assigner.rs)

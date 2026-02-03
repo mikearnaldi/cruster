@@ -26,6 +26,11 @@ In Progress.
   a top-level error. Added `signal_healthy()` calls after successful storage
   operations to support re-attachment.
 
+- [x] **Task 5: Pause While Detached** - Added detachment checks to
+  `shard_acquisition_loop` and `lock_refresh_loop` to short-circuit while
+  detached. When detached, loops skip their work (rebalancing or lock refresh)
+  and continue sleeping, waiting for re-attachment.
+
 ## Problem Statement
 
 The cluster currently allows windows where a runner continues executing shard

@@ -637,6 +637,17 @@ impl ShardingImpl {
                 break;
             }
 
+            // Short-circuit while detached — no point in rebalancing when we can't
+            // safely execute shards. Sleep and wait for re-attachment.
+            if self.is_detached() {
+                tracing::trace!("shard_acquisition_loop: detached, skipping rebalance");
+                tokio::select! {
+                    _ = self.cancel.cancelled() => break,
+                    _ = tokio::time::sleep(self.config.shard_rebalance_retry_interval) => {},
+                }
+                continue;
+            }
+
             let changed = match self.rebalance_shards(&runner_storage).await {
                 Ok(changed) => changed,
                 Err(e) => {
@@ -887,6 +898,13 @@ impl ShardingImpl {
             // Check cancellation after waking up
             if self.cancel.is_cancelled() {
                 break;
+            }
+
+            // Short-circuit while detached — owned_shards is empty and we shouldn't
+            // be refreshing locks when we can't safely execute shards.
+            if self.is_detached() {
+                tracing::trace!("lock_refresh_loop: detached, skipping refresh");
+                continue;
             }
 
             let owned: std::collections::HashSet<ShardId> =

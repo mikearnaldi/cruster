@@ -31,6 +31,13 @@ In Progress.
   detached. When detached, loops skip their work (rebalancing or lock refresh)
   and continue sleeping, waiting for re-attachment.
 
+- [x] **Task 4: Reacquire Retry Window** - Implemented retry loop in
+  `rebalance_shards` for shards held by other runners. Added config options
+  `acquire_retry_interval` (default 200ms) and `acquire_retry_window` (default
+  2s). Added metrics `acquire_retry_attempts` and `acquire_retry_window_exhausted`.
+  Retries only shards held by other runners (not storage errors). Window of 0
+  disables retries for backward compatibility.
+
 ## Problem Statement
 
 The cluster currently allows windows where a runner continues executing shard

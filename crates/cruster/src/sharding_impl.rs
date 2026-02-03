@@ -789,70 +789,127 @@ impl ShardingImpl {
             return Ok(!to_release.is_empty());
         }
 
-        // 5. Acquire phase: batch acquire newly assigned shards
+        // 5. Acquire phase: batch acquire newly assigned shards with retry
         // Filter out shards currently being released
         let releasing = self.releasing_shards.read().await;
-        let to_acquire_filtered: Vec<ShardId> = to_acquire
+        let mut pending_acquire: Vec<ShardId> = to_acquire
             .iter()
             .filter(|s| !releasing.contains(s))
             .cloned()
             .collect();
         drop(releasing);
 
-        // Acquire shards (with cancellation support)
-        let batch_result = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => {
+        let mut all_newly_acquired = Vec::new();
+        let retry_window = self.config.acquire_retry_window;
+        let retry_interval = self.config.acquire_retry_interval;
+        let window_start = std::time::Instant::now();
+        let mut is_first_attempt = true;
+
+        // Retry loop for acquiring shards held by other runners
+        while !pending_acquire.is_empty() {
+            // Check cancellation before each attempt
+            if self.cancel.is_cancelled() {
                 tracing::debug!("rebalance_shards cancelled during acquire_batch");
-                return Ok(!to_release.is_empty());
+                return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
             }
-            result = runner_storage.acquire_batch(&to_acquire_filtered, &self.config.runner_address) => {
-                match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Storage error during acquire_batch - trigger detachment
-                        tracing::error!(error = %e, "acquire_batch failed, triggering detachment");
-                        self.detach(DetachmentReason::StorageError(format!(
-                            "acquire_batch failed: {}", e
-                        ))).await;
-                        return Ok(!to_release.is_empty());
-                    }
+
+            // If not first attempt, check window and sleep before retry
+            if !is_first_attempt {
+                // Check if we've exceeded the retry window
+                if window_start.elapsed() >= retry_window {
+                    tracing::warn!(
+                        remaining_shards = pending_acquire.len(),
+                        window_ms = retry_window.as_millis() as u64,
+                        "acquire retry window exhausted, giving up on remaining shards"
+                    );
+                    self.metrics.acquire_retry_window_exhausted.inc();
+                    break;
                 }
-            },
-        };
 
-        let failure_count = batch_result.failures.len();
-        if failure_count > 0 {
-            tracing::warn!(
-                failure_count,
-                "some shards failed to acquire due to storage errors"
-            );
-        }
+                // Sleep before retry
+                tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        tracing::debug!("rebalance_shards cancelled during acquire retry sleep");
+                        return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
+                    }
+                    _ = tokio::time::sleep(retry_interval) => {},
+                }
 
-        let newly_acquired = batch_result.acquired;
-
-        {
-            let mut owned = self.owned_shards.write().await;
-            for shard_id in &newly_acquired {
-                owned.insert(shard_id.clone());
-                tracing::debug!(shard_id = %shard_id, "acquired shard");
+                self.metrics.acquire_retry_attempts.inc();
+                tracing::trace!(
+                    pending_shards = pending_acquire.len(),
+                    "retrying acquire for shards held by other runners"
+                );
             }
-        }
+            is_first_attempt = false;
 
-        let not_acquired = to_acquire_filtered
-            .len()
-            .saturating_sub(newly_acquired.len())
-            .saturating_sub(failure_count);
-        if not_acquired > 0 {
-            tracing::trace!(
-                count = not_acquired,
-                "shards not acquired (held by other runners)"
-            );
+            // Acquire shards (with cancellation support)
+            let batch_result = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => {
+                    tracing::debug!("rebalance_shards cancelled during acquire_batch");
+                    return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
+                }
+                result = runner_storage.acquire_batch(&pending_acquire, &self.config.runner_address) => {
+                    match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // Storage error during acquire_batch - trigger detachment
+                            tracing::error!(error = %e, "acquire_batch failed, triggering detachment");
+                            self.detach(DetachmentReason::StorageError(format!(
+                                "acquire_batch failed: {}", e
+                            ))).await;
+                            return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
+                        }
+                    }
+                },
+            };
+
+            // Handle storage errors for individual shards - remove them from pending
+            // (don't retry shards that failed due to storage errors, only shards held elsewhere)
+            let failed_shard_ids: HashSet<_> = batch_result
+                .failures
+                .iter()
+                .map(|(shard_id, _)| shard_id.clone())
+                .collect();
+            if !failed_shard_ids.is_empty() {
+                tracing::warn!(
+                    failure_count = failed_shard_ids.len(),
+                    "some shards failed to acquire due to storage errors (will not retry)"
+                );
+            }
+
+            // Add acquired shards to owned_shards and track them
+            {
+                let mut owned = self.owned_shards.write().await;
+                for shard_id in &batch_result.acquired {
+                    owned.insert(shard_id.clone());
+                    tracing::debug!(shard_id = %shard_id, "acquired shard");
+                }
+            }
+            all_newly_acquired.extend(batch_result.acquired.clone());
+
+            // Remove acquired and failed shards from pending
+            let acquired_set: HashSet<_> = batch_result.acquired.into_iter().collect();
+            pending_acquire.retain(|s| !acquired_set.contains(s) && !failed_shard_ids.contains(s));
+
+            // If no retries configured, break after first attempt
+            if retry_window.is_zero() {
+                if !pending_acquire.is_empty() {
+                    tracing::trace!(
+                        count = pending_acquire.len(),
+                        "shards not acquired (held by other runners, no retry configured)"
+                    );
+                }
+                break;
+            }
         }
 
         // Update metrics
         let owned_count = self.owned_shards.read().await.len();
         self.metrics.shards.set(owned_count as i64);
+        let newly_acquired = all_newly_acquired;
 
         // 6. If we acquired new shards, reset them in message storage and trigger poll
         if !newly_acquired.is_empty() && !self.cancel.is_cancelled() {

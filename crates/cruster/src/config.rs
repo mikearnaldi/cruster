@@ -119,6 +119,16 @@ pub struct ShardingConfig {
     /// When the lease keep-alive fails this many times in a row, the runner
     /// detaches from the cluster to prevent split-brain. Default: 3.
     pub keepalive_failure_threshold: u32,
+
+    /// Interval between acquire retries for shards held by other runners.
+    /// After the initial acquire_batch, shards that were not acquired due to
+    /// being held elsewhere are retried at this interval. Default: 200ms.
+    pub acquire_retry_interval: Duration,
+
+    /// Maximum duration to retry acquiring shards before giving up for this
+    /// rebalance cycle. Retries continue until either all shards are acquired
+    /// or this window elapses. 0 = no retries (single attempt). Default: 2s.
+    pub acquire_retry_window: Duration,
 }
 
 impl ShardingConfig {
@@ -269,6 +279,8 @@ impl Default for ShardingConfig {
             detachment_recover_window: Duration::from_millis(500),
             detachment_enabled: false,
             keepalive_failure_threshold: 3,
+            acquire_retry_interval: Duration::from_millis(200),
+            acquire_retry_window: Duration::from_secs(2),
         }
     }
 }

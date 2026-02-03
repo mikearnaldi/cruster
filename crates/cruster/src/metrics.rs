@@ -18,6 +18,10 @@ pub struct ClusterMetrics {
     pub lease_keepalive_failures: IntCounter,
     /// Current consecutive keep-alive failure streak.
     pub lease_keepalive_failure_streak: IntGauge,
+    /// Total number of acquire retry attempts for shards held by other runners.
+    pub acquire_retry_attempts: IntCounter,
+    /// Number of times the acquire retry window was exhausted without acquiring all shards.
+    pub acquire_retry_window_exhausted: IntCounter,
 }
 
 impl ClusterMetrics {
@@ -52,6 +56,14 @@ impl ClusterMetrics {
             "cluster_lease_keepalive_failure_streak",
             "Current consecutive keep-alive failure streak",
         ))?;
+        let acquire_retry_attempts = IntCounter::with_opts(Opts::new(
+            "cluster_acquire_retry_attempts_total",
+            "Total number of acquire retry attempts for shards held by other runners",
+        ))?;
+        let acquire_retry_window_exhausted = IntCounter::with_opts(Opts::new(
+            "cluster_acquire_retry_window_exhausted_total",
+            "Number of times the acquire retry window was exhausted",
+        ))?;
 
         registry.register(Box::new(entities.clone()))?;
         registry.register(Box::new(singletons.clone()))?;
@@ -61,6 +73,8 @@ impl ClusterMetrics {
         registry.register(Box::new(sharding_detached.clone()))?;
         registry.register(Box::new(lease_keepalive_failures.clone()))?;
         registry.register(Box::new(lease_keepalive_failure_streak.clone()))?;
+        registry.register(Box::new(acquire_retry_attempts.clone()))?;
+        registry.register(Box::new(acquire_retry_window_exhausted.clone()))?;
 
         Ok(Self {
             entities,
@@ -71,6 +85,8 @@ impl ClusterMetrics {
             sharding_detached,
             lease_keepalive_failures,
             lease_keepalive_failure_streak,
+            acquire_retry_attempts,
+            acquire_retry_window_exhausted,
         })
     }
 
@@ -94,6 +110,16 @@ impl ClusterMetrics {
             lease_keepalive_failure_streak: IntGauge::new(
                 "cluster_lease_keepalive_failure_streak",
                 "streak",
+            )
+            .expect("valid metric name"),
+            acquire_retry_attempts: IntCounter::new(
+                "cluster_acquire_retry_attempts_total",
+                "retries",
+            )
+            .expect("valid metric name"),
+            acquire_retry_window_exhausted: IntCounter::new(
+                "cluster_acquire_retry_window_exhausted_total",
+                "exhausted",
             )
             .expect("valid metric name"),
         }

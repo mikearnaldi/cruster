@@ -65,4 +65,9 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 trybuild = "1"
+
+[[bench]]
+name = "shard_assignment"
+harness = false

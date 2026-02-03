@@ -31,9 +31,6 @@ prost = "0.13"
 # Errors
 thiserror = { workspace = true }
 
-# Hashing
-hashring = "0.3"
-
 # Concurrency
 dashmap = "6"
 parking_lot = "0.12"

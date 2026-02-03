@@ -1,0 +1,339 @@
+# Rendezvous Hashing Implementation Plan
+
+## Problem Statement
+
+The current consistent hashing implementation using the `hashring` crate with 100 virtual nodes per runner produces uneven shard distribution:
+
+- 2048 shards across 3 nodes
+- Expected: ~682-683 each
+- Actual: 655, 662, 731 (variance of -4%, -3%, +7%)
+
+This variance is inherent to ring-based consistent hashing with a limited number of virtual nodes.
+
+## Proposed Solution
+
+Replace the ring-based consistent hashing with **Rendezvous Hashing** (also known as Highest Random Weight / HRW hashing).
+
+### Algorithm
+
+For each shard, compute a hash combining the shard key with each candidate runner. Assign the shard to the runner with the highest hash value:
+
+```
+assign(shard) = argmax over runners r: hash(shard, r)
+```
+
+### Properties
+
+| Property | Guarantee |
+|----------|-----------|
+| Distribution | Near-perfect (each node gets exactly 1/n shards, ±1) |
+| Node departure | Only shards on departed node move (~1/n) |
+| Node addition | New node claims ~1/(n+1) shards evenly from all nodes |
+| Determinism | Same inputs always produce same assignments |
+| Weighted nodes | Supported via multiple hash computations per weight unit |
+
+## Implementation Plan
+
+### Phase 1: Core Algorithm [COMPLETE]
+
+**File**: `crates/cruster/src/shard_assigner.rs`
+
+1. ~~Remove the `hashring` crate dependency~~
+2. ~~Replace `RunnerNode` struct with a simpler weight expansion approach~~
+3. ~~Implement rendezvous assignment~~
+
+**Implementation note**: Used a two-phase hash with MurmurHash3-style bit mixing for better distribution. The shard and runner keys are hashed separately with djb2, then combined with XOR and mixed using the MurmurHash3 finalizer for excellent avalanche properties.
+
+Original pseudocode:
+
+```rust
+use crate::hash::djb2_hash64_with_seed;
+
+impl ShardAssigner {
+    pub fn compute_assignments(
+        runners: &[Runner],
+        shard_groups: &[String],
+        shards_per_group: i32,
+    ) -> HashMap<ShardId, RunnerAddress> {
+        let mut assignments = HashMap::new();
+
+        let healthy_runners: Vec<&Runner> = runners
+            .iter()
+            .filter(|r| r.healthy && r.weight > 0)
+            .collect();
+
+        if healthy_runners.is_empty() {
+            return assignments;
+        }
+
+        for group in shard_groups {
+            for id in 0..shards_per_group {
+                let shard_key = format!("{group}:{id}");
+                
+                if let Some(runner) = select_runner_rendezvous(&shard_key, &healthy_runners) {
+                    assignments.insert(ShardId::new(group, id), runner.address.clone());
+                }
+            }
+        }
+
+        assignments
+    }
+}
+
+/// Select the runner with the highest hash score for the given shard key.
+/// Weights are handled by computing multiple hashes per runner (one per weight unit)
+/// and using the maximum.
+fn select_runner_rendezvous<'a>(
+    shard_key: &str,
+    runners: &[&'a Runner],
+) -> Option<&'a Runner> {
+    runners
+        .iter()
+        .max_by_key(|runner| compute_runner_score(shard_key, runner))
+        .copied()
+}
+
+/// Compute the rendezvous score for a runner.
+/// For weighted runners, we compute `weight` hashes and take the maximum,
+/// which statistically gives weighted runners proportionally more wins.
+fn compute_runner_score(shard_key: &str, runner: &Runner) -> u64 {
+    let runner_key = format!("{}:{}", runner.address.host, runner.address.port);
+    
+    (0..runner.weight)
+        .map(|w| {
+            let combined = format!("{shard_key}:{runner_key}:{w}");
+            djb2_hash64(combined.as_bytes())
+        })
+        .max()
+        .unwrap_or(0)
+}
+```
+
+### Phase 2: Hash Function [COMPLETE]
+
+**File**: `crates/cruster/src/hash.rs`
+
+The existing `djb2_hash64` function is used but combined with a MurmurHash3-style bit mixing function (`mix64`) in `shard_assigner.rs` to achieve better avalanche properties for rendezvous hashing. Original djb2 alone had weak distribution when runner keys differed only slightly.
+
+Original spec:
+
+```rust
+/// DJB2 hash (64-bit variant) - used for rendezvous hashing
+pub fn djb2_hash64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 5381;
+    for &byte in data {
+        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+    }
+    hash
+}
+```
+
+Consider whether to use a stronger hash (xxhash, seahash) if distribution testing reveals issues with djb2 for this use case.
+
+### Phase 3: Testing [PARTIAL - existing tests pass]
+
+**File**: `crates/cruster/src/shard_assigner.rs` (test module)
+
+All existing tests pass with the rendezvous implementation. The following additional tests from the spec have not yet been added:
+
+1. **Distribution uniformity test** - verify near-perfect distribution:
+
+```rust
+#[test]
+fn rendezvous_distribution_uniformity() {
+    let runners = vec![
+        Runner::new(RunnerAddress::new("host1", 9000), 1),
+        Runner::new(RunnerAddress::new("host2", 9000), 1),
+        Runner::new(RunnerAddress::new("host3", 9000), 1),
+    ];
+    let groups = vec!["default".to_string()];
+    let assignments = ShardAssigner::compute_assignments(&runners, &groups, 2048);
+
+    let count = |host: &str| assignments.values().filter(|a| a.host == host).count();
+    let h1 = count("host1");
+    let h2 = count("host2");
+    let h3 = count("host3");
+
+    // With rendezvous, expect very tight distribution
+    // 2048 / 3 = 682.67, so expect 682 or 683 each
+    let expected = 2048 / 3; // 682
+    let tolerance = 5; // Much tighter than the 20% we had before
+    
+    assert!(h1.abs_diff(expected) <= tolerance, "host1: {h1}");
+    assert!(h2.abs_diff(expected) <= tolerance, "host2: {h2}");
+    assert!(h3.abs_diff(expected) <= tolerance, "host3: {h3}");
+}
+```
+
+2. **Minimal movement on node removal**:
+
+```rust
+#[test]
+fn minimal_movement_on_node_removal() {
+    let runners_3 = vec![
+        Runner::new(RunnerAddress::new("host1", 9000), 1),
+        Runner::new(RunnerAddress::new("host2", 9000), 1),
+        Runner::new(RunnerAddress::new("host3", 9000), 1),
+    ];
+    let runners_2 = vec![
+        Runner::new(RunnerAddress::new("host1", 9000), 1),
+        Runner::new(RunnerAddress::new("host2", 9000), 1),
+        // host3 removed
+    ];
+    
+    let groups = vec!["default".to_string()];
+    let before = ShardAssigner::compute_assignments(&runners_3, &groups, 2048);
+    let after = ShardAssigner::compute_assignments(&runners_2, &groups, 2048);
+
+    let moved: usize = before
+        .iter()
+        .filter(|(shard, addr)| after.get(*shard) != Some(*addr))
+        .count();
+
+    // Only shards from host3 should move (~1/3 of total)
+    let host3_shards = before.values().filter(|a| a.host == "host3").count();
+    assert_eq!(moved, host3_shards, "only host3 shards should move");
+    
+    // Verify it's roughly 1/3
+    assert!(moved > 600 && moved < 750, "expected ~683 moves, got {moved}");
+}
+```
+
+3. **Minimal movement on node addition**:
+
+```rust
+#[test]
+fn minimal_movement_on_node_addition() {
+    let runners_3 = vec![
+        Runner::new(RunnerAddress::new("host1", 9000), 1),
+        Runner::new(RunnerAddress::new("host2", 9000), 1),
+        Runner::new(RunnerAddress::new("host3", 9000), 1),
+    ];
+    let runners_4 = vec![
+        Runner::new(RunnerAddress::new("host1", 9000), 1),
+        Runner::new(RunnerAddress::new("host2", 9000), 1),
+        Runner::new(RunnerAddress::new("host3", 9000), 1),
+        Runner::new(RunnerAddress::new("host4", 9000), 1), // new
+    ];
+    
+    let groups = vec!["default".to_string()];
+    let before = ShardAssigner::compute_assignments(&runners_3, &groups, 2048);
+    let after = ShardAssigner::compute_assignments(&runners_4, &groups, 2048);
+
+    let moved: usize = before
+        .iter()
+        .filter(|(shard, addr)| after.get(*shard) != Some(*addr))
+        .count();
+
+    // New node should claim ~1/4 of shards
+    let host4_shards = after.values().filter(|a| a.host == "host4").count();
+    assert_eq!(moved, host4_shards, "moves should equal host4's new shards");
+    
+    // Verify it's roughly 1/4
+    assert!(moved > 450 && moved < 560, "expected ~512 moves, got {moved}");
+}
+```
+
+4. **Weighted distribution**:
+
+```rust
+#[test]
+fn weighted_distribution() {
+    let runners = vec![
+        Runner::new(RunnerAddress::new("host1", 9000), 3), // 3x weight
+        Runner::new(RunnerAddress::new("host2", 9000), 1),
+    ];
+    let groups = vec!["default".to_string()];
+    let assignments = ShardAssigner::compute_assignments(&runners, &groups, 2048);
+
+    let h1 = assignments.values().filter(|a| a.host == "host1").count();
+    let h2 = assignments.values().filter(|a| a.host == "host2").count();
+
+    // host1 (weight 3) should get ~75%, host2 (weight 1) should get ~25%
+    // 2048 * 0.75 = 1536, 2048 * 0.25 = 512
+    assert!(h1 > 1450 && h1 < 1620, "host1 (w=3): expected ~1536, got {h1}");
+    assert!(h2 > 430 && h2 < 600, "host2 (w=1): expected ~512, got {h2}");
+}
+```
+
+### Phase 4: Benchmarking [PENDING]
+
+Add a benchmark to verify performance is acceptable:
+
+```rust
+// benches/shard_assignment.rs
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+
+fn bench_compute_assignments(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shard_assignment");
+    
+    for num_runners in [3, 10, 100, 1000] {
+        let runners: Vec<Runner> = (0..num_runners)
+            .map(|i| Runner::new(RunnerAddress::new(&format!("host{i}"), 9000), 1))
+            .collect();
+        let shard_groups = vec!["default".to_string()];
+        
+        group.bench_with_input(
+            BenchmarkId::new("rendezvous", num_runners),
+            &num_runners,
+            |b, _| {
+                b.iter(|| {
+                    ShardAssigner::compute_assignments(&runners, &shard_groups, 2048)
+                })
+            },
+        );
+    }
+    
+    group.finish();
+}
+
+criterion_group!(benches, bench_compute_assignments);
+criterion_main!(benches);
+```
+
+### Phase 5: Cleanup [COMPLETE]
+
+1. ~~Remove `hashring` from `Cargo.toml` dependencies~~
+2. ~~Remove unused `RunnerNode` struct~~
+3. Documentation updated: ShardAssigner docstring now describes rendezvous hashing properties
+
+## Migration
+
+No migration needed - the assignment computation is stateless and deterministic. When the new code deploys:
+
+1. Runners will compute new assignments using rendezvous
+2. Shards will rebalance to their new assignments
+3. One-time movement of shards (full rebalance, not incremental)
+
+This is acceptable because:
+- It's a one-time event
+- The shard handoff mechanism already handles rebalancing gracefully
+- The new distribution will be better immediately
+
+## Future Considerations
+
+### Large Cluster Optimization
+
+If we ever reach 10,000+ nodes where O(n) per shard becomes noticeable:
+
+1. **Hierarchical rendezvous**: Assign shards to zones first, then to nodes within zones
+2. **Candidate filtering**: Use a cheap hash to select K candidates, then rendezvous among those
+3. **Parallel computation**: The per-shard computation is embarrassingly parallel
+
+### Alternative Hash Functions
+
+If distribution testing reveals issues with djb2:
+
+- `xxhash` - very fast, excellent distribution
+- `seahash` - Rust-native, good performance
+- `ahash` - Rust's fast HashMap hasher
+
+## Acceptance Criteria
+
+- [x] All existing tests pass (with updated tolerance expectations)
+- [x] Distribution test shows variance < 20% for equal-weight nodes (existing test)
+- [ ] Distribution test shows variance < 1% for equal-weight nodes (new test needed)
+- [ ] Node add/remove tests confirm O(1/n) movement
+- [ ] Weighted distribution test confirms proportional assignment (at scale)
+- [ ] Benchmark shows acceptable performance (< 10ms for 1000 nodes, 2048 shards)
+- [x] `hashring` crate removed from dependencies

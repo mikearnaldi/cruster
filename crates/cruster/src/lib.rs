@@ -24,6 +24,7 @@
 
 pub mod config;
 pub mod cron;
+pub mod detachment;
 pub mod entity;
 pub mod entity_client;
 pub mod entity_manager;

@@ -12,6 +12,8 @@ pub struct ClusterMetrics {
     pub runners_healthy: IntGauge,
     /// Number of shards owned by this runner.
     pub shards: IntGauge,
+    /// Whether the runner is detached from the cluster (0 = attached, 1 = detached).
+    pub sharding_detached: IntGauge,
 }
 
 impl ClusterMetrics {
@@ -34,12 +36,17 @@ impl ClusterMetrics {
             "cluster_shards",
             "Number of shards owned by this runner",
         ))?;
+        let sharding_detached = IntGauge::with_opts(Opts::new(
+            "cluster_sharding_detached",
+            "Whether the runner is detached from the cluster (0 = attached, 1 = detached)",
+        ))?;
 
         registry.register(Box::new(entities.clone()))?;
         registry.register(Box::new(singletons.clone()))?;
         registry.register(Box::new(runners.clone()))?;
         registry.register(Box::new(runners_healthy.clone()))?;
         registry.register(Box::new(shards.clone()))?;
+        registry.register(Box::new(sharding_detached.clone()))?;
 
         Ok(Self {
             entities,
@@ -47,6 +54,7 @@ impl ClusterMetrics {
             runners,
             runners_healthy,
             shards,
+            sharding_detached,
         })
     }
 
@@ -60,6 +68,8 @@ impl ClusterMetrics {
             runners_healthy: IntGauge::new("cluster_runners_healthy", "healthy")
                 .expect("valid metric name"),
             shards: IntGauge::new("cluster_shards", "shards").expect("valid metric name"),
+            sharding_detached: IntGauge::new("cluster_sharding_detached", "detached")
+                .expect("valid metric name"),
         }
     }
 }

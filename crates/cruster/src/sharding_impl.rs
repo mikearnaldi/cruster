@@ -12,6 +12,7 @@ use tokio_stream::Stream;
 use tracing::instrument;
 
 use crate::config::ShardingConfig;
+use crate::detachment::{DetachedState, DetachmentReason};
 use crate::durable::{WorkflowEngine, WorkflowStorage, INTERRUPT_SIGNAL};
 use crate::entity::Entity;
 use crate::entity_client::EntityClient;
@@ -138,6 +139,13 @@ pub struct ShardingImpl {
     /// access to the sharding interface for inter-entity communication and
     /// scheduled messages.
     self_ref: OnceLock<Weak<ShardingImpl>>,
+
+    /// Detachment state tracking for storage connectivity.
+    ///
+    /// When detached, the runner clears owned shards and pauses acquisition/refresh
+    /// loops to prevent split-brain scenarios where multiple runners execute the
+    /// same shard concurrently.
+    detached_state: Arc<DetachedState>,
 }
 
 /// A reusable singleton factory function that can be called multiple times
@@ -226,6 +234,7 @@ impl ShardingImpl {
         let snowflake = Arc::new(SnowflakeGenerator::new());
         let cancel = tokio_util::sync::CancellationToken::new();
         let reaper = Arc::new(EntityReaper::new(cancel.clone()));
+        let detached_state = Arc::new(DetachedState::new(config.detachment_recover_window));
 
         let this = Arc::new(Self {
             config,
@@ -257,6 +266,7 @@ impl ShardingImpl {
             unregistered_first_seen: DashMap::new(),
             singleton_lock: tokio::sync::Mutex::new(()),
             self_ref: OnceLock::new(),
+            detached_state,
         });
 
         // Initialize self-reference for entity managers to access sharding.
@@ -419,6 +429,92 @@ impl ShardingImpl {
     /// Look up the runner that owns a shard (async version, blocks until lock available).
     async fn get_shard_owner_async(&self, shard_id: &ShardId) -> Option<RunnerAddress> {
         self.shard_assignments.read().await.get(shard_id).cloned()
+    }
+
+    // -------------------------------------------------------------------------
+    // Detachment API
+    // -------------------------------------------------------------------------
+
+    /// Check if the runner is currently detached from the cluster.
+    ///
+    /// When detached, the runner should not execute shard entities and should
+    /// pause acquisition/refresh loops.
+    #[inline]
+    pub fn is_detached(&self) -> bool {
+        self.config.detachment_enabled && self.detached_state.is_detached()
+    }
+
+    /// Detach from the cluster with the given reason.
+    ///
+    /// This clears owned shards and interrupts all entities to prevent split-brain.
+    /// Returns `true` if this call caused the transition from attached to detached.
+    pub async fn detach(&self, reason: DetachmentReason) {
+        if !self.config.detachment_enabled {
+            tracing::debug!(
+                reason = %reason,
+                "detachment triggered but detachment_enabled=false, ignoring"
+            );
+            return;
+        }
+
+        let transitioned = self.detached_state.detach(reason);
+        if transitioned {
+            self.handle_detachment().await;
+        }
+    }
+
+    /// Signal that a healthy storage operation was observed.
+    ///
+    /// If detached, this may trigger re-attachment if the recovery window has
+    /// elapsed with sustained healthy status.
+    pub fn signal_healthy(&self) {
+        if !self.config.detachment_enabled {
+            return;
+        }
+
+        if self.detached_state.maybe_reattach() {
+            self.metrics.sharding_detached.set(0);
+        }
+    }
+
+    /// Signal that an unhealthy storage operation was observed while detached.
+    ///
+    /// This resets the recovery window, requiring another full recovery period
+    /// before re-attachment can occur.
+    pub fn signal_unhealthy(&self) {
+        if self.config.detachment_enabled {
+            self.detached_state.reset_healthy_since();
+        }
+    }
+
+    /// Handle the transition to detached state.
+    ///
+    /// Clears owned shards and interrupts all entities to prevent split-brain.
+    async fn handle_detachment(&self) {
+        self.metrics.sharding_detached.set(1);
+
+        // Clear owned shards
+        let shards_to_interrupt: Vec<ShardId> = {
+            let mut owned = self.owned_shards.write().await;
+            let shards: Vec<_> = owned.drain().collect();
+            self.metrics.shards.set(0);
+            shards
+        };
+
+        // Interrupt all entities on the cleared shards
+        for shard_id in &shards_to_interrupt {
+            for entry in self.entity_managers.iter() {
+                entry.value().interrupt_shard(shard_id).await;
+            }
+        }
+
+        // Sync singletons to stop any running (shards are now empty)
+        self.sync_singletons().await;
+
+        tracing::warn!(
+            shards_interrupted = shards_to_interrupt.len(),
+            "detachment complete: cleared owned shards and interrupted entities"
+        );
     }
 
     /// Whether an error is retryable during shard rebalancing.

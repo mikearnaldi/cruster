@@ -27,9 +27,20 @@ while [[ $# -gt 0 ]]; do
         --judge-first) JUDGE_FIRST=true; USE_JUDGE=true; shift ;;
         --help|-h)
             echo "Usage: ./ralph-auto.sh <focus prompt> [options]"
-            echo "Options: --skip-checks, --max-iterations <n>, --judge, --judge-first, --help"
-            echo "Environment: OPENCODE_MODEL (default: anthropic/claude-opus-4-5)"
-            echo "Environment: OPENCODE_VARIANT (default: high)"
+            echo ""
+            echo "Options:"
+            echo "  --skip-checks        Skip CI checks"
+            echo "  --max-iterations <n> Limit iterations"
+            echo "  --judge              Enable judge agent"
+            echo "  --judge-first        Run judge before starting"
+            echo "  --help               Show this help"
+            echo ""
+            echo "Configuration: ralph-auto.jsonc (required)"
+            echo "  specsDir      Directory containing specs"
+            echo "  model         OpenCode model"
+            echo "  variant       OpenCode variant"
+            echo "  commitPrefix  Git commit prefix"
+            echo "  checks        Array of {name, command} CI checks"
             exit 0 ;;
         -*) echo "Unknown option: $1"; exit 1 ;;
         *)
@@ -46,11 +57,24 @@ if [[ -z "$FOCUS_PROMPT" ]]; then
     exit 1
 fi
 
-PROMPT_TEMPLATE="RALPH_AUTO_PROMPT.md"
 COMPLETE_MARKER="NOTHING_LEFT_TO_DO"
 OUTPUT_DIR=".ralph-auto"
-OPENCODE_MODEL="${OPENCODE_MODEL:-anthropic/claude-opus-4-5}"
-OPENCODE_VARIANT="${OPENCODE_VARIANT:-high}"
+CONFIG_FILE="ralph-auto.jsonc"
+
+# Strip JSONC comments and parse JSON
+parse_jsonc() {
+    sed 's|//.*$||g; s|/\*.*\*/||g' "$CONFIG_FILE" | jq -c '.'
+}
+
+# Load config (called after config file check)
+load_config() {
+    local config
+    config=$(parse_jsonc)
+    SPECS_DIR=$(echo "$config" | jq -r '.specsDir')
+    OPENCODE_MODEL=$(echo "$config" | jq -r '.model')
+    OPENCODE_VARIANT=$(echo "$config" | jq -r '.variant')
+    COMMIT_PREFIX=$(echo "$config" | jq -r '.commitPrefix')
+}
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -94,12 +118,31 @@ log() {
 check_prerequisites() {
     log "INFO" "Checking prerequisites..."
     command -v opencode &> /dev/null || { log "ERROR" "OpenCode is not installed"; exit 1; }
+    command -v jq &> /dev/null || { log "ERROR" "jq is not installed"; exit 1; }
     git rev-parse --git-dir > /dev/null 2>&1 || { log "ERROR" "Not in a git repository"; exit 1; }
-    [ -d "specs" ] || { log "ERROR" "specs/ directory not found"; exit 1; }
-    local spec_count=$(find specs -name "*.md" -type f | wc -l | tr -d ' ')
-    [ "$spec_count" -eq 0 ] && { log "ERROR" "No .md files in specs/"; exit 1; }
-    log "INFO" "Found $spec_count actionable spec(s) in specs/"
-    [ -f "$PROMPT_TEMPLATE" ] || { log "ERROR" "$PROMPT_TEMPLATE not found"; exit 1; }
+    [ -f "$CONFIG_FILE" ] || { log "ERROR" "$CONFIG_FILE not found"; exit 1; }
+    
+    # Validate config has all required fields
+    local config
+    config=$(parse_jsonc) || { log "ERROR" "$CONFIG_FILE is not valid JSON"; exit 1; }
+    
+    local missing=""
+    echo "$config" | jq -e '.specsDir' > /dev/null 2>&1 || missing+=" specsDir"
+    echo "$config" | jq -e '.model' > /dev/null 2>&1 || missing+=" model"
+    echo "$config" | jq -e '.variant' > /dev/null 2>&1 || missing+=" variant"
+    echo "$config" | jq -e '.commitPrefix' > /dev/null 2>&1 || missing+=" commitPrefix"
+    echo "$config" | jq -e '.checks | length > 0' > /dev/null 2>&1 || missing+=" checks"
+    
+    [ -n "$missing" ] && { log "ERROR" "$CONFIG_FILE missing required fields:$missing"; exit 1; }
+    
+    # Load config values
+    load_config
+    log "INFO" "Model: $OPENCODE_MODEL, Variant: $OPENCODE_VARIANT"
+    
+    [ -d "$SPECS_DIR" ] || { log "ERROR" "$SPECS_DIR/ directory not found"; exit 1; }
+    local spec_count=$(find "$SPECS_DIR" -name "*.md" -type f | wc -l | tr -d ' ')
+    [ "$spec_count" -eq 0 ] && { log "ERROR" "No .md files in $SPECS_DIR/"; exit 1; }
+    log "INFO" "Found $spec_count spec(s) in $SPECS_DIR/"
     log "SUCCESS" "Prerequisites check passed"
 }
 
@@ -176,54 +219,41 @@ stream_filter() {
     echo ""
 }
 
+load_ci_checks() {
+    parse_jsonc | jq -c '.checks'
+}
+
 run_ci_checks() {
     log "INFO" "Running CI checks..."
     local ci_failed=0
     local error_output=""
+    local checks
+    checks=$(load_ci_checks)
+    local check_count
+    check_count=$(echo "$checks" | jq 'length')
 
     echo "=========================================="
     echo "Running CI Checks"
     echo "=========================================="
 
-    echo -e "\n1. Cargo Check...\n-----------------"
-    local check_output
-    if check_output=$(cargo check --all-targets 2>&1); then
-        echo -e "${GREEN}Cargo check passed${NC}"
-    else
-        echo -e "${RED}Cargo check failed${NC}"
-        ci_failed=1
-        error_output+="## Cargo Check Failed\n\`\`\`\n$check_output\n\`\`\`\n\n"
-    fi
-
-    echo -e "\n2. Clippy (Linting)...\n----------------------"
-    local clippy_output
-    if clippy_output=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1); then
-        echo -e "${GREEN}Clippy passed${NC}"
-    else
-        echo -e "${RED}Clippy failed${NC}"
-        ci_failed=1
-        error_output+="## Clippy Failed\n\`\`\`\n$clippy_output\n\`\`\`\n\n"
-    fi
-
-    echo -e "\n3. Documentation Check...\n-------------------------"
-    local doc_output
-    if doc_output=$(cargo doc --no-deps 2>&1); then
-        echo -e "${GREEN}Documentation check passed${NC}"
-    else
-        echo -e "${RED}Documentation check failed${NC}"
-        ci_failed=1
-        error_output+="## Documentation Check Failed\n\`\`\`\n$doc_output\n\`\`\`\n\n"
-    fi
-
-    echo -e "\n4. Running Tests...\n-------------------"
-    local test_output
-    if test_output=$(cargo test 2>&1); then
-        echo -e "${GREEN}Tests passed${NC}"
-    else
-        echo -e "${RED}Tests failed${NC}"
-        ci_failed=1
-        error_output+="## Tests Failed\n\`\`\`\n$test_output\n\`\`\`\n\n"
-    fi
+    local i=0
+    while [ $i -lt "$check_count" ]; do
+        local name command check_output
+        name=$(echo "$checks" | jq -r ".[$i].name")
+        command=$(echo "$checks" | jq -r ".[$i].command")
+        
+        echo -e "\n$((i+1)). $name...\n$(printf '%*s' ${#name} '' | tr ' ' '-')---"
+        
+        if check_output=$(eval "$command" 2>&1); then
+            echo -e "${GREEN}$name passed${NC}"
+        else
+            echo -e "${RED}$name failed${NC}"
+            ci_failed=1
+            error_output+="## $name Failed\n\`\`\`\n$check_output\n\`\`\`\n\n"
+        fi
+        
+        ((i++))
+    done
 
     echo -e "\n=========================================="
     if [ $ci_failed -eq 0 ]; then
@@ -243,7 +273,7 @@ commit_changes() {
     log "INFO" "Committing changes..."
     git add -A
     git diff --cached --quiet && { log "WARN" "No changes to commit"; return 0; }
-    if git commit -m "feat(auto): $task_summary
+    if git commit -m "$COMMIT_PREFIX: $task_summary
 
 Ralph-Auto-Iteration: $iteration
 
@@ -277,13 +307,175 @@ Read: \`$OUTPUT_DIR/ci_errors.txt\`
 Signal TASK_COMPLETE when done.
 "
 
-    local specs_list=$(find specs -name "*.md" -type f | sort | while read f; do echo "- \`$f\`"; done)
-    local prompt=$(cat "$PROMPT_TEMPLATE")
-    prompt="${prompt//\{\{SPECS_LIST\}\}/$specs_list}"
-    prompt="${prompt//\{\{ITERATION\}\}/$iteration}"
-    prompt="${prompt//\{\{CI_ERRORS\}\}/$ci_errors}"
-    prompt="${prompt//\{\{FOCUS\}\}/$focus_section}"
-    echo "$prompt"
+    local specs_list=$(find "$SPECS_DIR" -name "*.md" -type f | sort | while read f; do echo "- \`$f\`"; done)
+    
+    # Build CI checks list from config
+    local checks_list=""
+    local commands_table=""
+    local checks
+    checks=$(load_ci_checks)
+    local check_count
+    check_count=$(echo "$checks" | jq 'length')
+    local i=0
+    while [ $i -lt "$check_count" ]; do
+        local name command
+        name=$(echo "$checks" | jq -r ".[$i].name")
+        command=$(echo "$checks" | jq -r ".[$i].command")
+        checks_list+="$((i+1)). \`$command\` - $name must pass
+"
+        commands_table+="| \`$command\` | $name (CI) |
+"
+        ((i++))
+    done
+    
+    # Add additional commands from config
+    local extra_commands
+    extra_commands=$(parse_jsonc | jq -c '.commands // []')
+    local extra_count
+    extra_count=$(echo "$extra_commands" | jq 'length')
+    i=0
+    while [ $i -lt "$extra_count" ]; do
+        local name command
+        name=$(echo "$extra_commands" | jq -r ".[$i].name")
+        command=$(echo "$extra_commands" | jq -r ".[$i].command")
+        commands_table+="| \`$command\` | $name |
+"
+        ((i++))
+    done
+
+    cat <<PROMPT_EOF
+# Ralph Auto Loop - Autonomous Implementation Agent
+
+You are an autonomous coding agent working on a focused topic.
+
+## Focus Mode
+
+The **focus input** specifies the topic you should work on. Within that topic:
+- You **select your own tasks** based on what needs to be done
+- You complete **one task at a time**, then signal completion
+- You **update specs** to track task status as you work
+- You may **create new tasks** if you discover they are needed
+- When all work for the focus topic is complete, signal that nothing is left to do
+
+## The $SPECS_DIR/ Directory
+
+The \`$SPECS_DIR/\` directory contains all documentation about this application:
+- **Implementation plans** - specifications for features to be built
+- **Best practices** - conventions for Rust, testing, etc.
+- **Architecture context** - how the app has been built and why
+
+Use these files as reference when implementing tasks. Read relevant specs before making changes.
+
+**Available specs:**
+
+$specs_list
+
+## Critical Rules
+
+1. **STAY ON TOPIC**: Work only on tasks related to the focus input. Do not work on unrelated areas.
+2. **DO NOT COMMIT**: The Ralph Auto script handles all git commits. Just write code.
+3. **CI MUST BE GREEN**: Your code MUST pass all CI checks before signaling completion.
+4. **ONE TASK PER ITERATION**: Complete one task, signal completion, then STOP.
+5. **UPDATE SPECS**: Update spec files to mark tasks complete, add new tasks, or track progress.
+
+## Signals
+
+### TASK_COMPLETE
+
+When you have finished a task AND verified CI is green, output **exactly** this format:
+
+\`\`\`
+TASK_COMPLETE: Brief description of what you implemented
+\`\`\`
+
+**FORMAT REQUIREMENTS (the script parses this for git commit):**
+- Must be on its own line
+- Must start with exactly \`TASK_COMPLETE:\` (with colon)
+- Description follows the colon and space
+- Description becomes the git commit message - keep it concise (one line, under 72 chars)
+- No markdown formatting, no backticks, no extra text around it
+
+**Examples:**
+- \`TASK_COMPLETE: Added user authentication with JWT tokens\`
+- \`TASK_COMPLETE: Fixed currency conversion bug in reports\`
+
+**After outputting TASK_COMPLETE, STOP IMMEDIATELY.** Do not start the next task.
+
+## Progress Updates
+
+While working, emit brief status text between tool batches so the operator can follow your reasoning. Keep it concise:
+
+- Before the first tool call, print 1 short sentence stating the task you chose.
+- After each batch of tool calls, print 1 short sentence describing what you learned or will do next.
+- Do NOT add any extra text after \`TASK_COMPLETE\` or \`NOTHING_LEFT_TO_DO\`.
+
+### NOTHING_LEFT_TO_DO
+
+When all tasks for the focus topic are complete and there is no more work to do:
+
+\`\`\`
+NOTHING_LEFT_TO_DO
+\`\`\`
+
+**After outputting NOTHING_LEFT_TO_DO, STOP IMMEDIATELY.**
+
+### Completing the Last Task
+
+**IMPORTANT:** When you complete the LAST task for the focus topic, you MUST signal BOTH (each on its own line):
+
+\`\`\`
+TASK_COMPLETE: Brief description of what you implemented
+
+NOTHING_LEFT_TO_DO
+\`\`\`
+
+This ensures the task gets committed (via TASK_COMPLETE) AND the loop exits (via NOTHING_LEFT_TO_DO). Always check if there are remaining tasks before deciding which signal(s) to use.
+
+## CI Green Requirement
+
+**A task is NOT complete until CI is green.**
+
+Before signaling TASK_COMPLETE, run these checks in order:
+
+$checks_list
+**If any check fails, fix the errors before signaling completion.**
+
+### Command Reference
+
+| Command | Description |
+|---|---|
+$commands_table
+## Workflow
+
+1. **Check CI status** - if there are errors from a previous iteration, fix them first
+2. **Read relevant specs** - understand the focus topic, context, and best practices
+3. **Select a task** - choose one task to work on within the focus topic
+4. **Implement** - follow patterns from specs
+5. **Verify CI** - run the CI checks listed above
+6. **Update spec** - mark the task complete, add new tasks if discovered
+7. **Signal** - output \`TASK_COMPLETE: <description>\` or \`NOTHING_LEFT_TO_DO\` if all done
+8. **STOP** - do not continue
+
+## Important Reminders
+
+- **Read \`AGENTS.md\`** for project structure and conventions
+- **DO NOT run git commands** - the script handles commits
+- **Create tasks as needed** - if you discover work that needs to be done within the focus topic, add it to the spec
+
+---
+
+## Iteration
+
+This is iteration $iteration of the autonomous loop.
+
+$focus_section
+$ci_errors
+## Begin
+
+Review the focus topic above and select one task to work on. When the task is complete:
+- If there are MORE tasks remaining: signal \`TASK_COMPLETE: <description>\` and STOP
+- If this was the LAST task: signal BOTH \`TASK_COMPLETE: <description>\` AND \`NOTHING_LEFT_TO_DO\`, then STOP
+PROMPT_EOF
 }
 
 extract_task_description() {
@@ -306,7 +498,7 @@ extract_task_description() {
 
 build_judge_prompt() {
     local focus="$1"
-    local specs_list=$(find specs -name "*.md" -type f | sort | while read f; do echo "- \`$f\`"; done)
+    local specs_list=$(find "$SPECS_DIR" -name "*.md" -type f | sort | while read f; do echo "- \`$f\`"; done)
     
     cat <<EOF
 # Judge Agent - Work Completion Review

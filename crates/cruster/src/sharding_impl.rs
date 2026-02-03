@@ -1090,7 +1090,10 @@ impl ShardingImpl {
     ///
     /// Listens to `LeaseHealth` updates from the runner storage and triggers
     /// detachment when the failure streak exceeds `keepalive_failure_threshold`.
-    async fn lease_health_loop(&self, mut health_rx: tokio::sync::broadcast::Receiver<LeaseHealth>) {
+    async fn lease_health_loop(
+        &self,
+        mut health_rx: tokio::sync::broadcast::Receiver<LeaseHealth>,
+    ) {
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
@@ -5120,7 +5123,9 @@ mod tests {
         assert!(!s.is_detached());
 
         // Configure storage to fail on get_runners
-        runner_storage.fail_get_runners.store(true, Ordering::SeqCst);
+        runner_storage
+            .fail_get_runners
+            .store(true, Ordering::SeqCst);
 
         // Trigger rebalance_shards which calls get_runners
         let result = s
@@ -5129,7 +5134,10 @@ mod tests {
 
         // Should return Ok(false) but trigger detachment
         assert!(result.is_ok());
-        assert!(s.is_detached(), "should be detached after get_runners error");
+        assert!(
+            s.is_detached(),
+            "should be detached after get_runners error"
+        );
 
         // Owned shards should be cleared
         assert!(
@@ -5451,15 +5459,8 @@ mod tests {
             ..Default::default()
         });
         let metrics = Arc::new(ClusterMetrics::unregistered());
-        let s = ShardingImpl::new(
-            config,
-            Arc::new(NoopRunners),
-            None,
-            None,
-            None,
-            metrics,
-        )
-        .unwrap();
+        let s =
+            ShardingImpl::new(config, Arc::new(NoopRunners), None, None, None, metrics).unwrap();
 
         // Detach
         s.detach(DetachmentReason::Manual).await;

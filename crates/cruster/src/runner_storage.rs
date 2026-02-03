@@ -2,10 +2,23 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures::Stream;
+use tokio::sync::broadcast;
 
 use crate::error::ClusterError;
 use crate::runner::Runner;
 use crate::types::{MachineId, RunnerAddress, ShardId};
+
+/// Health status of the runner's lease/registration keep-alive.
+///
+/// Published by `RunnerStorage` implementations to allow sharding to monitor
+/// lease health and trigger detachment when connectivity is degraded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseHealth {
+    /// Whether the last keep-alive attempt was successful.
+    pub healthy: bool,
+    /// Number of consecutive keep-alive failures.
+    pub failure_streak: u32,
+}
 
 /// Result of a batch shard lock refresh, reporting successes, lost locks, and per-shard errors.
 #[derive(Debug)]
@@ -127,5 +140,18 @@ pub trait RunnerStorage: Send + Sync {
             }
         }
         Ok(BatchAcquireResult { acquired, failures })
+    }
+
+    /// Subscribe to lease health updates.
+    ///
+    /// The returned receiver will receive [`LeaseHealth`] updates whenever the
+    /// keep-alive status changes (success or failure). Sharding uses these
+    /// updates to detect connectivity degradation and trigger detachment.
+    ///
+    /// The default implementation returns `None`, indicating the backend does
+    /// not support health notifications (e.g., in-memory implementations).
+    /// Backends that use leases (etcd, etc.) should override this.
+    fn lease_health_receiver(&self) -> Option<broadcast::Receiver<LeaseHealth>> {
+        None
     }
 }

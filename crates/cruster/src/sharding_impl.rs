@@ -29,7 +29,7 @@ use crate::reply::{
 };
 use crate::runner::Runner;
 use crate::runner_health::RunnerHealth;
-use crate::runner_storage::RunnerStorage;
+use crate::runner_storage::{LeaseHealth, RunnerStorage};
 use crate::runners::Runners;
 use crate::shard_assigner::ShardAssigner;
 use crate::sharding::{Sharding, ShardingRegistrationEvent};
@@ -357,6 +357,19 @@ impl ShardingImpl {
             tasks.push(h1);
             tasks.push(h2);
             tasks.push(h3);
+        }
+
+        // Start lease health monitoring loop if storage supports it.
+        if let Some(health_rx) = runner_storage.lease_health_receiver() {
+            let this = Arc::clone(self);
+            let h4 = tokio::spawn(async move {
+                this.lease_health_loop(health_rx).await;
+            });
+            self.background_tasks
+                .try_lock()
+                .expect("background_tasks lock uncontested during start()")
+                .push(h4);
+            tracing::info!("started lease health monitoring loop");
         }
 
         // Register runner health loop as a cluster singleton so only one runner
@@ -959,6 +972,62 @@ impl ShardingImpl {
             // are re-spawned without waiting for a shard topology change (skip if cancelled)
             if !self.cancel.is_cancelled() {
                 self.sync_singletons().await;
+            }
+        }
+    }
+
+    /// Background loop that monitors lease health and triggers detachment.
+    ///
+    /// Listens to `LeaseHealth` updates from the runner storage and triggers
+    /// detachment when the failure streak exceeds `keepalive_failure_threshold`.
+    async fn lease_health_loop(&self, mut health_rx: tokio::sync::broadcast::Receiver<LeaseHealth>) {
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                result = health_rx.recv() => {
+                    match result {
+                        Ok(health) => {
+                            // Update metrics.
+                            self.metrics.lease_keepalive_failure_streak.set(health.failure_streak as i64);
+                            if !health.healthy {
+                                self.metrics.lease_keepalive_failures.inc();
+                            }
+
+                            if health.healthy {
+                                // Signal healthy for re-attachment.
+                                self.signal_healthy();
+                            } else {
+                                // Check if failure streak exceeds threshold.
+                                if health.failure_streak >= self.config.keepalive_failure_threshold {
+                                    tracing::warn!(
+                                        failure_streak = health.failure_streak,
+                                        threshold = self.config.keepalive_failure_threshold,
+                                        "keep-alive failure streak exceeded threshold, triggering detachment"
+                                    );
+                                    self.detach(DetachmentReason::KeepAliveFailure {
+                                        consecutive_failures: health.failure_streak,
+                                    }).await;
+                                } else {
+                                    // Signal unhealthy to reset recovery window.
+                                    self.signal_unhealthy();
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            // We missed some messages due to slow processing. This is
+                            // generally fine — we'll catch up on the next message.
+                            tracing::debug!(
+                                missed_count = count,
+                                "lease health receiver lagged, missed some updates"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Sender closed — runner storage is shutting down.
+                            tracing::info!("lease health channel closed, stopping monitoring loop");
+                            break;
+                        }
+                    }
+                }
             }
         }
     }

@@ -12,6 +12,14 @@ In Progress.
   `detachment_recover_window`, and `detachment_enabled`. Added
   `sharding_detached` metric.
 
+- [x] **Task 2: Wire Keep-Alive Health to Sharding** - Extended etcd runner
+  storage keep-alive loop to publish `LeaseHealth` updates via broadcast
+  channel. Added `lease_health_receiver()` method to `RunnerStorage` trait.
+  `ShardingImpl` now subscribes to lease health during `start()` and triggers
+  detachment when failure streak exceeds `keepalive_failure_threshold`. Added
+  metrics `lease_keepalive_failures` (counter) and `lease_keepalive_failure_streak`
+  (gauge). Logs transitions between healthy and degraded states.
+
 ## Problem Statement
 
 The cluster currently allows windows where a runner continues executing shard

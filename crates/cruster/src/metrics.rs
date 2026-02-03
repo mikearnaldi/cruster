@@ -1,4 +1,4 @@
-use prometheus::{IntGauge, Opts, Registry};
+use prometheus::{IntCounter, IntGauge, Opts, Registry};
 
 /// Cluster-level prometheus metrics.
 pub struct ClusterMetrics {
@@ -14,6 +14,10 @@ pub struct ClusterMetrics {
     pub shards: IntGauge,
     /// Whether the runner is detached from the cluster (0 = attached, 1 = detached).
     pub sharding_detached: IntGauge,
+    /// Total number of lease keep-alive failures.
+    pub lease_keepalive_failures: IntCounter,
+    /// Current consecutive keep-alive failure streak.
+    pub lease_keepalive_failure_streak: IntGauge,
 }
 
 impl ClusterMetrics {
@@ -40,6 +44,14 @@ impl ClusterMetrics {
             "cluster_sharding_detached",
             "Whether the runner is detached from the cluster (0 = attached, 1 = detached)",
         ))?;
+        let lease_keepalive_failures = IntCounter::with_opts(Opts::new(
+            "cluster_lease_keepalive_failures_total",
+            "Total number of lease keep-alive failures",
+        ))?;
+        let lease_keepalive_failure_streak = IntGauge::with_opts(Opts::new(
+            "cluster_lease_keepalive_failure_streak",
+            "Current consecutive keep-alive failure streak",
+        ))?;
 
         registry.register(Box::new(entities.clone()))?;
         registry.register(Box::new(singletons.clone()))?;
@@ -47,6 +59,8 @@ impl ClusterMetrics {
         registry.register(Box::new(runners_healthy.clone()))?;
         registry.register(Box::new(shards.clone()))?;
         registry.register(Box::new(sharding_detached.clone()))?;
+        registry.register(Box::new(lease_keepalive_failures.clone()))?;
+        registry.register(Box::new(lease_keepalive_failure_streak.clone()))?;
 
         Ok(Self {
             entities,
@@ -55,6 +69,8 @@ impl ClusterMetrics {
             runners_healthy,
             shards,
             sharding_detached,
+            lease_keepalive_failures,
+            lease_keepalive_failure_streak,
         })
     }
 
@@ -70,6 +86,16 @@ impl ClusterMetrics {
             shards: IntGauge::new("cluster_shards", "shards").expect("valid metric name"),
             sharding_detached: IntGauge::new("cluster_sharding_detached", "detached")
                 .expect("valid metric name"),
+            lease_keepalive_failures: IntCounter::new(
+                "cluster_lease_keepalive_failures_total",
+                "failures",
+            )
+            .expect("valid metric name"),
+            lease_keepalive_failure_streak: IntGauge::new(
+                "cluster_lease_keepalive_failure_streak",
+                "streak",
+            )
+            .expect("valid metric name"),
         }
     }
 }

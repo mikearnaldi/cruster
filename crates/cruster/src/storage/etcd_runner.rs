@@ -7,12 +7,12 @@ use etcd_client::{
     WatchOptions,
 };
 use futures::Stream;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
 use crate::error::ClusterError;
 use crate::runner::Runner;
 use crate::runner_health::RunnerHealth;
-use crate::runner_storage::{BatchAcquireResult, BatchRefreshResult, RunnerStorage};
+use crate::runner_storage::{BatchAcquireResult, BatchRefreshResult, LeaseHealth, RunnerStorage};
 use crate::types::{MachineId, RunnerAddress, ShardId};
 
 /// etcd-backed runner storage using leases for registration and
@@ -27,6 +27,10 @@ pub struct EtcdRunnerStorage {
     /// Uses `parking_lot::Mutex` (non-async) so `Drop` can always access it
     /// synchronously without contention with async code paths.
     keep_alive_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Broadcast channel for publishing lease health updates.
+    /// Sharding subscribes to this to monitor keep-alive health and trigger
+    /// detachment when connectivity is degraded.
+    lease_health_tx: broadcast::Sender<LeaseHealth>,
 }
 
 impl EtcdRunnerStorage {
@@ -37,12 +41,15 @@ impl EtcdRunnerStorage {
     /// - `lease_ttl`: TTL in seconds for runner registration leases.
     pub fn new(client: Client, prefix: impl Into<String>, lease_ttl: i64) -> Self {
         assert!(lease_ttl > 0, "lease_ttl must be positive, got {lease_ttl}");
+        // Buffer size of 16 allows for brief subscriber lag without blocking the keep-alive loop.
+        let (lease_health_tx, _) = broadcast::channel(16);
         Self {
             client: Arc::new(Mutex::new(client)),
             prefix: prefix.into(),
             lease_ttl,
             lease_id: Mutex::new(None),
             keep_alive_handle: parking_lot::Mutex::new(None),
+            lease_health_tx,
         }
     }
 
@@ -246,12 +253,22 @@ impl RunnerStorage for EtcdRunnerStorage {
         // Phase 3: Start keep-alive for the lease.
         let client_clone = self.client.clone();
         let keep_alive_interval = (self.lease_ttl as u64).max(3) / 3;
+        let health_tx = self.lease_health_tx.clone();
         let handle = tokio::spawn(async move {
-            /// Maximum consecutive keep-alive failures before the task gives up.
-            /// At the default keep-alive interval (~10s for a 30s TTL), 100 failures
-            /// means ~16 minutes of sustained etcd unreachability before giving up.
+            // Maximum consecutive keep-alive failures before the task gives up.
+            // At the default keep-alive interval (~10s for a 30s TTL), 100 failures
+            // means ~16 minutes of sustained etcd unreachability before giving up.
             const MAX_CONSECUTIVE_FAILURES: u32 = 100;
             let mut consecutive_failures: u32 = 0;
+
+            // Publish health update to subscribers.
+            fn publish_health(tx: &broadcast::Sender<LeaseHealth>, healthy: bool, failures: u32) {
+                // Ignore send errors — no subscribers means no one cares.
+                let _ = tx.send(LeaseHealth {
+                    healthy,
+                    failure_streak: failures,
+                });
+            }
 
             loop {
                 let result = {
@@ -261,13 +278,24 @@ impl RunnerStorage for EtcdRunnerStorage {
                 match result {
                     Ok((mut keeper, mut stream)) => {
                         // Successful initialization resets the failure counter.
+                        let previous_failures = consecutive_failures;
+                        if previous_failures > 0 {
+                            tracing::info!(
+                                lease_id,
+                                previous_failures,
+                                "etcd keep-alive recovered"
+                            );
+                        }
                         consecutive_failures = 0;
+                        publish_health(&health_tx, true, 0);
+
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(keep_alive_interval))
                                 .await;
                             if let Err(e) = keeper.keep_alive().await {
                                 tracing::warn!(lease_id, error = %e, "etcd lease keep-alive failed, reconnecting");
                                 consecutive_failures += 1;
+                                publish_health(&health_tx, false, consecutive_failures);
                                 break;
                             }
                             // Consume the response.
@@ -278,22 +306,33 @@ impl RunnerStorage for EtcdRunnerStorage {
                             .await
                             {
                                 Ok(Ok(Some(_))) => {
-                                    // Successful keep-alive resets the failure counter.
-                                    consecutive_failures = 0;
+                                    // Successful keep-alive.
+                                    if consecutive_failures > 0 {
+                                        tracing::info!(
+                                            lease_id,
+                                            previous_failures = consecutive_failures,
+                                            "etcd keep-alive healthy after degradation"
+                                        );
+                                        consecutive_failures = 0;
+                                        publish_health(&health_tx, true, 0);
+                                    }
                                 }
                                 Ok(Ok(None)) => {
                                     tracing::warn!(lease_id, "etcd keep-alive stream ended");
                                     consecutive_failures += 1;
+                                    publish_health(&health_tx, false, consecutive_failures);
                                     break;
                                 }
                                 Ok(Err(e)) => {
                                     tracing::warn!(lease_id, error = %e, "etcd keep-alive stream error");
                                     consecutive_failures += 1;
+                                    publish_health(&health_tx, false, consecutive_failures);
                                     break;
                                 }
                                 Err(_) => {
                                     tracing::warn!(lease_id, "etcd keep-alive response timed out");
                                     consecutive_failures += 1;
+                                    publish_health(&health_tx, false, consecutive_failures);
                                     break;
                                 }
                             }
@@ -302,6 +341,7 @@ impl RunnerStorage for EtcdRunnerStorage {
                     Err(e) => {
                         tracing::warn!(lease_id, error = %e, "etcd keep-alive initialization failed, retrying in 1s");
                         consecutive_failures += 1;
+                        publish_health(&health_tx, false, consecutive_failures);
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
@@ -313,6 +353,8 @@ impl RunnerStorage for EtcdRunnerStorage {
                         "etcd keep-alive exhausted after {MAX_CONSECUTIVE_FAILURES} consecutive failures — \
                          lease will expire and runner registration will be lost"
                     );
+                    // Final unhealthy notification before giving up.
+                    publish_health(&health_tx, false, consecutive_failures);
                     break;
                 }
             }
@@ -919,6 +961,10 @@ impl RunnerStorage for EtcdRunnerStorage {
         Ok(Box::pin(
             tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
         ))
+    }
+
+    fn lease_health_receiver(&self) -> Option<broadcast::Receiver<LeaseHealth>> {
+        Some(self.lease_health_tx.subscribe())
     }
 }
 

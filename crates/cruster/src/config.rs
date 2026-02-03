@@ -114,6 +114,11 @@ pub struct ShardingConfig {
     /// do not trigger detachment. Use this to preserve current behavior during
     /// rollout. Default: false.
     pub detachment_enabled: bool,
+
+    /// Number of consecutive keep-alive failures before triggering detachment.
+    /// When the lease keep-alive fails this many times in a row, the runner
+    /// detaches from the cluster to prevent split-brain. Default: 3.
+    pub keepalive_failure_threshold: u32,
 }
 
 impl ShardingConfig {
@@ -263,6 +268,7 @@ impl Default for ShardingConfig {
             detachment_window: Duration::from_millis(200),
             detachment_recover_window: Duration::from_millis(500),
             detachment_enabled: false,
+            keepalive_failure_threshold: 3,
         }
     }
 }

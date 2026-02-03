@@ -20,6 +20,12 @@ In Progress.
   metrics `lease_keepalive_failures` (counter) and `lease_keepalive_failure_streak`
   (gauge). Logs transitions between healthy and degraded states.
 
+- [x] **Task 3: Detachment on Storage Errors** - Modified `rebalance_shards` to
+  trigger detachment when `get_runners` or `acquire_batch` return storage errors.
+  Modified `lock_refresh_loop` to trigger detachment when `refresh_batch` returns
+  a top-level error. Added `signal_healthy()` calls after successful storage
+  operations to support re-attachment.
+
 ## Problem Statement
 
 The cluster currently allows windows where a runner continues executing shard

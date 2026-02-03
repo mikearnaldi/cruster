@@ -690,7 +690,23 @@ impl ShardingImpl {
                 tracing::debug!("rebalance_shards cancelled during get_runners");
                 return Ok(false);
             }
-            result = runner_storage.get_runners() => result?,
+            result = runner_storage.get_runners() => {
+                match result {
+                    Ok(r) => {
+                        // Successful storage call - signal healthy for re-attachment
+                        self.signal_healthy();
+                        r
+                    }
+                    Err(e) => {
+                        // Storage error during get_runners - trigger detachment
+                        tracing::error!(error = %e, "get_runners failed, triggering detachment");
+                        self.detach(DetachmentReason::StorageError(format!(
+                            "get_runners failed: {}", e
+                        ))).await;
+                        return Ok(false);
+                    }
+                }
+            },
         };
         self.metrics.runners.set(runners.len() as i64);
         self.metrics
@@ -779,7 +795,19 @@ impl ShardingImpl {
                 tracing::debug!("rebalance_shards cancelled during acquire_batch");
                 return Ok(!to_release.is_empty());
             }
-            result = runner_storage.acquire_batch(&to_acquire_filtered, &self.config.runner_address) => result?,
+            result = runner_storage.acquire_batch(&to_acquire_filtered, &self.config.runner_address) => {
+                match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // Storage error during acquire_batch - trigger detachment
+                        tracing::error!(error = %e, "acquire_batch failed, triggering detachment");
+                        self.detach(DetachmentReason::StorageError(format!(
+                            "acquire_batch failed: {}", e
+                        ))).await;
+                        return Ok(!to_release.is_empty());
+                    }
+                }
+            },
         };
 
         let failure_count = batch_result.failures.len();
@@ -889,12 +917,19 @@ impl ShardingImpl {
                     match result {
                         Ok(r) => r,
                         Err(e) => {
-                            tracing::warn!(error = %e, "batch refresh failed entirely");
+                            // Top-level storage error - trigger detachment and return early
+                            tracing::error!(error = %e, "batch refresh failed entirely, triggering detachment");
+                            self.detach(DetachmentReason::StorageError(format!(
+                                "refresh_batch failed: {}", e
+                            ))).await;
                             continue;
                         }
                     }
                 }
             };
+
+            // Successful storage call - signal healthy for re-attachment
+            self.signal_healthy();
 
             // Process successfully refreshed shards — reset failure counts.
             for shard_id in &batch_result.refreshed {

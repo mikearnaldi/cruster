@@ -11,7 +11,7 @@ set -o pipefail
 SKIP_CHECKS=false
 FOCUS_PROMPT=""
 MAX_ITERATIONS=0
-JUDGE_PROMPT_FILE=""
+USE_JUDGE=false
 JUDGE_FIRST=false
 
 while [[ $# -gt 0 ]]; do
@@ -23,16 +23,11 @@ while [[ $# -gt 0 ]]; do
             else
                 echo "Error: --max-iterations requires a positive integer"; exit 1
             fi ;;
-        --judge)
-            if [[ -n "$2" && -f "$2" ]]; then
-                JUDGE_PROMPT_FILE="$2"; shift 2
-            else
-                echo "Error: --judge requires a path to an existing prompt file"; exit 1
-            fi ;;
-        --judge-first) JUDGE_FIRST=true; shift ;;
+        --judge) USE_JUDGE=true; shift ;;
+        --judge-first) JUDGE_FIRST=true; USE_JUDGE=true; shift ;;
         --help|-h)
             echo "Usage: ./ralph-auto.sh <focus prompt> [options]"
-            echo "Options: --skip-checks, --max-iterations <n>, --judge <file>, --judge-first, --help"
+            echo "Options: --skip-checks, --max-iterations <n>, --judge, --judge-first, --help"
             echo "Environment: OPENCODE_MODEL (default: anthropic/claude-opus-4-5)"
             echo "Environment: OPENCODE_VARIANT (default: high)"
             exit 0 ;;
@@ -309,6 +304,88 @@ extract_task_description() {
     echo "${desc:-Autonomous improvements}"
 }
 
+build_judge_prompt() {
+    local focus="$1"
+    local specs_list=$(find specs -name "*.md" -type f | sort | while read f; do echo "- \`$f\`"; done)
+    
+    cat <<EOF
+# Judge Agent - Work Completion Review
+
+You are a judging agent that reviews whether implementation work is complete.
+
+## Your Task
+
+Review the codebase to determine if the following focus area has been fully implemented:
+
+**Focus:** $focus
+
+## Available Specs
+
+$specs_list
+
+## Review Checklist
+
+Perform these checks in order:
+
+### 1. Spec Review
+- Read the relevant spec(s) for the focus area
+- Check if all tasks/items are marked complete (look for checkboxes, status markers)
+- Identify any tasks still marked as pending or in-progress
+
+### 2. Code Completeness
+- Search for \`TODO\`, \`FIXME\`, \`XXX\`, \`HACK\` comments in relevant code
+- Search for \`todo!\(\)\`, \`unimplemented!\(\)\`, \`unreachable!\(\)\` macros
+- Look for placeholder implementations or stub functions
+- Check for \`panic!\(\)\` calls that should be proper error handling
+
+### 3. Implementation Verification
+- Verify the code matches what the spec requires
+- Check that all specified features/functions exist
+- Look for missing error handling or edge cases mentioned in spec
+
+### 4. Test Coverage
+- Check if tests mentioned in the spec exist
+- Look for \`#[ignore]\` tests that should be enabled
+- Verify test assertions match spec requirements
+
+### 5. Integration
+- Check if the implementation is wired up (not just dead code)
+- Verify exports, public APIs, or entry points exist as specified
+
+## Verdict
+
+After your review, you MUST output exactly one of these signals on its own line:
+
+\`\`\`
+MORE_WORK_TO_DO
+\`\`\`
+OR
+\`\`\`
+ALL_WORK_DONE
+\`\`\`
+
+**Output \`MORE_WORK_TO_DO\` if ANY of these are true:**
+- Tasks in the spec are not marked complete
+- TODO/FIXME comments exist in the relevant code
+- \`todo!()\` or \`unimplemented!()\` macros are present
+- Implementation is missing or incomplete
+- Tests are missing or ignored
+- Code exists but isn't integrated
+
+**Output \`ALL_WORK_DONE\` if ALL of these are true:**
+- All tasks in the spec are marked complete
+- No TODO/FIXME comments in relevant code
+- No \`todo!()\` or \`unimplemented!()\` macros
+- Implementation matches the spec requirements
+- Tests exist and are not ignored
+- Code is properly integrated
+
+## Begin
+
+Review the focus area above using the checklist. Be thorough - it's better to flag incomplete work than to miss something.
+EOF
+}
+
 run_judge() {
     local iteration=$1
     local judge_output_file="$OUTPUT_DIR/iteration_${iteration}_judge_output.txt"
@@ -317,45 +394,7 @@ run_judge() {
 
     log "INFO" "Running judging agent..."
 
-    cp "$JUDGE_PROMPT_FILE" "$judge_prompt_file"
-
-    # Prepend verdict signal instructions to the judge prompt (more visible at top)
-    local original_prompt
-    original_prompt=$(cat "$judge_prompt_file")
-    cat > "$judge_prompt_file" <<'SIGNALS'
-# CRITICAL: VERDICT REQUIRED
-
-After completing your review, you MUST output exactly one of these verdict signals on its own line:
-
-```
-MORE_WORK_TO_DO
-```
-OR
-```
-ALL_WORK_DONE
-```
-
-**If you find ANY issues, problems, or incomplete work:** Output `MORE_WORK_TO_DO`
-**If everything is complete and correct:** Output `ALL_WORK_DONE`
-
-This signal is MANDATORY. Your response will be rejected without it.
-
----
-
-SIGNALS
-    echo "$original_prompt" >> "$judge_prompt_file"
-    
-    # Also append reminder at the end
-    cat >> "$judge_prompt_file" <<'SIGNALS_END'
-
----
-
-# REMINDER: Output Your Verdict
-
-You MUST end your response with exactly one of:
-- `MORE_WORK_TO_DO` - if any issues remain
-- `ALL_WORK_DONE` - if everything is complete
-SIGNALS_END
+    build_judge_prompt "$FOCUS_PROMPT" > "$judge_prompt_file"
 
     local judge_exit_code=0
     if cat "$judge_prompt_file" | opencode run --model "$OPENCODE_MODEL" --variant "$OPENCODE_VARIANT" --format json 2>"$judge_stderr_file" | tee "$judge_output_file" | stream_filter; then
@@ -459,7 +498,7 @@ run_iteration() {
 
     if [ "$has_nothing_left" = true ]; then
         log "SUCCESS" "Agent signaled NOTHING_LEFT_TO_DO"
-        if [ -n "$JUDGE_PROMPT_FILE" ]; then
+        if [ "$USE_JUDGE" = true ]; then
             local judge_result=0
             run_judge "$iteration" || judge_result=$?
             if [ $judge_result -eq 1 ]; then
@@ -480,7 +519,7 @@ main() {
     log "INFO" "=========================================="
     log "INFO" "Focus: $FOCUS_PROMPT"
     [ "$MAX_ITERATIONS" -gt 0 ] && log "INFO" "Max iterations: $MAX_ITERATIONS"
-    [ -n "$JUDGE_PROMPT_FILE" ] && log "INFO" "Judge prompt: $JUDGE_PROMPT_FILE"
+    [ "$USE_JUDGE" = true ] && log "INFO" "Judge: enabled"
     [ "$JUDGE_FIRST" = true ] && log "INFO" "Judge-first: enabled"
     [ "$SKIP_CHECKS" = true ] && log "WARN" "Skip checks: enabled"
 
@@ -496,7 +535,7 @@ main() {
         run_ci_checks && rm -f "$OUTPUT_DIR/ci_errors.txt" || log "WARN" "Initial CI failed"
     fi
 
-    if [ "$JUDGE_FIRST" = true ] && [ -n "$JUDGE_PROMPT_FILE" ]; then
+    if [ "$JUDGE_FIRST" = true ] && [ "$USE_JUDGE" = true ]; then
         log "INFO" "Running judge before main loop..."
         local judge_result=0
         run_judge 0 || judge_result=$?

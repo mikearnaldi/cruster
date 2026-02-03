@@ -31,9 +31,6 @@ prost = "0.13"
 # Errors
 thiserror = { workspace = true }
 
-# Hashing
-hashring = "0.3"
-
 # Concurrency
 dashmap = "6"
 parking_lot = "0.12"
@@ -58,14 +55,27 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "tls-rustls",
 # etcd storage (optional)
 etcd-client = { version = "0.14", optional = true }
 
+# Consistent hashing (optional)
+hashring = { version = "0.3", optional = true }
+
+# Parallel computation (optional)
+rayon = { version = "1.10", optional = true }
+
 [features]
 default = []
 sql = ["dep:sqlx"]
 etcd = ["dep:etcd-client"]
+consistent-hash = ["dep:hashring"]
+parallel = ["dep:rayon"]
 
 [build-dependencies]
 tonic-build = "0.12"
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
 trybuild = "1"
+
+[[bench]]
+name = "shard_assignment"
+harness = false

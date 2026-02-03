@@ -31,6 +31,26 @@ fn bench_compute_assignments(c: &mut Criterion) {
             },
         );
 
+        // Benchmark parallel rendezvous hashing (when feature is enabled)
+        #[cfg(feature = "parallel")]
+        {
+            let parallel_strategy = ShardAssignmentStrategy::RendezvousParallel;
+            group.bench_with_input(
+                BenchmarkId::new("rendezvous_parallel", num_runners),
+                &num_runners,
+                |b, _| {
+                    b.iter(|| {
+                        ShardAssigner::compute_assignments(
+                            &runners,
+                            &shard_groups,
+                            2048,
+                            &parallel_strategy,
+                        )
+                    })
+                },
+            );
+        }
+
         // Benchmark consistent hashing (when feature is enabled)
         #[cfg(feature = "consistent-hash")]
         {

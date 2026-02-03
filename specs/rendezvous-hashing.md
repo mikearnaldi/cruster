@@ -359,7 +359,7 @@ pub struct ShardingConfig {
 - Existing deployments continue unchanged
 - Users can opt into `ConsistentHash` if they have very large clusters or need compatibility
 
-### Phase 7: Parallel Rendezvous Hashing
+### Phase 7: Parallel Rendezvous Hashing [COMPLETE]
 
 For large shard counts, parallelize the rendezvous computation using Rayon to leverage multiple CPU cores.
 
@@ -429,12 +429,12 @@ fn compute_rendezvous_parallel(
 
 #### Implementation Tasks
 
-- [ ] Add `rayon` dependency (with optional feature flag `parallel`)
-- [ ] Implement `RendezvousParallel` strategy variant
-- [ ] Add `compute_rendezvous_parallel` method
-- [ ] Add benchmark comparing sequential vs parallel performance
-- [ ] Add tests for parallel strategy correctness (same results as sequential)
-- [ ] Document when to use parallel vs sequential
+- [x] Add `rayon` dependency (with optional feature flag `parallel`)
+- [x] Implement `RendezvousParallel` strategy variant
+- [x] Add `compute_rendezvous_parallel` method
+- [x] Add benchmark comparing sequential vs parallel performance
+- [x] Add tests for parallel strategy correctness (same results as sequential)
+- [x] Document when to use parallel vs sequential
 
 #### Expected Performance
 
@@ -500,10 +500,10 @@ If distribution testing reveals issues with djb2:
 - [x] ConsistentHash strategy implementation (behind `consistent-hash` feature flag)
 - [x] Documentation explains when to use each strategy (module-level doc in shard_assigner.rs)
 
-### Parallel Rendezvous (Phase 7)
+### Parallel Rendezvous (Phase 7) [COMPLETE]
 
-- [ ] `rayon` dependency added with `parallel` feature flag
-- [ ] `RendezvousParallel` strategy variant implemented
-- [ ] Parallel and sequential produce identical results
-- [ ] Benchmark shows speedup for large inputs (100+ nodes, 2048+ shards)
-- [ ] Documentation explains when to use parallel vs sequential
+- [x] `rayon` dependency added with `parallel` feature flag
+- [x] `RendezvousParallel` strategy variant implemented
+- [x] Parallel and sequential produce identical results
+- [x] Benchmark shows speedup for large inputs (100+ nodes, 2048+ shards)
+- [x] Documentation explains when to use parallel vs sequential

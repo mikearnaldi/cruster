@@ -58,11 +58,15 @@ etcd-client = { version = "0.14", optional = true }
 # Consistent hashing (optional)
 hashring = { version = "0.3", optional = true }
 
+# Parallel computation (optional)
+rayon = { version = "1.10", optional = true }
+
 [features]
 default = []
 sql = ["dep:sqlx"]
 etcd = ["dep:etcd-client"]
 consistent-hash = ["dep:hashring"]
+parallel = ["dep:rayon"]
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -18,6 +18,20 @@ fi
 echo "Cluster healthy"
 echo ""
 
+# Per-node health checks when running under docker compose
+if [ -n "$DOCKER_COMPOSE_PROJECT" ]; then
+    echo "Checking per-node health..."
+    for node in node1 node2 node3; do
+        if ! docker compose -p "$DOCKER_COMPOSE_PROJECT" exec -T "$node" \
+            curl -sf "http://localhost:8080/health" > /dev/null; then
+            echo "FAIL: $node not healthy"
+            exit 1
+        fi
+        echo "$node healthy"
+    done
+    echo ""
+fi
+
 # Run all test suites
 "$SCRIPT_DIR/test_basic.sh"
 echo ""
@@ -44,6 +58,9 @@ echo ""
 echo ""
 
 "$SCRIPT_DIR/test_sql_activity.sh"
+echo ""
+
+"$SCRIPT_DIR/test_shard_topology.sh"
 echo ""
 
 # Singleton failover test runs last since it kills a node

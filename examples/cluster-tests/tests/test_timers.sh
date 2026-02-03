@@ -14,9 +14,9 @@ TIMER_ID="t-$(date +%s)"
 
 # Schedule a timer with 500ms delay (this blocks until it fires)
 echo "Scheduling timer (will block for 500ms)..."
-START=$(date +%s%3N)
+START=$(now_ms)
 post "/timer/$ID/schedule" "{\"timer_id\": \"$TIMER_ID\", \"delay_ms\": 500}" > /dev/null
-END=$(date +%s%3N)
+END=$(now_ms)
 ELAPSED=$((END - START))
 
 # Verify timer took at least 500ms (allowing some margin)

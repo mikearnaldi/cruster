@@ -11,9 +11,8 @@ echo "========================================="
 echo "SQL Activity Transaction Tests"
 echo "========================================="
 
-BASE_URL="${CLUSTER_TESTS_URL:-http://localhost:8080}"
-# Use a simple entity ID that routes consistently
-ENTITY_ID="sql-e2e-test"
+# Use a unique entity ID per run to avoid state pollution
+ENTITY_ID="sql-e2e-test-$(date +%s)"
 
 # Test 1: Basic transfer (state + SQL in same transaction)
 echo ""
@@ -21,13 +20,11 @@ echo "Test 1: Basic transfer (state + SQL atomically)"
 echo "------------------------------------------------"
 
 # Make a transfer
-RESULT=$(curl -sf -X POST "$BASE_URL/sql-activity/$ENTITY_ID/transfer" \
-    -H "Content-Type: application/json" \
-    -d '{"to_entity": "recipient-1", "amount": 100}')
+RESULT=$(post "/sql-activity/$ENTITY_ID/transfer" '{"to_entity": "recipient-1", "amount": 100}')
 echo "Transfer result: $RESULT"
 
 # Check state was updated
-STATE=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/state")
+STATE=$(get "/sql-activity/$ENTITY_ID/state")
 echo "State after transfer: $STATE"
 
 TRANSFER_COUNT=$(echo "$STATE" | jq -r '.transfer_count')
@@ -44,7 +41,7 @@ if [ "$TOTAL_TRANSFERRED" != "100" ]; then
 fi
 
 # Check SQL table was also updated
-SQL_COUNT=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/sql-count")
+SQL_COUNT=$(get "/sql-activity/$ENTITY_ID/sql-count")
 echo "SQL table count: $SQL_COUNT"
 
 if [ "$SQL_COUNT" != "1" ]; then
@@ -59,15 +56,11 @@ echo ""
 echo "Test 2: Multiple transfers"
 echo "--------------------------"
 
-curl -sf -X POST "$BASE_URL/sql-activity/$ENTITY_ID/transfer" \
-    -H "Content-Type: application/json" \
-    -d '{"to_entity": "recipient-2", "amount": 200}' > /dev/null
+post "/sql-activity/$ENTITY_ID/transfer" '{"to_entity": "recipient-2", "amount": 200}' > /dev/null
 
-curl -sf -X POST "$BASE_URL/sql-activity/$ENTITY_ID/transfer" \
-    -H "Content-Type: application/json" \
-    -d '{"to_entity": "recipient-3", "amount": 300}' > /dev/null
+post "/sql-activity/$ENTITY_ID/transfer" '{"to_entity": "recipient-3", "amount": 300}' > /dev/null
 
-STATE=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/state")
+STATE=$(get "/sql-activity/$ENTITY_ID/state")
 TRANSFER_COUNT=$(echo "$STATE" | jq -r '.transfer_count')
 TOTAL_TRANSFERRED=$(echo "$STATE" | jq -r '.total_transferred')
 
@@ -81,7 +74,7 @@ if [ "$TOTAL_TRANSFERRED" != "600" ]; then
     exit 1
 fi
 
-SQL_COUNT=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/sql-count")
+SQL_COUNT=$(get "/sql-activity/$ENTITY_ID/sql-count")
 if [ "$SQL_COUNT" != "3" ]; then
     echo "FAIL: Expected SQL count=3, got $SQL_COUNT"
     exit 1
@@ -95,14 +88,14 @@ echo "Test 3: Failing transfer (tests rollback)"
 echo "------------------------------------------"
 
 # Get state before failing transfer
-STATE_BEFORE=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/state")
+STATE_BEFORE=$(get "/sql-activity/$ENTITY_ID/state")
 TRANSFER_COUNT_BEFORE=$(echo "$STATE_BEFORE" | jq -r '.transfer_count')
-SQL_COUNT_BEFORE=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/sql-count")
+SQL_COUNT_BEFORE=$(get "/sql-activity/$ENTITY_ID/sql-count")
 
 echo "State before failing transfer: transfer_count=$TRANSFER_COUNT_BEFORE, sql_count=$SQL_COUNT_BEFORE"
 
 # Attempt failing transfer (should fail and rollback)
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/sql-activity/$ENTITY_ID/failing-transfer" \
+HTTP_CODE=$(curl_base_no_fail -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/sql-activity/$ENTITY_ID/failing-transfer" \
     -H "Content-Type: application/json" \
     -d '{"to_entity": "recipient-fail", "amount": 999}')
 
@@ -113,7 +106,7 @@ fi
 echo "Failing transfer returned HTTP $HTTP_CODE (expected error)"
 
 # Check state was NOT updated (rolled back)
-STATE_AFTER=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/state")
+STATE_AFTER=$(get "/sql-activity/$ENTITY_ID/state")
 TRANSFER_COUNT_AFTER=$(echo "$STATE_AFTER" | jq -r '.transfer_count')
 TOTAL_TRANSFERRED_AFTER=$(echo "$STATE_AFTER" | jq -r '.total_transferred')
 
@@ -123,7 +116,7 @@ if [ "$TRANSFER_COUNT_AFTER" != "$TRANSFER_COUNT_BEFORE" ]; then
 fi
 
 # Check SQL table was also NOT updated (rolled back)
-SQL_COUNT_AFTER=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/sql-count")
+SQL_COUNT_AFTER=$(get "/sql-activity/$ENTITY_ID/sql-count")
 
 if [ "$SQL_COUNT_AFTER" != "$SQL_COUNT_BEFORE" ]; then
     echo "FAIL: SQL should have been rolled back. Expected sql_count=$SQL_COUNT_BEFORE, got $SQL_COUNT_AFTER"
@@ -137,11 +130,9 @@ echo ""
 echo "Test 4: Transfer after failed transfer"
 echo "---------------------------------------"
 
-curl -sf -X POST "$BASE_URL/sql-activity/$ENTITY_ID/transfer" \
-    -H "Content-Type: application/json" \
-    -d '{"to_entity": "recipient-4", "amount": 400}' > /dev/null
+post "/sql-activity/$ENTITY_ID/transfer" '{"to_entity": "recipient-4", "amount": 400}' > /dev/null
 
-STATE=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/state")
+STATE=$(get "/sql-activity/$ENTITY_ID/state")
 TRANSFER_COUNT=$(echo "$STATE" | jq -r '.transfer_count')
 
 if [ "$TRANSFER_COUNT" != "4" ]; then
@@ -149,7 +140,7 @@ if [ "$TRANSFER_COUNT" != "4" ]; then
     exit 1
 fi
 
-SQL_COUNT=$(curl -sf "$BASE_URL/sql-activity/$ENTITY_ID/sql-count")
+SQL_COUNT=$(get "/sql-activity/$ENTITY_ID/sql-count")
 if [ "$SQL_COUNT" != "4" ]; then
     echo "FAIL: Expected SQL count=4, got $SQL_COUNT"
     exit 1

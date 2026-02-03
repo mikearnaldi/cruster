@@ -359,6 +359,93 @@ pub struct ShardingConfig {
 - Existing deployments continue unchanged
 - Users can opt into `ConsistentHash` if they have very large clusters or need compatibility
 
+### Phase 7: Parallel Rendezvous Hashing
+
+For large shard counts, parallelize the rendezvous computation using Rayon to leverage multiple CPU cores.
+
+#### Motivation
+
+The rendezvous algorithm is embarrassingly parallel - each shard's assignment is independent. With 2048+ shards across 100+ nodes, parallelization can provide significant speedups.
+
+#### API Design
+
+```rust
+/// Strategy for assigning shards to runners.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ShardAssignmentStrategy {
+    /// Rendezvous hashing (HRW) - best distribution, O(shards × nodes) complexity.
+    /// Single-threaded computation.
+    #[default]
+    Rendezvous,
+
+    /// Parallel rendezvous hashing using Rayon.
+    /// Same algorithm as Rendezvous but parallelized across shards.
+    /// Recommended for large shard counts (1000+) with many nodes (100+).
+    #[cfg(feature = "parallel")]
+    RendezvousParallel,
+
+    /// Consistent hashing with virtual nodes.
+    #[cfg(feature = "consistent-hash")]
+    ConsistentHash { vnodes_per_weight: u32 },
+}
+```
+
+#### Implementation
+
+```rust
+use rayon::prelude::*;
+
+fn compute_rendezvous_parallel(
+    runners: &[Runner],
+    shard_groups: &[String],
+    shards_per_group: i32,
+) -> HashMap<ShardId, RunnerAddress> {
+    let healthy_runners: Vec<&Runner> = runners
+        .iter()
+        .filter(|r| r.healthy && r.weight > 0)
+        .collect();
+
+    if healthy_runners.is_empty() {
+        return HashMap::new();
+    }
+
+    // Generate all (group, shard_id) pairs
+    let shards: Vec<(String, i32)> = shard_groups
+        .iter()
+        .flat_map(|group| (0..shards_per_group).map(move |id| (group.clone(), id)))
+        .collect();
+
+    // Parallel computation
+    shards
+        .par_iter()
+        .filter_map(|(group, id)| {
+            let shard_key = format!("{group}:{id}");
+            select_runner_rendezvous(&shard_key, &healthy_runners)
+                .map(|runner| (ShardId::new(group, *id), runner.address.clone()))
+        })
+        .collect()
+}
+```
+
+#### Implementation Tasks
+
+- [ ] Add `rayon` dependency (with optional feature flag `parallel`)
+- [ ] Implement `RendezvousParallel` strategy variant
+- [ ] Add `compute_rendezvous_parallel` method
+- [ ] Add benchmark comparing sequential vs parallel performance
+- [ ] Add tests for parallel strategy correctness (same results as sequential)
+- [ ] Document when to use parallel vs sequential
+
+#### Expected Performance
+
+| Runners | Shards | Sequential | Parallel (8 cores) | Speedup |
+|---------|--------|------------|-------------------|---------|
+| 100     | 2048   | ~11ms      | ~2ms              | ~5.5x   |
+| 1000    | 2048   | ~107ms     | ~15ms             | ~7x     |
+| 100     | 10000  | ~55ms      | ~8ms              | ~7x     |
+
+Note: Parallel overhead means sequential may be faster for small inputs (< 100 shards or < 10 nodes).
+
 ## Migration
 
 No migration needed - the assignment computation is stateless and deterministic. When the new code deploys:
@@ -412,3 +499,11 @@ If distribution testing reveals issues with djb2:
 - [x] Benchmarks updated to use strategy API
 - [x] ConsistentHash strategy implementation (behind `consistent-hash` feature flag)
 - [x] Documentation explains when to use each strategy (module-level doc in shard_assigner.rs)
+
+### Parallel Rendezvous (Phase 7)
+
+- [ ] `rayon` dependency added with `parallel` feature flag
+- [ ] `RendezvousParallel` strategy variant implemented
+- [ ] Parallel and sequential produce identical results
+- [ ] Benchmark shows speedup for large inputs (100+ nodes, 2048+ shards)
+- [ ] Documentation explains when to use parallel vs sequential

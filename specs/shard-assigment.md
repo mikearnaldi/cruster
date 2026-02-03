@@ -110,12 +110,14 @@ indicating the runner may be detached. While detached:
 - Shard acquisition and refresh loops pause or no-op.
 - The runner is treated as having zero shards until re-attached.
 
-Detachment triggers (fast threshold):
+Detachment triggers (lease deadline model):
 
-- Any storage connectivity error starts a short detachment timer (100-200ms).
-- If connectivity is not restored within the window, detach immediately.
-- Keep-alive failure streak uses the same window and detaches if the lease
-  cannot be confirmed healthy within that window.
+- On every successful keep-alive response, record `lease_deadline = now + ttl_returned`.
+- If connectivity is lost or keep-alive fails, the runner may continue only
+  until `lease_deadline - safety_margin`.
+- Once `now >= lease_deadline - safety_margin`, detach immediately.
+- Storage connectivity errors still trigger a fast-path timer, but the
+  definitive cutoff is the lease deadline (not a fixed 100-200ms window).
 
 Re-attachment triggers:
 
@@ -126,8 +128,8 @@ Re-attachment triggers:
 
 Strengthen lease keep-alive observability and feedback into sharding:
 
-- Emit structured metrics for keep-alive success/failure rate and failure
-  streak length.
+- Emit structured metrics for keep-alive success/failure rate, failure streak
+  length, and the current `lease_deadline` lag (`lease_deadline - now`).
 - Emit a log on every keep-alive streak transition (healthy -> degraded, and
   degraded -> healthy).
 - Keep-alive task publishes status into a shared channel/atomic used by
@@ -159,8 +161,9 @@ Add or reuse the following settings (defaults to be tuned):
 - `shard_rebalance_retry_interval` (existing): standard rebalance cadence.
 - `shard_rebalance_debounce` (existing): avoid thrashing on topology changes.
 - `lease_ttl` (existing in etcd runner storage): TTL for registration lease.
-- `detachment_window` (new): short window (100-200ms) to confirm connectivity
-  before detaching.
+- `lease_detach_margin` (new): safety margin before `lease_deadline` at which
+  the runner must detach if keep-alive is not confirmed. Default to
+  `lease_ttl / 3` to align with keep-alive cadence.
 - `detachment_recover_window` (new): duration of healthy status required to
   re-attach.
 - `acquire_retry_interval` (new): short interval between acquire retries.
@@ -220,9 +223,9 @@ Logs:
 
 Add tests to `crates/cruster/src/sharding_impl.rs`:
 
-- Detach after detachment window on `get_runners` error.
-- Detach after detachment window on `refresh_batch` error.
-- Detach after detachment window on keep-alive failure streak.
+- Detach at `lease_deadline - lease_detach_margin` after keep-alive loss.
+- Detach after lease deadline on `get_runners` error if no healthy keep-alive.
+- Detach after lease deadline on `refresh_batch` error if no healthy keep-alive.
 - Reacquire retries pick up immediately after lock deletion (watch-driven).
 - While detached, `owned_shards` stays empty and entities are interrupted.
 

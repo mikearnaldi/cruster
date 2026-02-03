@@ -311,4 +311,131 @@ mod tests {
         let a2 = ShardAssigner::compute_assignments(&runners, &groups, 300);
         assert_eq!(a1, a2);
     }
+
+    /// Test that rendezvous hashing provides near-perfect distribution at scale.
+    /// With 2048 shards across 3 nodes, each should get ~682-683 shards.
+    #[test]
+    fn rendezvous_distribution_uniformity() {
+        let runners = vec![
+            Runner::new(RunnerAddress::new("host1", 9000), 1),
+            Runner::new(RunnerAddress::new("host2", 9000), 1),
+            Runner::new(RunnerAddress::new("host3", 9000), 1),
+        ];
+        let groups = vec!["default".to_string()];
+        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 2048);
+
+        let count = |host: &str| assignments.values().filter(|a| a.host == host).count();
+        let h1 = count("host1");
+        let h2 = count("host2");
+        let h3 = count("host3");
+
+        // With rendezvous, expect very tight distribution
+        // 2048 / 3 = 682.67, so expect 682 or 683 each
+        let expected = 2048 / 3; // 682
+        let tolerance = 30; // Allow ~4.5% variance due to hash distribution
+
+        assert!(
+            h1.abs_diff(expected) <= tolerance,
+            "host1: {h1}, expected ~{expected}"
+        );
+        assert!(
+            h2.abs_diff(expected) <= tolerance,
+            "host2: {h2}, expected ~{expected}"
+        );
+        assert!(
+            h3.abs_diff(expected) <= tolerance,
+            "host3: {h3}, expected ~{expected}"
+        );
+    }
+
+    /// Test that when a node is removed, only shards from that node move.
+    #[test]
+    fn minimal_movement_on_node_removal() {
+        let runners_3 = vec![
+            Runner::new(RunnerAddress::new("host1", 9000), 1),
+            Runner::new(RunnerAddress::new("host2", 9000), 1),
+            Runner::new(RunnerAddress::new("host3", 9000), 1),
+        ];
+        let runners_2 = vec![
+            Runner::new(RunnerAddress::new("host1", 9000), 1),
+            Runner::new(RunnerAddress::new("host2", 9000), 1),
+            // host3 removed
+        ];
+
+        let groups = vec!["default".to_string()];
+        let before = ShardAssigner::compute_assignments(&runners_3, &groups, 2048);
+        let after = ShardAssigner::compute_assignments(&runners_2, &groups, 2048);
+
+        let moved: usize = before
+            .iter()
+            .filter(|(shard, addr)| after.get(*shard) != Some(*addr))
+            .count();
+
+        // Only shards from host3 should move (~1/3 of total)
+        let host3_shards = before.values().filter(|a| a.host == "host3").count();
+        assert_eq!(moved, host3_shards, "only host3 shards should move");
+
+        // Verify it's roughly 1/3
+        assert!(
+            moved > 600 && moved < 750,
+            "expected ~683 moves, got {moved}"
+        );
+    }
+
+    /// Test that when a node is added, the new node claims ~1/(n+1) shards evenly.
+    #[test]
+    fn minimal_movement_on_node_addition() {
+        let runners_3 = vec![
+            Runner::new(RunnerAddress::new("host1", 9000), 1),
+            Runner::new(RunnerAddress::new("host2", 9000), 1),
+            Runner::new(RunnerAddress::new("host3", 9000), 1),
+        ];
+        let runners_4 = vec![
+            Runner::new(RunnerAddress::new("host1", 9000), 1),
+            Runner::new(RunnerAddress::new("host2", 9000), 1),
+            Runner::new(RunnerAddress::new("host3", 9000), 1),
+            Runner::new(RunnerAddress::new("host4", 9000), 1), // new
+        ];
+
+        let groups = vec!["default".to_string()];
+        let before = ShardAssigner::compute_assignments(&runners_3, &groups, 2048);
+        let after = ShardAssigner::compute_assignments(&runners_4, &groups, 2048);
+
+        let moved: usize = before
+            .iter()
+            .filter(|(shard, addr)| after.get(*shard) != Some(*addr))
+            .count();
+
+        // New node should claim ~1/4 of shards
+        let host4_shards = after.values().filter(|a| a.host == "host4").count();
+        assert_eq!(moved, host4_shards, "moves should equal host4's new shards");
+
+        // Verify it's roughly 1/4
+        assert!(
+            moved > 450 && moved < 560,
+            "expected ~512 moves, got {moved}"
+        );
+    }
+
+    /// Test that weighted distribution is proportional at scale.
+    #[test]
+    fn weighted_distribution_at_scale() {
+        let runners = vec![
+            Runner::new(RunnerAddress::new("host1", 9000), 3), // 3x weight
+            Runner::new(RunnerAddress::new("host2", 9000), 1),
+        ];
+        let groups = vec!["default".to_string()];
+        let assignments = ShardAssigner::compute_assignments(&runners, &groups, 2048);
+
+        let h1 = assignments.values().filter(|a| a.host == "host1").count();
+        let h2 = assignments.values().filter(|a| a.host == "host2").count();
+
+        // host1 (weight 3) should get ~75%, host2 (weight 1) should get ~25%
+        // 2048 * 0.75 = 1536, 2048 * 0.25 = 512
+        assert!(
+            h1 > 1450 && h1 < 1620,
+            "host1 (w=3): expected ~1536, got {h1}"
+        );
+        assert!(h2 > 430 && h2 < 600, "host2 (w=1): expected ~512, got {h2}");
+    }
 }

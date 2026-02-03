@@ -2,7 +2,7 @@
 
 ## Status
 
-In Progress.
+Complete.
 
 ## Completed Tasks
 
@@ -37,6 +37,23 @@ In Progress.
   2s). Added metrics `acquire_retry_attempts` and `acquire_retry_window_exhausted`.
   Retries only shards held by other runners (not storage errors). Window of 0
   disables retries for backward compatibility.
+
+- [x] **Task 6: Tests** - Added comprehensive tests in `sharding_impl.rs`:
+  - `detach_on_get_runners_error` - Verifies detachment on storage errors
+  - `detach_on_acquire_batch_error` - Verifies detachment on acquire failures
+  - `detach_on_refresh_batch_error` - Verifies detachment on refresh failures
+  - `detach_on_keepalive_failure_streak` - Verifies detachment when keep-alive
+    failure streak exceeds threshold
+  - `detached_loops_skip_work` - Verifies loops skip work while detached
+  - `reattach_after_recovery_window` - Verifies re-attachment after healthy period
+  - `unhealthy_signal_resets_recovery_window` - Verifies recovery window reset
+  - `detachment_disabled_ignores_detach_calls` - Verifies feature toggle works
+  Note: Watch-driven reacquire test deferred until watch functionality is implemented.
+
+- [x] **Task 7: Rollout Strategy** - Config defaults preserve current behavior:
+  `detachment_enabled` defaults to `false`, so detachment is opt-in. Metrics and
+  logs are always active for observability. Enable `detachment_enabled` in staging
+  first to validate behavior before production rollout.
 
 ## Problem Statement
 

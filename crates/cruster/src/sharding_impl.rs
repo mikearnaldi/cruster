@@ -4965,4 +4965,578 @@ mod tests {
             "first-seen tracking should be cleaned up after failure reply"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Detachment Tests
+    // -------------------------------------------------------------------------
+
+    /// Mock runner storage that can be configured to fail on specific operations.
+    mod failing_storage {
+        use super::*;
+        use crate::runner::Runner;
+        use crate::types::MachineId;
+        use futures::Stream;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        pub struct FailingRunnerStorage {
+            inner: crate::storage::memory_runner::MemoryRunnerStorage,
+            pub fail_get_runners: AtomicBool,
+            pub fail_refresh_batch: AtomicBool,
+            pub fail_acquire_batch: AtomicBool,
+        }
+
+        impl FailingRunnerStorage {
+            pub fn new() -> Self {
+                Self {
+                    inner: crate::storage::memory_runner::MemoryRunnerStorage::new(),
+                    fail_get_runners: AtomicBool::new(false),
+                    fail_refresh_batch: AtomicBool::new(false),
+                    fail_acquire_batch: AtomicBool::new(false),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl RunnerStorage for FailingRunnerStorage {
+            async fn register(&self, runner: &Runner) -> Result<MachineId, ClusterError> {
+                self.inner.register(runner).await
+            }
+
+            async fn unregister(&self, address: &RunnerAddress) -> Result<(), ClusterError> {
+                self.inner.unregister(address).await
+            }
+
+            async fn get_runners(&self) -> Result<Vec<Runner>, ClusterError> {
+                if self.fail_get_runners.load(Ordering::SeqCst) {
+                    return Err(ClusterError::PersistenceError {
+                        reason: "simulated get_runners failure".into(),
+                        source: None,
+                    });
+                }
+                self.inner.get_runners().await
+            }
+
+            async fn set_runner_health(
+                &self,
+                address: &RunnerAddress,
+                healthy: bool,
+            ) -> Result<(), ClusterError> {
+                self.inner.set_runner_health(address, healthy).await
+            }
+
+            async fn acquire(
+                &self,
+                shard_id: &ShardId,
+                runner: &RunnerAddress,
+            ) -> Result<bool, ClusterError> {
+                self.inner.acquire(shard_id, runner).await
+            }
+
+            async fn acquire_batch(
+                &self,
+                shard_ids: &[ShardId],
+                runner: &RunnerAddress,
+            ) -> Result<crate::runner_storage::BatchAcquireResult, ClusterError> {
+                if self.fail_acquire_batch.load(Ordering::SeqCst) {
+                    return Err(ClusterError::PersistenceError {
+                        reason: "simulated acquire_batch failure".into(),
+                        source: None,
+                    });
+                }
+                self.inner.acquire_batch(shard_ids, runner).await
+            }
+
+            async fn refresh(
+                &self,
+                shard_id: &ShardId,
+                runner: &RunnerAddress,
+            ) -> Result<bool, ClusterError> {
+                self.inner.refresh(shard_id, runner).await
+            }
+
+            async fn refresh_batch(
+                &self,
+                shard_ids: &[ShardId],
+                runner: &RunnerAddress,
+            ) -> Result<crate::runner_storage::BatchRefreshResult, ClusterError> {
+                if self.fail_refresh_batch.load(Ordering::SeqCst) {
+                    return Err(ClusterError::PersistenceError {
+                        reason: "simulated refresh_batch failure".into(),
+                        source: None,
+                    });
+                }
+                self.inner.refresh_batch(shard_ids, runner).await
+            }
+
+            async fn release(
+                &self,
+                shard_id: &ShardId,
+                runner: &RunnerAddress,
+            ) -> Result<(), ClusterError> {
+                self.inner.release(shard_id, runner).await
+            }
+
+            async fn release_all(&self, runner: &RunnerAddress) -> Result<(), ClusterError> {
+                self.inner.release_all(runner).await
+            }
+
+            async fn watch_runners(
+                &self,
+            ) -> Result<Pin<Box<dyn Stream<Item = Vec<Runner>> + Send>>, ClusterError> {
+                self.inner.watch_runners().await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detach_on_get_runners_error() {
+        use failing_storage::FailingRunnerStorage;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let runner_storage = Arc::new(FailingRunnerStorage::new());
+        let config = Arc::new(ShardingConfig {
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 10,
+            detachment_enabled: true,
+            detachment_recover_window: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            Some(runner_storage.clone() as Arc<dyn RunnerStorage>),
+            None,
+            None,
+            metrics,
+        )
+        .unwrap();
+
+        // Acquire some shards first
+        s.acquire_all_shards().await;
+        assert!(!s.owned_shards.read().await.is_empty());
+        assert!(!s.is_detached());
+
+        // Configure storage to fail on get_runners
+        runner_storage.fail_get_runners.store(true, Ordering::SeqCst);
+
+        // Trigger rebalance_shards which calls get_runners
+        let result = s
+            .rebalance_shards(&(runner_storage.clone() as Arc<dyn RunnerStorage>))
+            .await;
+
+        // Should return Ok(false) but trigger detachment
+        assert!(result.is_ok());
+        assert!(s.is_detached(), "should be detached after get_runners error");
+
+        // Owned shards should be cleared
+        assert!(
+            s.owned_shards.read().await.is_empty(),
+            "owned_shards should be cleared on detachment"
+        );
+
+        // Metrics should reflect detachment
+        assert_eq!(s.metrics.sharding_detached.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn detach_on_acquire_batch_error() {
+        use failing_storage::FailingRunnerStorage;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let runner_storage = Arc::new(FailingRunnerStorage::new());
+        let address = RunnerAddress::new("10.0.0.1", 9000);
+        let config = Arc::new(ShardingConfig {
+            runner_address: address.clone(),
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 3,
+            detachment_enabled: true,
+            detachment_recover_window: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            Some(runner_storage.clone() as Arc<dyn RunnerStorage>),
+            None,
+            None,
+            metrics,
+        )
+        .unwrap();
+
+        // Register this runner so it gets assigned shards
+        runner_storage
+            .register(&Runner::new(address.clone(), 1))
+            .await
+            .unwrap();
+
+        assert!(!s.is_detached());
+
+        // Configure storage to fail on acquire_batch
+        runner_storage
+            .fail_acquire_batch
+            .store(true, Ordering::SeqCst);
+
+        // Trigger rebalance_shards which will try to acquire shards
+        let result = s
+            .rebalance_shards(&(runner_storage.clone() as Arc<dyn RunnerStorage>))
+            .await;
+
+        // Should return Ok but trigger detachment
+        assert!(result.is_ok());
+        assert!(
+            s.is_detached(),
+            "should be detached after acquire_batch error"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_on_refresh_batch_error() {
+        use failing_storage::FailingRunnerStorage;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let runner_storage = Arc::new(FailingRunnerStorage::new());
+        let config = Arc::new(ShardingConfig {
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 10,
+            runner_lock_refresh_interval: Duration::from_millis(10),
+            detachment_enabled: true,
+            detachment_recover_window: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            Some(runner_storage.clone() as Arc<dyn RunnerStorage>),
+            None,
+            None,
+            metrics,
+        )
+        .unwrap();
+
+        // Acquire some shards
+        s.acquire_all_shards().await;
+        assert!(!s.owned_shards.read().await.is_empty());
+        assert!(!s.is_detached());
+
+        // Configure storage to fail on refresh_batch
+        runner_storage
+            .fail_refresh_batch
+            .store(true, Ordering::SeqCst);
+
+        // Start the lock refresh loop
+        let s_clone = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            s_clone.lock_refresh_loop().await;
+        });
+
+        // Wait for the refresh loop to trigger detachment
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        s.cancel.cancel();
+        let _ = handle.await;
+
+        assert!(
+            s.is_detached(),
+            "should be detached after refresh_batch error"
+        );
+        assert!(
+            s.owned_shards.read().await.is_empty(),
+            "owned_shards should be cleared on detachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_on_keepalive_failure_streak() {
+        use std::time::Duration;
+
+        let config = Arc::new(ShardingConfig {
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 10,
+            detachment_enabled: true,
+            detachment_recover_window: Duration::from_millis(100),
+            keepalive_failure_threshold: 3,
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            None,
+            None,
+            None,
+            metrics.clone(),
+        )
+        .unwrap();
+
+        // Acquire some shards
+        s.acquire_all_shards().await;
+        assert!(!s.owned_shards.read().await.is_empty());
+        assert!(!s.is_detached());
+
+        // Create a lease health channel to simulate keep-alive updates
+        let (health_tx, health_rx) = tokio::sync::broadcast::channel::<LeaseHealth>(16);
+
+        // Start the lease health loop
+        let s_clone = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            s_clone.lease_health_loop(health_rx).await;
+        });
+
+        // Send healthy signals first
+        health_tx
+            .send(LeaseHealth {
+                healthy: true,
+                failure_streak: 0,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!s.is_detached());
+
+        // Send failures below threshold
+        health_tx
+            .send(LeaseHealth {
+                healthy: false,
+                failure_streak: 2,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!s.is_detached(), "should not detach below threshold");
+
+        // Send failure at threshold
+        health_tx
+            .send(LeaseHealth {
+                healthy: false,
+                failure_streak: 3,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            s.is_detached(),
+            "should be detached after failure streak exceeds threshold"
+        );
+        assert!(
+            s.owned_shards.read().await.is_empty(),
+            "owned_shards should be cleared on detachment"
+        );
+
+        // Verify metrics
+        assert_eq!(metrics.lease_keepalive_failure_streak.get(), 3);
+
+        s.cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn detached_loops_skip_work() {
+        use failing_storage::FailingRunnerStorage;
+        use std::time::Duration;
+
+        let runner_storage = Arc::new(FailingRunnerStorage::new());
+        let config = Arc::new(ShardingConfig {
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 10,
+            shard_rebalance_retry_interval: Duration::from_millis(10),
+            runner_lock_refresh_interval: Duration::from_millis(10),
+            detachment_enabled: true,
+            detachment_recover_window: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            Some(runner_storage.clone() as Arc<dyn RunnerStorage>),
+            None,
+            None,
+            metrics,
+        )
+        .unwrap();
+
+        // Manually detach
+        s.detach(DetachmentReason::Manual).await;
+        assert!(s.is_detached());
+        assert!(s.owned_shards.read().await.is_empty());
+
+        // Start background loops
+        let s_clone = Arc::clone(&s);
+        let acq_handle = tokio::spawn(async move {
+            s_clone.shard_acquisition_loop().await;
+        });
+
+        let s_clone = Arc::clone(&s);
+        let refresh_handle = tokio::spawn(async move {
+            s_clone.lock_refresh_loop().await;
+        });
+
+        // Let loops run a bit
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Should still be detached (loops should skip work)
+        assert!(
+            s.is_detached(),
+            "should remain detached while loops are skipping"
+        );
+        assert!(
+            s.owned_shards.read().await.is_empty(),
+            "owned_shards should remain empty while detached"
+        );
+
+        s.cancel.cancel();
+        let _ = acq_handle.await;
+        let _ = refresh_handle.await;
+    }
+
+    #[tokio::test]
+    async fn reattach_after_recovery_window() {
+        use std::time::Duration;
+
+        let config = Arc::new(ShardingConfig {
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 10,
+            detachment_enabled: true,
+            detachment_recover_window: Duration::from_millis(50),
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            None,
+            None,
+            None,
+            metrics.clone(),
+        )
+        .unwrap();
+
+        // Detach
+        s.detach(DetachmentReason::Manual).await;
+        assert!(s.is_detached());
+        assert_eq!(metrics.sharding_detached.get(), 1);
+
+        // First healthy signal starts recovery window
+        s.signal_healthy();
+        assert!(
+            s.is_detached(),
+            "should still be detached immediately after first healthy signal"
+        );
+
+        // Wait for recovery window to elapse
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Another healthy signal should trigger re-attachment
+        s.signal_healthy();
+        assert!(
+            !s.is_detached(),
+            "should be re-attached after recovery window"
+        );
+        assert_eq!(metrics.sharding_detached.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn unhealthy_signal_resets_recovery_window() {
+        use std::time::Duration;
+
+        let config = Arc::new(ShardingConfig {
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 10,
+            detachment_enabled: true,
+            detachment_recover_window: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            None,
+            None,
+            None,
+            metrics,
+        )
+        .unwrap();
+
+        // Detach
+        s.detach(DetachmentReason::Manual).await;
+        assert!(s.is_detached());
+
+        // Start recovery
+        s.signal_healthy();
+
+        // Wait partway through recovery window
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Signal unhealthy - resets recovery
+        s.signal_unhealthy();
+
+        // Wait a bit more (would have exceeded window if not reset)
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Should still be detached because recovery was reset
+        s.signal_healthy();
+        assert!(
+            s.is_detached(),
+            "should still be detached after recovery reset"
+        );
+
+        // Now wait for full recovery window
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        s.signal_healthy();
+        assert!(
+            !s.is_detached(),
+            "should be re-attached after full recovery window"
+        );
+    }
+
+    #[tokio::test]
+    async fn detachment_disabled_ignores_detach_calls() {
+        use std::time::Duration;
+
+        let config = Arc::new(ShardingConfig {
+            shard_groups: vec!["default".to_string()],
+            shards_per_group: 10,
+            detachment_enabled: false, // Disabled!
+            detachment_recover_window: Duration::from_millis(50),
+            ..Default::default()
+        });
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            None,
+            None,
+            None,
+            metrics.clone(),
+        )
+        .unwrap();
+
+        // Acquire shards
+        s.acquire_all_shards().await;
+        let shard_count = s.owned_shards.read().await.len();
+        assert!(shard_count > 0);
+
+        // Try to detach
+        s.detach(DetachmentReason::Manual).await;
+
+        // Should NOT be detached (feature disabled)
+        assert!(
+            !s.is_detached(),
+            "should not detach when detachment_enabled=false"
+        );
+        assert_eq!(
+            s.owned_shards.read().await.len(),
+            shard_count,
+            "owned_shards should not be cleared when detachment is disabled"
+        );
+        assert_eq!(
+            metrics.sharding_detached.get(),
+            0,
+            "detachment metric should not change when disabled"
+        );
+    }
 }

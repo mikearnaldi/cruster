@@ -260,18 +260,20 @@ fn weighted_distribution() {
 
 **File**: `crates/cruster/benches/shard_assignment.rs`
 
-Benchmark added using criterion. Results with 2048 shards:
+Benchmark comparing all strategies with 2048 shards across 100 nodes:
 
-| Runners | Time |
-|---------|------|
-| 3 | 0.63ms |
-| 10 | 1.38ms |
-| 100 | 11.1ms |
-| 1000 | 107ms |
+| Strategy | Time | Relative |
+|----------|------|----------|
+| Rendezvous Parallel | 1.35 ms | 1x (fastest) |
+| Rendezvous (sequential) | 10.9 ms | 8x slower |
+| Consistent Hash (150 vnodes) | 175 ms | 130x slower |
 
-Performance is O(shards * runners) which is expected for rendezvous hashing. For typical production clusters (< 100 nodes), performance is excellent. Large clusters (1000+ nodes) may benefit from the optimizations described in Future Considerations.
+**Key findings:**
+- Parallel rendezvous is the clear winner for clusters with 100+ nodes
+- Consistent hash is slow due to ring building cost (100 nodes × 150 vnodes = 15,000 insertions)
+- Sequential rendezvous is fast enough for smaller clusters (< 50 nodes)
 
-Run with: `cargo bench --bench shard_assignment`
+Run with: `cargo bench --bench shard_assignment --features "consistent-hash,parallel"`
 
 ### Phase 5: Cleanup [COMPLETE]
 

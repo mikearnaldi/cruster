@@ -55,10 +55,14 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "tls-rustls",
 # etcd storage (optional)
 etcd-client = { version = "0.14", optional = true }
 
+# Consistent hashing (optional)
+hashring = { version = "0.3", optional = true }
+
 [features]
 default = []
 sql = ["dep:sqlx"]
 etcd = ["dep:etcd-client"]
+consistent-hash = ["dep:hashring"]
 
 [build-dependencies]
 tonic-build = "0.12"

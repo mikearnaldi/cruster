@@ -347,7 +347,7 @@ pub struct ShardingConfig {
 - [x] Define `ShardAssignmentStrategy` enum
 - [x] Refactor `compute_assignments` to accept strategy parameter
 - [x] Extract current rendezvous logic into `compute_rendezvous` method
-- [ ] Re-add consistent hash implementation as `compute_consistent_hash` method (bring back `hashring` as optional)
+- [x] Re-add consistent hash implementation as `compute_consistent_hash` method (bring back `hashring` as optional)
 - [x] Add strategy to `ShardingConfig` / cluster configuration
 - [x] Update `ShardingImpl` to use configured strategy
 - [x] Add tests for strategy selection
@@ -404,11 +404,11 @@ If distribution testing reveals issues with djb2:
 
 ### Configurable Strategy (Phase 6)
 
-- [x] `ShardAssignmentStrategy` enum defined with `Rendezvous` variant (ConsistentHash to be added later)
+- [x] `ShardAssignmentStrategy` enum defined with `Rendezvous` and `ConsistentHash` variants
 - [x] `compute_assignments` accepts strategy parameter
 - [x] Rendezvous strategy produces correct, deterministic assignments
 - [x] Rendezvous strategy passes distribution and rebalance tests
 - [x] Strategy is configurable via `ShardingConfig`
 - [x] Benchmarks updated to use strategy API
-- [ ] ConsistentHash strategy implementation (optional, for large clusters)
+- [x] ConsistentHash strategy implementation (behind `consistent-hash` feature flag)
 - [x] Documentation explains when to use each strategy (module-level doc in shard_assigner.rs)

@@ -50,7 +50,7 @@ tracing = { workspace = true }
 cruster-macros = { workspace = true }
 
 # SQL storage (optional)
-sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "chrono"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "chrono"], optional = true }
 
 # etcd storage (optional)
 etcd-client = { version = "0.14", optional = true }

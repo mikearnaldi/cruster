@@ -113,7 +113,7 @@ pub mod __internal {
     };
     #[cfg(feature = "sql")]
     pub use crate::state_guard::SqlTransactionHandle;
-    pub use crate::state_guard::{ActivityScope, StateMutGuard, TraitStateMutGuard};
+    pub use crate::state_guard::{ActivityScope, StateMutGuard, StateRef, TraitStateMutGuard};
     #[cfg(feature = "sql")]
     pub use crate::storage::sql_workflow_engine::SqlWorkflowEngine;
 }

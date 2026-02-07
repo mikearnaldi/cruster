@@ -1363,21 +1363,20 @@ fn entity_trait_impl_inner(
                 }
             });
         } else {
-            // Read-only methods go on ReadView with &self, access self.state directly
+            // Read-only methods go on ReadView with &mut self, access self.state via StateRef proxy
             read_methods.push(quote! {
                 #(#attrs)*
-                #vis async fn #method_name #generics (&self, #(#params),*) #output #where_clause
+                #vis async fn #method_name #generics (&mut self, #(#params),*) #output #where_clause
                     #block
             });
 
-            // Wrapper loads state and creates ReadView
+            // Wrapper loads state into StateRef and creates ReadView
             wrapper_methods.push(quote! {
                 #(#attrs)*
                 #vis async fn #method_name #generics (&self, #(#params),*) #output #where_clause {
-                    let __guard = self.__state.load();
-                    let __view = #read_view_name {
+                    let mut __view = #read_view_name {
                         __wrapper: self,
-                        state: &**__guard,
+                        state: #krate::__internal::StateRef::__new(self.__state.load_full()),
                     };
                     __view.#method_name(#(#param_names),*).await
                 }
@@ -1416,8 +1415,11 @@ fn entity_trait_impl_inner(
 
             quote! {
                 #[inline]
-                async fn #method_name #generics (&self, #(#params),*) #output #where_clause {
-                    self.__wrapper.#method_name(#(#param_names),*).await
+                async fn #method_name #generics (&mut self, #(#params),*) #output #where_clause {
+                    let __result = self.__wrapper.#method_name(#(#param_names),*).await;
+                    // Refresh state from ArcSwap after activity commits
+                    self.state.__refresh(self.__wrapper.__state.load_full());
+                    __result
                 }
             }
         })
@@ -1429,7 +1431,7 @@ fn entity_trait_impl_inner(
         struct #read_view_name<'a> {
             #[allow(dead_code)]
             __wrapper: &'a #wrapper_name,
-            state: &'a #state_type,
+            state: #krate::__internal::StateRef<#state_type>,
         }
 
         #[doc(hidden)]
@@ -2392,20 +2394,19 @@ fn generate_stateful_entity(
                 });
             }
         } else {
-            // Read-only method: goes on ReadView, wrapper acquires read lock
+            // Read-only method: goes on ReadView, wrapper uses StateRef proxy
             read_methods.push(quote! {
                 #(#attrs)*
-                #vis #async_token fn #method_name #generics (&self, #(#params),*) #output #where_clause
+                #vis #async_token fn #method_name #generics (&mut self, #(#params),*) #output #where_clause
                     #block
             });
 
             wrapper_methods.push(quote! {
                 #(#attrs)*
                 #vis #async_token fn #method_name #generics (&self, #(#params),*) #output #where_clause {
-                    let __guard = self.__state.load();
-                    let __view = #read_view_name {
+                    let mut __view = #read_view_name {
                         __handler: self,
-                        state: &**__guard,
+                        state: #krate::__internal::StateRef::__new(self.__state.load_full()),
                     };
                     __view.#method_name(#(#param_names),*) #await_token
                 }
@@ -2420,7 +2421,7 @@ fn generate_stateful_entity(
         struct #read_view_name<'a> {
             #[allow(dead_code)]
             __handler: &'a #handler_name,
-            state: &'a #state_type,
+            state: #krate::__internal::StateRef<#state_type>,
         }
 
         #[doc(hidden)]
@@ -2521,8 +2522,11 @@ fn generate_stateful_entity(
 
             quote! {
                 #[inline]
-                async fn #method_name #generics (&self, #(#params),*) #output #where_clause {
-                    self.__handler.#method_name(#(#param_names),*).await
+                async fn #method_name #generics (&mut self, #(#params),*) #output #where_clause {
+                    let __result = self.__handler.#method_name(#(#param_names),*).await;
+                    // Refresh state from ArcSwap after activity commits
+                    self.state.__refresh(self.__handler.__state.load_full());
+                    __result
                 }
             }
         })

@@ -7,6 +7,12 @@
 //! ArcSwap on drop but does not handle persistence (persistence is managed
 //! at the entity level for composite state).
 //!
+//! `StateRef<S>` is a read-only proxy for entity state in `#[workflow]` and
+//! `#[rpc]` methods. It implements `Deref<Target=S>` so `self.state.field`
+//! works transparently, but cannot be reassigned or mutated by user code.
+//! After each activity call, the macro-generated delegation code refreshes
+//! the proxy to reflect the latest committed state.
+//!
 //! For transactional activities, use `ActivityScope` to wrap activity execution
 //! in a database transaction. State mutations via `self.state` in `#[activity]`
 //! methods automatically write to the active transaction when one exists.
@@ -25,6 +31,42 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use crate::durable::StorageTransaction;
 use crate::durable::WorkflowStorage;
 use crate::error::ClusterError;
+
+/// Read-only proxy for entity state in `#[workflow]` and `#[rpc]` methods.
+///
+/// Wraps an `Arc<S>` and implements `Deref<Target=S>` so that `self.state.field`
+/// works transparently. The inner `Arc` is private, preventing user code from
+/// reassigning or constructing a `StateRef` directly.
+///
+/// After each activity call within a workflow, the macro-generated delegation
+/// code calls `__refresh` to swap in the latest committed state from the
+/// `ArcSwap`.
+pub struct StateRef<S>(Arc<S>);
+
+impl<S> StateRef<S> {
+    /// Create a new `StateRef` wrapping the given `Arc`.
+    #[doc(hidden)]
+    pub fn __new(arc: Arc<S>) -> Self {
+        Self(arc)
+    }
+
+    /// Refresh the inner state with a new `Arc`.
+    ///
+    /// Called by macro-generated activity delegation code after an activity
+    /// commits, so that subsequent reads in the workflow see the updated state.
+    #[doc(hidden)]
+    pub fn __refresh(&mut self, new: Arc<S>) {
+        self.0 = new;
+    }
+}
+
+impl<S> Deref for StateRef<S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 // Type aliases to reduce complexity warnings
 type PendingWrites = Arc<parking_lot::Mutex<Vec<(String, Vec<u8>)>>>;

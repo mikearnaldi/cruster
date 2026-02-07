@@ -2086,4 +2086,131 @@ mod tests {
             total_elapsed
         );
     }
+
+    /// Test that `self.state` in a workflow reflects updated values after
+    /// calling an activity. With the `StateRef` proxy, the read view
+    /// is refreshed after each activity delegation, so subsequent reads
+    /// within the same workflow see the committed state.
+    #[tokio::test]
+    async fn workflow_state_refreshes_after_activity() {
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct RefreshState {
+            count: i32,
+            label: String,
+        }
+
+        #[entity(krate = "crate")]
+        #[derive(Clone)]
+        struct RefreshEntity;
+
+        #[entity_impl(krate = "crate")]
+        #[state(RefreshState)]
+        impl RefreshEntity {
+            fn init(&self, _ctx: &EntityContext) -> Result<RefreshState, ClusterError> {
+                Ok(RefreshState {
+                    count: 0,
+                    label: "init".to_string(),
+                })
+            }
+
+            #[activity]
+            async fn do_increment(&mut self, amount: i32) -> Result<(), ClusterError> {
+                self.state.count += amount;
+                Ok(())
+            }
+
+            #[activity]
+            async fn do_set_label(&mut self, label: String) -> Result<(), ClusterError> {
+                self.state.label = label;
+                Ok(())
+            }
+
+            /// Workflow that calls multiple activities and reads self.state
+            /// after each one. With StateRef, these reads should reflect
+            /// the latest committed state.
+            #[workflow]
+            async fn increment_and_read(&self, amount: i32) -> Result<i32, ClusterError> {
+                assert_eq!(self.state.count, 0, "count should start at 0");
+
+                self.do_increment(amount).await?;
+
+                // This read must reflect the activity's mutation
+                let after_first = self.state.count;
+                assert_eq!(
+                    after_first, amount,
+                    "count should be {amount} after first increment"
+                );
+
+                self.do_increment(amount).await?;
+
+                // Second read must reflect the second mutation
+                let after_second = self.state.count;
+                assert_eq!(
+                    after_second,
+                    amount * 2,
+                    "count should be {} after second increment",
+                    amount * 2
+                );
+
+                Ok(after_second)
+            }
+
+            /// Workflow that interleaves different activities and reads
+            /// multiple fields after each call.
+            #[workflow]
+            async fn multi_field_workflow(&self) -> Result<String, ClusterError> {
+                self.do_increment(10).await?;
+                assert_eq!(self.state.count, 10);
+                assert_eq!(self.state.label, "init");
+
+                self.do_set_label("updated".to_string()).await?;
+                assert_eq!(self.state.count, 10);
+                assert_eq!(self.state.label, "updated");
+
+                self.do_increment(5).await?;
+                assert_eq!(self.state.count, 15);
+                assert_eq!(self.state.label, "updated");
+
+                Ok(format!("{}:{}", self.state.label, self.state.count))
+            }
+
+            #[rpc]
+            async fn get_count(&self) -> Result<i32, ClusterError> {
+                Ok(self.state.count)
+            }
+        }
+
+        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let ctx = test_ctx_with_storage("RefreshEntity", "r-1", storage);
+        let handler = RefreshEntity.spawn(ctx).await.unwrap();
+
+        // Test 1: workflow reads state after activity calls
+        let payload = rmp_serde::to_vec(&10i32).unwrap();
+        let result = handler
+            .handle_request("increment_and_read", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 20);
+
+        // Verify via RPC that state persisted correctly
+        let result = handler
+            .handle_request("get_count", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 20);
+
+        // Test 2: multi-field workflow
+        let storage2: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let ctx2 = test_ctx_with_storage("RefreshEntity", "r-2", storage2);
+        let handler2 = RefreshEntity.spawn(ctx2).await.unwrap();
+
+        let result = handler2
+            .handle_request("multi_field_workflow", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "updated:15");
+    }
 }

@@ -2314,16 +2314,20 @@ impl Sharding for ShardingImpl {
                 // a gRPC call to ourselves — that causes infinite recursion and OOM.
                 // Instead, route locally since the assignment says we own this shard.
                 if owner == self.config.runner_address {
-                    tracing::debug!(
-                        attempt,
-                        shard_id = %shard_id,
-                        "send: shard assigned to us but not in owned_shards, routing locally"
-                    );
+                    if envelope.persisted {
+                        let (tx, rx) = mpsc::channel(16);
+                        if let Some(ref storage) = self.message_storage {
+                            storage.register_reply_handler(envelope.request_id, tx);
+                        }
+                        self.storage_poll_notify.notify_one();
+                        return Ok(rx);
+                    }
+
                     let (tx, rx) = mpsc::channel(16);
                     match self.route_local(envelope.clone(), Some(tx)).await {
                         Ok(()) => return Ok(rx),
                         Err(e) if Self::is_retryable(&e) && !is_last => {
-                            tracing::debug!(attempt, error = %e, "send: local route failed for self-assigned shard, will retry");
+                            tracing::debug!(attempt, error = %e, "send: retryable error (self-routed), will retry");
                             last_err = Some(e);
                             continue;
                         }
@@ -2444,15 +2448,15 @@ impl Sharding for ShardingImpl {
             } else if let Some(owner) = self.get_shard_owner_async(&shard_id).await {
                 // Self-send guard: same as in send() — prevent infinite recursion
                 if owner == self.config.runner_address {
-                    tracing::debug!(
-                        attempt,
-                        shard_id = %shard_id,
-                        "notify: shard assigned to us but not in owned_shards, routing locally"
-                    );
+                    if envelope.persisted {
+                        self.storage_poll_notify.notify_one();
+                        return Ok(());
+                    }
+
                     match self.route_local(envelope.clone(), None).await {
                         Ok(()) => return Ok(()),
                         Err(e) if Self::is_retryable(&e) && !is_last => {
-                            tracing::debug!(attempt, error = %e, "notify: local route failed for self-assigned shard, will retry");
+                            tracing::debug!(attempt, error = %e, "notify: retryable error (self-routed), will retry");
                             last_err = Some(e);
                             continue;
                         }
@@ -2537,6 +2541,12 @@ impl Sharding for ShardingImpl {
         }
 
         if let Some(owner) = self.get_shard_owner_async(&shard_id).await {
+            // Self-send guard: same as in send() — prevent infinite recursion
+            if owner == self.config.runner_address {
+                self.handle_interrupt_local(&interrupt).await;
+                return Ok(());
+            }
+
             return self
                 .runners
                 .notify(&owner, Envelope::Interrupt(interrupt))

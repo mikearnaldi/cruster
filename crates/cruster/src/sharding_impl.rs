@@ -792,7 +792,7 @@ impl ShardingImpl {
         // 5. Acquire phase: batch acquire newly assigned shards with retry
         // Filter out shards currently being released
         let releasing = self.releasing_shards.read().await;
-        let mut pending_acquire: Vec<ShardId> = to_acquire
+        let pending_acquire: Vec<ShardId> = to_acquire
             .iter()
             .filter(|s| !releasing.contains(s))
             .cloned()
@@ -800,56 +800,25 @@ impl ShardingImpl {
         drop(releasing);
 
         let mut all_newly_acquired = Vec::new();
-        let retry_window = self.config.acquire_retry_window;
-        let retry_interval = self.config.acquire_retry_interval;
-        let window_start = std::time::Instant::now();
-        let mut is_first_attempt = true;
 
-        // Retry loop for acquiring shards held by other runners
-        while !pending_acquire.is_empty() {
-            // Check cancellation before each attempt
+        // Single acquire attempt per rebalance cycle. Shards held by other
+        // runners will be retried on the next rebalance cycle (every
+        // shard_rebalance_retry_interval). Since shard assignment is
+        // deterministic, we WILL eventually acquire all our shards once the
+        // previous owner's lease expires.
+        if !pending_acquire.is_empty() {
+            // Check cancellation before attempting
             if self.cancel.is_cancelled() {
                 tracing::debug!("rebalance_shards cancelled during acquire_batch");
-                return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
+                return Ok(!to_release.is_empty());
             }
-
-            // If not first attempt, check window and sleep before retry
-            if !is_first_attempt {
-                // Check if we've exceeded the retry window
-                if window_start.elapsed() >= retry_window {
-                    tracing::warn!(
-                        remaining_shards = pending_acquire.len(),
-                        window_ms = retry_window.as_millis() as u64,
-                        "acquire retry window exhausted, giving up on remaining shards"
-                    );
-                    self.metrics.acquire_retry_window_exhausted.inc();
-                    break;
-                }
-
-                // Sleep before retry
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => {
-                        tracing::debug!("rebalance_shards cancelled during acquire retry sleep");
-                        return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
-                    }
-                    _ = tokio::time::sleep(retry_interval) => {},
-                }
-
-                self.metrics.acquire_retry_attempts.inc();
-                tracing::trace!(
-                    pending_shards = pending_acquire.len(),
-                    "retrying acquire for shards held by other runners"
-                );
-            }
-            is_first_attempt = false;
 
             // Acquire shards (with cancellation support)
             let batch_result = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
                     tracing::debug!("rebalance_shards cancelled during acquire_batch");
-                    return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
+                    return Ok(!to_release.is_empty());
                 }
                 result = runner_storage.acquire_batch(&pending_acquire, &self.config.runner_address) => {
                     match result {
@@ -860,27 +829,21 @@ impl ShardingImpl {
                             self.detach(DetachmentReason::StorageError(format!(
                                 "acquire_batch failed: {}", e
                             ))).await;
-                            return Ok(!to_release.is_empty() || !all_newly_acquired.is_empty());
+                            return Ok(!to_release.is_empty());
                         }
                     }
                 },
             };
 
-            // Handle storage errors for individual shards - remove them from pending
-            // (don't retry shards that failed due to storage errors, only shards held elsewhere)
-            let failed_shard_ids: HashSet<_> = batch_result
-                .failures
-                .iter()
-                .map(|(shard_id, _)| shard_id.clone())
-                .collect();
-            if !failed_shard_ids.is_empty() {
+            // Handle storage errors for individual shards
+            if !batch_result.failures.is_empty() {
                 tracing::warn!(
-                    failure_count = failed_shard_ids.len(),
-                    "some shards failed to acquire due to storage errors (will not retry)"
+                    failure_count = batch_result.failures.len(),
+                    "some shards failed to acquire due to storage errors"
                 );
             }
 
-            // Add acquired shards to owned_shards and track them
+            // Add acquired shards to owned_shards
             {
                 let mut owned = self.owned_shards.write().await;
                 for shard_id in &batch_result.acquired {
@@ -890,19 +853,15 @@ impl ShardingImpl {
             }
             all_newly_acquired.extend(batch_result.acquired.clone());
 
-            // Remove acquired and failed shards from pending
-            let acquired_set: HashSet<_> = batch_result.acquired.into_iter().collect();
-            pending_acquire.retain(|s| !acquired_set.contains(s) && !failed_shard_ids.contains(s));
-
-            // If no retries configured, break after first attempt
-            if retry_window.is_zero() {
-                if !pending_acquire.is_empty() {
-                    tracing::trace!(
-                        count = pending_acquire.len(),
-                        "shards not acquired (held by other runners, no retry configured)"
-                    );
-                }
-                break;
+            // Log shards still pending (held by other runners)
+            let remaining =
+                pending_acquire.len() - batch_result.acquired.len() - batch_result.failures.len();
+            if remaining > 0 {
+                tracing::info!(
+                    acquired = batch_result.acquired.len(),
+                    remaining,
+                    "shards held by other runners, will retry next rebalance cycle"
+                );
             }
         }
 
@@ -2323,7 +2282,10 @@ impl Sharding for ShardingImpl {
 
             let is_last = attempt == max_retries;
 
-            if self.has_shard_async(&shard_id).await {
+            let has_local = self.has_shard_async(&shard_id).await;
+            let owner = self.get_shard_owner_async(&shard_id).await;
+
+            if has_local {
                 if envelope.persisted {
                     // Persisted messages are dispatched via the storage poll path.
                     let (tx, rx) = mpsc::channel(16);
@@ -2345,7 +2307,33 @@ impl Sharding for ShardingImpl {
                     }
                     Err(e) => return Err(e),
                 }
-            } else if let Some(owner) = self.get_shard_owner_async(&shard_id).await {
+            } else if let Some(owner) = owner {
+                // Self-send guard: if the shard owner is ourselves but has_shard_async
+                // returned false, the shard is being acquired or was lost. Do NOT make
+                // a gRPC call to ourselves — that causes infinite recursion and OOM.
+                // Instead, route locally since the assignment says we own this shard.
+                if owner == self.config.runner_address {
+                    if envelope.persisted {
+                        let (tx, rx) = mpsc::channel(16);
+                        if let Some(ref storage) = self.message_storage {
+                            storage.register_reply_handler(envelope.request_id, tx);
+                        }
+                        self.storage_poll_notify.notify_one();
+                        return Ok(rx);
+                    }
+
+                    let (tx, rx) = mpsc::channel(16);
+                    match self.route_local(envelope.clone(), Some(tx)).await {
+                        Ok(()) => return Ok(rx),
+                        Err(e) if Self::is_retryable(&e) && !is_last => {
+                            tracing::debug!(attempt, error = %e, "send: retryable error (self-routed), will retry");
+                            last_err = Some(e);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
                 // Remote delivery via the Runners transport.
                 // Use send() to get streaming replies from the remote node.
                 match self.runners.send(&owner, envelope.clone()).await {
@@ -2457,6 +2445,24 @@ impl Sharding for ShardingImpl {
                     Err(e) => return Err(e),
                 }
             } else if let Some(owner) = self.get_shard_owner_async(&shard_id).await {
+                // Self-send guard: same as in send() — prevent infinite recursion
+                if owner == self.config.runner_address {
+                    if envelope.persisted {
+                        self.storage_poll_notify.notify_one();
+                        return Ok(());
+                    }
+
+                    match self.route_local(envelope.clone(), None).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) if Self::is_retryable(&e) && !is_last => {
+                            tracing::debug!(attempt, error = %e, "notify: retryable error (self-routed), will retry");
+                            last_err = Some(e);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
                 match self
                     .runners
                     .notify(&owner, Envelope::Request(envelope.clone()))
@@ -2534,6 +2540,12 @@ impl Sharding for ShardingImpl {
         }
 
         if let Some(owner) = self.get_shard_owner_async(&shard_id).await {
+            // Self-send guard: same as in send() — prevent infinite recursion
+            if owner == self.config.runner_address {
+                self.handle_interrupt_local(&interrupt).await;
+                return Ok(());
+            }
+
             return self
                 .runners
                 .notify(&owner, Envelope::Interrupt(interrupt))

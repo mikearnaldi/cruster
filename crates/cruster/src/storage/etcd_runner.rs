@@ -544,14 +544,17 @@ impl RunnerStorage for EtcdRunnerStorage {
         Ok(false)
     }
 
-    /// Batch acquire multiple shard locks. Releases mutexes between individual
-    /// shard operations to reduce contention — other etcd operations (health
-    /// checks, other runners) can proceed between shards.
+    /// Batch acquire multiple shard locks using concurrent CAS transactions.
+    /// Clones the etcd client (which is backed by a single gRPC connection
+    /// that supports multiplexing) and fires all CAS operations concurrently
+    /// with a bounded concurrency limit.
     async fn acquire_batch(
         &self,
         shard_ids: &[ShardId],
         runner: &RunnerAddress,
     ) -> Result<BatchAcquireResult, ClusterError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         if shard_ids.is_empty() {
             return Ok(BatchAcquireResult {
                 acquired: Vec::new(),
@@ -561,71 +564,89 @@ impl RunnerStorage for EtcdRunnerStorage {
 
         let value = format!("{}:{}", runner.host, runner.port);
 
+        // Clone the client (cheap — gRPC channel is shared) and read lease_id once.
+        let client = self.client.lock().await.clone();
+        let lease_id = *self.lease_id.lock().await;
+
+        // Fire up to CONCURRENCY CAS operations at a time.
+        const CONCURRENCY: usize = 64;
+
         let mut acquired = Vec::new();
         let mut failures = Vec::new();
-        for shard_id in shard_ids {
-            let key = self.shard_key(shard_id);
 
-            // Acquire mutexes per-shard to allow other operations between shards.
-            let mut client = self.client.lock().await;
-            let lease_id = self.lease_id.lock().await;
-            let put_opts = lease_id.map(|id| PutOptions::new().with_lease(id));
-            drop(lease_id);
+        // Process shards in chunks to bound concurrency.
+        for chunk in shard_ids.chunks(CONCURRENCY) {
+            let mut futures = FuturesUnordered::new();
 
-            let txn = Txn::new()
-                .when([Compare::create_revision(
-                    key.as_bytes(),
-                    CompareOp::Equal,
-                    0,
-                )])
-                .and_then([TxnOp::put(key.as_bytes(), value.as_bytes(), put_opts)])
-                .or_else([TxnOp::get(key.as_bytes(), None)]);
+            for shard_id in chunk {
+                let key = self.shard_key(shard_id);
+                let put_opts = lease_id.map(|id| PutOptions::new().with_lease(id));
+                let value = value.clone();
+                let shard_id = shard_id.clone();
+                let mut client = client.clone();
 
-            match client.txn(txn).await {
-                Ok(resp) => {
-                    if resp.succeeded() {
-                        acquired.push(shard_id.clone());
-                    } else {
-                        // Check if already held by us
-                        let mut is_ours = false;
-                        for op_resp in resp.op_responses() {
-                            if let etcd_client::TxnOpResponse::Get(get_resp) = op_resp {
-                                if let Some(kv) = get_resp.kvs().first() {
-                                    match std::str::from_utf8(kv.value()) {
-                                        Ok(existing) => {
-                                            if existing == value {
-                                                is_ours = true;
+                futures.push(async move {
+                    let txn = Txn::new()
+                        .when([Compare::create_revision(
+                            key.as_bytes(),
+                            CompareOp::Equal,
+                            0,
+                        )])
+                        .and_then([TxnOp::put(key.as_bytes(), value.as_bytes(), put_opts)])
+                        .or_else([TxnOp::get(key.as_bytes(), None)]);
+
+                    let result = client.txn(txn).await;
+                    (shard_id, value, result)
+                });
+            }
+
+            while let Some((shard_id, value, result)) = futures.next().await {
+                match result {
+                    Ok(resp) => {
+                        if resp.succeeded() {
+                            acquired.push(shard_id);
+                        } else {
+                            // Check if already held by us
+                            let mut is_ours = false;
+                            for op_resp in resp.op_responses() {
+                                if let etcd_client::TxnOpResponse::Get(get_resp) = op_resp {
+                                    if let Some(kv) = get_resp.kvs().first() {
+                                        match std::str::from_utf8(kv.value()) {
+                                            Ok(existing) => {
+                                                if existing == value {
+                                                    is_ours = true;
+                                                }
                                             }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                shard_id = %shard_id,
-                                                error = %e,
-                                                "non-UTF-8 shard lock value in acquire_batch"
-                                            );
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    shard_id = %shard_id,
+                                                    error = %e,
+                                                    "non-UTF-8 shard lock value in acquire_batch"
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        if is_ours {
-                            acquired.push(shard_id.clone());
+                            if is_ours {
+                                acquired.push(shard_id);
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        shard_id = %shard_id,
-                        error = %e,
-                        "failed to acquire shard in batch"
-                    );
-                    failures.push((
-                        shard_id.clone(),
-                        ClusterError::PersistenceError {
-                            reason: format!("etcd acquire failed for shard {shard_id}: {e}"),
-                            source: Some(Box::new(e)),
-                        },
-                    ));
+                    Err(e) => {
+                        tracing::warn!(
+                            shard_id = %shard_id,
+                            error = %e,
+                            "failed to acquire shard in batch"
+                        );
+                        failures.push((
+                            shard_id,
+                            ClusterError::PersistenceError {
+                                reason: format!("etcd acquire failed: {e}"),
+                                source: Some(Box::new(e)),
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -670,40 +691,57 @@ impl RunnerStorage for EtcdRunnerStorage {
         shard_ids: &[ShardId],
         runner: &RunnerAddress,
     ) -> Result<BatchRefreshResult, ClusterError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         let value = format!("{}:{}", runner.host, runner.port);
+
+        // Clone the client and read lease_id once.
+        let client = self.client.lock().await.clone();
+        let lease_id = *self.lease_id.lock().await;
+
+        const CONCURRENCY: usize = 64;
 
         let mut refreshed = Vec::new();
         let mut lost = Vec::new();
         let mut failures = Vec::new();
 
-        for shard_id in shard_ids {
-            let key = self.shard_key(shard_id);
+        for chunk in shard_ids.chunks(CONCURRENCY) {
+            let mut futures = FuturesUnordered::new();
 
-            // Acquire mutexes per-shard to allow other operations between shards.
-            let mut client = self.client.lock().await;
-            let lease_id = self.lease_id.lock().await;
-            let put_opts = lease_id.map(|id| PutOptions::new().with_lease(id));
-            drop(lease_id);
+            for shard_id in chunk {
+                let key = self.shard_key(shard_id);
+                let put_opts = lease_id.map(|id| PutOptions::new().with_lease(id));
+                let value = value.clone();
+                let shard_id = shard_id.clone();
+                let mut client = client.clone();
 
-            let txn = Txn::new()
-                .when([Compare::value(
-                    key.as_bytes(),
-                    CompareOp::Equal,
-                    value.as_bytes(),
-                )])
-                .and_then([TxnOp::put(key.as_bytes(), value.as_bytes(), put_opts)]);
+                futures.push(async move {
+                    let txn = Txn::new()
+                        .when([Compare::value(
+                            key.as_bytes(),
+                            CompareOp::Equal,
+                            value.as_bytes(),
+                        )])
+                        .and_then([TxnOp::put(key.as_bytes(), value.as_bytes(), put_opts)]);
 
-            match client.txn(txn).await {
-                Ok(resp) => {
-                    if resp.succeeded() {
-                        refreshed.push(shard_id.clone());
-                    } else {
-                        lost.push(shard_id.clone());
+                    let result = client.txn(txn).await;
+                    (shard_id, result)
+                });
+            }
+
+            while let Some((shard_id, result)) = futures.next().await {
+                match result {
+                    Ok(resp) => {
+                        if resp.succeeded() {
+                            refreshed.push(shard_id);
+                        } else {
+                            lost.push(shard_id);
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(shard_id = %shard_id, error = %e, "failed to refresh shard in batch");
-                    failures.push((shard_id.clone(), Self::map_err(e)));
+                    Err(e) => {
+                        tracing::warn!(shard_id = %shard_id, error = %e, "failed to refresh shard in batch");
+                        failures.push((shard_id, Self::map_err(e)));
+                    }
                 }
             }
         }

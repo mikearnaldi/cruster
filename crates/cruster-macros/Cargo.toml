@@ -1,13 +1,13 @@
 [package]
 name = "cruster-macros"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
-homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+version = "0.0.13"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Michael Arnaldi <michael.arnaldi@effectful.co>"]
+repository = "https://github.com/mikearnaldi/cruster"
+homepage = "https://github.com/mikearnaldi/cruster"
+keywords = ["distributed", "actor", "cluster", "workflow", "durable"]
+categories = ["asynchronous", "network-programming"]
 description = "Procedural macros for the cruster distributed entity framework"
 readme = "../../README.md"
 

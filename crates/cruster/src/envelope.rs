@@ -16,6 +16,11 @@ pub enum Envelope {
 pub const STREAM_HEADER_KEY: &str = "x-cruster-stream";
 /// Header value indicating a streaming request.
 pub const STREAM_HEADER_VALUE: &str = "1";
+/// Header key carrying the envelope's request ID into the handler.
+///
+/// Injected by the entity manager before dispatching so that macro-generated
+/// workflow code can scope activity journals per workflow execution.
+pub const REQUEST_ID_HEADER_KEY: &str = "x-cruster-request-id";
 
 /// A request envelope sent between runners.
 #[derive(Debug, Clone, Serialize, Deserialize)]

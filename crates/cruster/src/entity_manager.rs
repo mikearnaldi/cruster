@@ -677,6 +677,7 @@ impl EntityManager {
             state_storage: self.state_storage.clone(),
             workflow_engine: self.workflow_engine.clone(),
             sharding: self.sharding.clone(),
+            message_storage: self.message_storage.clone(),
         };
 
         let cancel = ctx.cancellation.clone();
@@ -1197,6 +1198,7 @@ impl EntityManager {
                         state_storage: state_storage.clone(),
                         workflow_engine: workflow_engine.clone(),
                         sharding: sharding.clone(),
+                        message_storage: message_storage.clone(),
                     };
 
                     match entity.spawn(ctx).await {
@@ -1332,6 +1334,7 @@ impl EntityManager {
                         state_storage: state_storage.clone(),
                         workflow_engine: workflow_engine.clone(),
                         sharding: sharding.clone(),
+                        message_storage: message_storage.clone(),
                     };
 
                     match entity.spawn(ctx).await {
@@ -1374,7 +1377,13 @@ impl EntityManager {
 
         let tag = snapshot.request.tag.clone();
         let payload = snapshot.request.payload.clone();
-        let headers = snapshot.request.headers.clone();
+        let mut headers = snapshot.request.headers.clone();
+        // Inject the envelope request_id so handler code (macro-generated workflow
+        // dispatch) can scope activity journals per workflow execution.
+        headers.insert(
+            crate::envelope::REQUEST_ID_HEADER_KEY.to_string(),
+            snapshot.request.request_id.0.to_string(),
+        );
 
         // SAFETY: We use AssertUnwindSafe because on panic we will discard the handler
         // entirely and respawn a fresh one. The handler state after a panic is never observed.

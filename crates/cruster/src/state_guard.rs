@@ -209,12 +209,15 @@ impl ActivityScope {
             .unwrap_or(false)
     }
 
-    /// Buffer a state write to be applied to the transaction on commit.
+    /// Buffer a write to be applied to the transaction on commit.
     ///
-    /// This is called by `StateMutGuard::drop()` when a transaction is active.
+    /// This is called by `StateMutGuard::drop()` when a transaction is active
+    /// to buffer state writes, and by `DurableContext` to buffer journal writes
+    /// so that activity results are persisted atomically with state changes.
+    ///
     /// The write is buffered synchronously and applied to the transaction
     /// BEFORE the activity returns. No fire-and-forget!
-    pub(crate) fn buffer_write(key: String, value: Vec<u8>) {
+    pub fn buffer_write(key: String, value: Vec<u8>) {
         let _ = ACTIVE_TRANSACTION.try_with(|cell| {
             if let Some(active) = cell.borrow().as_ref() {
                 let mut writes = active.pending_writes.lock();

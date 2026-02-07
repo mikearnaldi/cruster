@@ -977,10 +977,6 @@ fn entity_impl_block_inner(
 
     // Detect `#[state(Type, ...)]` on the impl block.
     let state_type: Option<syn::Type> = state_info.as_ref().map(|info| info.ty.clone());
-    let state_persisted = state_info
-        .as_ref()
-        .map(|info| info.persistent)
-        .unwrap_or(false);
     let mut has_init = false;
     let mut rpcs = Vec::new();
     let mut original_methods = Vec::new();
@@ -1038,29 +1034,16 @@ fn entity_impl_block_inner(
         ));
     }
 
-    let entity_tokens = if is_stateful {
-        generate_stateful_entity(
-            &krate,
-            &struct_name,
-            &handler_name,
-            &client_name,
-            state_type.as_ref().unwrap(),
-            state_persisted,
-            &traits,
-            &rpcs,
-            &original_methods,
-        )?
-    } else {
-        generate_stateless_entity(
-            &krate,
-            &struct_name,
-            &handler_name,
-            &client_name,
-            &traits,
-            &rpcs,
-            &original_methods,
-        )?
-    };
+    let entity_tokens = generate_entity(
+        &krate,
+        &struct_name,
+        &handler_name,
+        &client_name,
+        state_type.as_ref(),
+        &traits,
+        &rpcs,
+        &original_methods,
+    )?;
 
     let deferred_consts = generate_deferred_key_consts(&krate, &deferred_keys)?;
 
@@ -1142,10 +1125,6 @@ fn entity_trait_impl_inner(
 
     let mut rpcs = Vec::new();
     let state_type: Option<syn::Type> = state_info.as_ref().map(|info| info.ty.clone());
-    let state_persisted = state_info
-        .as_ref()
-        .map(|info| info.persistent)
-        .unwrap_or(false);
     let mut has_init = false;
     let mut init_method: Option<syn::ImplItemFn> = None;
     let mut original_methods = Vec::new();
@@ -1155,7 +1134,7 @@ fn entity_trait_impl_inner(
             syn::ImplItem::Type(type_item) if type_item.ident == "State" => {
                 return Err(syn::Error::new(
                     type_item.span(),
-                    "use #[state(Type, persistent)] on the impl block instead of `type State`",
+                    "use #[state(Type)] on the impl block instead of `type State`",
                 ));
             }
             syn::ImplItem::Fn(method) => {
@@ -1193,13 +1172,6 @@ fn entity_trait_impl_inner(
     }
 
     let is_stateful = state_type.is_some();
-
-    if is_stateful && !state_persisted {
-        return Err(syn::Error::new(
-            input.self_ty.span(),
-            "entity trait state must be declared as #[state(Type, persistent)]",
-        ));
-    }
 
     if is_stateful && !has_init {
         return Err(syn::Error::new(
@@ -1610,530 +1582,29 @@ fn entity_trait_impl_inner(
     })
 }
 
-/// Generate code for stateless entities (no `#[state(...)]`).
-fn generate_stateless_entity(
-    krate: &syn::Path,
-    struct_name: &syn::Ident,
-    handler_name: &syn::Ident,
-    client_name: &syn::Ident,
-    traits: &[syn::Path],
-    rpcs: &[RpcMethod],
-    original_methods: &[syn::ImplItemFn],
-) -> syn::Result<proc_macro2::TokenStream> {
-    let dispatch_arms = generate_dispatch_arms(krate, rpcs, false, None, false);
-    let client_methods = generate_client_methods(krate, rpcs);
-    let method_impls = generate_method_impls(original_methods);
-    let struct_name_str = struct_name.to_string();
-    let has_durable = rpcs.iter().any(|r| r.has_durable_context);
-
-    let trait_infos = trait_infos_from_paths(traits);
-    let has_traits = !trait_infos.is_empty();
-    let entity_impl = if has_traits {
-        quote! {}
-    } else {
-        quote! {
-            #[async_trait::async_trait]
-            impl #krate::entity::Entity for #struct_name {
-                fn entity_type(&self) -> #krate::types::EntityType {
-                    self.__entity_type()
-                }
-
-                fn shard_group(&self) -> &str {
-                    self.__shard_group()
-                }
-
-                fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
-                    self.__shard_group_for(entity_id)
-                }
-
-                fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
-                    self.__max_idle_time()
-                }
-
-                fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
-                    self.__mailbox_capacity()
-                }
-
-                fn concurrency(&self) -> ::std::option::Option<usize> {
-                    self.__concurrency()
-                }
-
-                async fn spawn(
-                    &self,
-                    ctx: #krate::entity::EntityContext,
-                ) -> ::std::result::Result<
-                    ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
-                    #krate::error::ClusterError,
-                > {
-                    let handler = #handler_name::__new(self.clone(), ctx).await?;
-                    ::std::result::Result::Ok(::std::boxed::Box::new(handler))
-                }
-            }
-        }
-    };
-    let durable_field = if has_durable {
-        quote! {
-            __workflow_engine: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowEngine>>,
-        }
-    } else {
-        quote! {}
-    };
-    let durable_field_init = if has_durable {
-        quote! { __workflow_engine: ctx.workflow_engine.clone(), }
-    } else {
-        quote! {}
-    };
-    let trait_dispatch_checks: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let field = &info.field;
-            quote! {
-                if let ::std::option::Option::Some(ref __trait) = self.#field {
-                    if let ::std::option::Option::Some(response) = __trait.__dispatch(tag, payload, headers).await? {
-                        return ::std::result::Result::Ok(response);
-                    }
-                }
-            }
-        })
-        .collect();
-
-    let trait_dispatch_fallback = if has_traits {
-        quote! {{
-            #(#trait_dispatch_checks)*
-            ::std::result::Result::Err(
-                #krate::error::ClusterError::MalformedMessage {
-                    reason: ::std::format!("unknown RPC tag: {tag}"),
-                    source: ::std::option::Option::None,
-                }
-            )
-        }}
-    } else {
-        quote! {{
-            ::std::result::Result::Err(
-                #krate::error::ClusterError::MalformedMessage {
-                    reason: ::std::format!("unknown RPC tag: {tag}"),
-                    source: ::std::option::Option::None,
-                }
-            )
-        }}
-    };
-
-    let trait_field_defs: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let field = &info.field;
-            let wrapper_path = &info.wrapper_path;
-            quote! { #field: ::std::option::Option<::std::sync::Arc<#wrapper_path>>, }
-        })
-        .collect();
-
-    let trait_field_init_none: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let field = &info.field;
-            quote! { #field: ::std::option::Option::None, }
-        })
-        .collect();
-
-    let trait_params: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let path = &info.path;
-            let ident = &info.ident;
-            let param = format_ident!("__trait_{}", to_snake(&ident.to_string()));
-            quote! { #param: #path }
-        })
-        .collect();
-
-    let trait_state_inits: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let path = &info.path;
-            let ident = &info.ident;
-            let state_init_path = &info.state_init_path;
-            let param = format_ident!("__trait_{}", to_snake(&ident.to_string()));
-            let state_var = format_ident!("__trait_{}_state", to_snake(&ident.to_string()));
-            quote! {
-                let #state_var = <#path as #state_init_path>::__init_state(&#param, &ctx)?;
-            }
-        })
-        .collect();
-
-    let trait_field_init_some: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let ident = &info.ident;
-            let field = &info.field;
-            let wrapper_path = &info.wrapper_path;
-            let param = format_ident!("__trait_{}", to_snake(&ident.to_string()));
-            let state_var = format_ident!("__trait_{}_state", to_snake(&ident.to_string()));
-            quote! {
-                #field: ::std::option::Option::Some(::std::sync::Arc::new(#wrapper_path::__new(
-                    #param,
-                    #state_var,
-                ))),
-            }
-        })
-        .collect();
-
-    let trait_param_idents: Vec<syn::Ident> = trait_infos
-        .iter()
-        .map(|info| {
-            let ident = &info.ident;
-            format_ident!("__trait_{}", to_snake(&ident.to_string()))
-        })
-        .collect();
-
-    let with_traits_name = format_ident!("{}WithTraits", struct_name);
-    let with_trait_trait_name = format_ident!("__{}WithTrait", struct_name);
-    let trait_use_tokens: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let path = &info.path;
-            let ident = &info.ident;
-            let methods_trait_ident = format_ident!("__{}TraitMethods", ident);
-            let methods_trait_path = replace_last_segment(path, methods_trait_ident);
-            quote! {
-                #[allow(unused_imports)]
-                use #methods_trait_path as _;
-            }
-        })
-        .collect();
-
-    // Generate trait access implementations for the handler
-    let trait_access_impls: Vec<proc_macro2::TokenStream> = trait_infos
-        .iter()
-        .map(|info| {
-            let path = &info.path;
-            let ident = &info.ident;
-            let field = &info.field;
-            let wrapper_path = &info.wrapper_path;
-            let access_trait_ident = format_ident!("__{}TraitAccess", ident);
-            let access_trait_path = replace_last_segment(path, access_trait_ident);
-            quote! {
-                impl #access_trait_path for #handler_name {
-                    fn __trait_ref(&self) -> ::std::option::Option<&::std::sync::Arc<#wrapper_path>> {
-                        self.#field.as_ref()
-                    }
-                }
-            }
-        })
-        .collect();
-
-    let with_traits_impl = if has_traits {
-        let trait_option_fields = trait_infos
-            .iter()
-            .map(|info| {
-                let field = &info.field;
-                let path = &info.path;
-                quote! { #field: ::std::option::Option<#path>, }
-            })
-            .collect::<Vec<_>>();
-
-        let trait_setters: Vec<proc_macro2::TokenStream> = trait_infos
-            .iter()
-            .map(|info| {
-                let path = &info.path;
-                let field = &info.field;
-                quote! {
-                    impl #with_trait_trait_name<#path> for #with_traits_name {
-                        fn __with_trait(&mut self, value: #path) {
-                            self.#field = ::std::option::Option::Some(value);
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        let trait_missing_guards: Vec<proc_macro2::TokenStream> = trait_infos
-            .iter()
-            .map(|info| {
-                let path = &info.path;
-                let ident = &info.ident;
-                let field = &info.field;
-                let missing_reason = &info.missing_reason;
-                let param = format_ident!("__trait_{}", to_snake(&ident.to_string()));
-                quote! {
-                    let #param: #path = self.#field.clone().ok_or_else(|| {
-                        #krate::error::ClusterError::MalformedMessage {
-                            reason: ::std::string::String::from(#missing_reason),
-                            source: ::std::option::Option::None,
-                        }
-                    })?;
-                }
-            })
-            .collect();
-
-        let trait_bounds: Vec<proc_macro2::TokenStream> = trait_infos
-            .iter()
-            .map(|info| {
-                let path = &info.path;
-                quote! { #path: ::std::clone::Clone }
-            })
-            .collect();
-
-        let trait_field_init_none_tokens = trait_infos
-            .iter()
-            .map(|info| {
-                let field = &info.field;
-                quote! { #field: ::std::option::Option::None, }
-            })
-            .collect::<Vec<_>>();
-
-        quote! {
-            #[doc(hidden)]
-            pub struct #with_traits_name {
-                entity: #struct_name,
-                #(#trait_option_fields)*
-            }
-
-            trait #with_trait_trait_name<T> {
-                fn __with_trait(&mut self, value: T);
-            }
-
-            impl #struct_name {
-                pub fn with<T>(self, value: T) -> #with_traits_name
-                where
-                    #with_traits_name: #with_trait_trait_name<T>,
-                {
-                    let mut bundle = #with_traits_name {
-                        entity: self,
-                        #(#trait_field_init_none_tokens)*
-                    };
-                    bundle.__with_trait(value);
-                    bundle
-                }
-            }
-
-            impl #with_traits_name {
-                pub fn with<T>(mut self, value: T) -> Self
-                where
-                    Self: #with_trait_trait_name<T>,
-                {
-                    self.__with_trait(value);
-                    self
-                }
-            }
-
-            #(#trait_setters)*
-
-            #[async_trait::async_trait]
-            impl #krate::entity::Entity for #with_traits_name
-            where
-                #struct_name: ::std::clone::Clone,
-                #(#trait_bounds,)*
-            {
-                fn entity_type(&self) -> #krate::types::EntityType {
-                    self.entity.__entity_type()
-                }
-
-                fn shard_group(&self) -> &str {
-                    self.entity.__shard_group()
-                }
-
-                fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
-                    self.entity.__shard_group_for(entity_id)
-                }
-
-                fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
-                    self.entity.__max_idle_time()
-                }
-
-                fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
-                    self.entity.__mailbox_capacity()
-                }
-
-                fn concurrency(&self) -> ::std::option::Option<usize> {
-                    self.entity.__concurrency()
-                }
-
-                async fn spawn(
-                    &self,
-                    ctx: #krate::entity::EntityContext,
-                ) -> ::std::result::Result<
-                    ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
-                    #krate::error::ClusterError,
-                > {
-                    #(#trait_missing_guards)*
-                    let handler = #handler_name::__new_with_traits(
-                        self.entity.clone(),
-                        #(#trait_param_idents,)*
-                        ctx,
-                    )
-                    .await?;
-                    ::std::result::Result::Ok(::std::boxed::Box::new(handler))
-                }
-            }
-        }
-    } else {
-        quote! {}
-    };
-
-    // Generate register method - different signatures depending on whether traits are used
-    let register_impl = if has_traits {
-        // With traits: register takes trait dependencies as parameters
-        let register_trait_params: Vec<proc_macro2::TokenStream> = trait_infos
-            .iter()
-            .map(|info| {
-                let param = &info.field;
-                let path = &info.path;
-                quote! { #param: #path }
-            })
-            .collect();
-        let trait_with_calls: Vec<proc_macro2::TokenStream> = trait_infos
-            .iter()
-            .map(|info| {
-                let field = &info.field;
-                quote! { .with(#field) }
-            })
-            .collect();
-        quote! {
-            impl #struct_name {
-                /// Register this entity with the cluster and return a typed client.
-                ///
-                /// This is the preferred way to register entities as it returns a typed client
-                /// with methods matching the entity's RPC interface.
-                pub async fn register(
-                    self,
-                    sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
-                    #(#register_trait_params),*
-                ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
-                    let entity_with_traits = self #(#trait_with_calls)*;
-                    sharding.register_entity(::std::sync::Arc::new(entity_with_traits)).await?;
-                    ::std::result::Result::Ok(#client_name::new(sharding))
-                }
-            }
-        }
-    } else {
-        // Without traits: simple register
-        quote! {
-            impl #struct_name {
-                /// Register this entity with the cluster and return a typed client.
-                ///
-                /// This is the preferred way to register entities as it returns a typed client
-                /// with methods matching the entity's RPC interface.
-                pub async fn register(
-                    self,
-                    sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
-                ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
-                    sharding.register_entity(::std::sync::Arc::new(self)).await?;
-                    ::std::result::Result::Ok(#client_name::new(sharding))
-                }
-            }
-        }
-    };
-
-    Ok(quote! {
-        #(#trait_use_tokens)*
-
-        impl #struct_name {
-            #(#method_impls)*
-        }
-
-        /// Generated handler for the entity.
-        #[doc(hidden)]
-        pub struct #handler_name {
-            entity: #struct_name,
-            #[allow(dead_code)]
-            ctx: #krate::entity::EntityContext,
-            #(#trait_field_defs)*
-            #durable_field
-        }
-
-        impl #handler_name {
-            #[doc(hidden)]
-            pub async fn __new(entity: #struct_name, ctx: #krate::entity::EntityContext) -> ::std::result::Result<Self, #krate::error::ClusterError> {
-                ::std::result::Result::Ok(Self {
-                    entity,
-                    #(#trait_field_init_none)*
-                    #durable_field_init
-                    ctx,
-                })
-            }
-
-            #[doc(hidden)]
-            pub async fn __new_with_traits(
-                entity: #struct_name,
-                #(#trait_params,)*
-                ctx: #krate::entity::EntityContext,
-            ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
-                #(#trait_state_inits)*
-                ::std::result::Result::Ok(Self {
-                    entity,
-                    #(#trait_field_init_some)*
-                    #durable_field_init
-                    ctx,
-                })
-            }
-        }
-
-        #[async_trait::async_trait]
-        impl #krate::entity::EntityHandler for #handler_name {
-            async fn handle_request(
-                &self,
-                tag: &str,
-                payload: &[u8],
-                headers: &::std::collections::HashMap<::std::string::String, ::std::string::String>,
-            ) -> ::std::result::Result<::std::vec::Vec<u8>, #krate::error::ClusterError> {
-                let _ = headers;
-                match tag {
-                    #(#dispatch_arms,)*
-                    _ => #trait_dispatch_fallback,
-                }
-            }
-        }
-
-        /// Generated typed client for the entity.
-        pub struct #client_name {
-            inner: #krate::entity_client::EntityClient,
-        }
-
-        impl #client_name {
-            /// Create a new typed client from a sharding instance.
-            pub fn new(sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>) -> Self {
-                Self {
-                    inner: #krate::entity_client::EntityClient::new(
-                        sharding,
-                        #krate::types::EntityType::new(#struct_name_str),
-                    ),
-                }
-            }
-
-            /// Access the underlying untyped [`EntityClient`].
-            pub fn inner(&self) -> &#krate::entity_client::EntityClient {
-                &self.inner
-            }
-
-            #(#client_methods)*
-        }
-
-        impl #krate::entity_client::EntityClientAccessor for #client_name {
-            fn entity_client(&self) -> &#krate::entity_client::EntityClient {
-                &self.inner
-            }
-        }
-
-        #register_impl
-        #with_traits_impl
-        #entity_impl
-
-        #(#trait_access_impls)*
-    })
-}
-
-/// Generate code for stateful entities (with `#[state(...)]`).
+/// Generate code for entities (both stateful and stateless).
+///
+/// When `state_type` is `Some`, the entity has user-defined state accessed via `self.state`.
+/// When `state_type` is `None`, the entity is stateless — `()` is used internally and
+/// views Deref to the entity struct so `self.field` keeps working.
+///
+/// Persistence infrastructure (storage, sharding, journaling, durable builtins) is
+/// always generated regardless of whether the entity has state.
 #[allow(clippy::too_many_arguments)]
-fn generate_stateful_entity(
+fn generate_entity(
     krate: &syn::Path,
     struct_name: &syn::Ident,
     handler_name: &syn::Ident,
     client_name: &syn::Ident,
-    state_type: &syn::Type,
-    state_persisted: bool,
+    state_type: Option<&syn::Type>,
     traits: &[syn::Path],
     rpcs: &[RpcMethod],
     original_methods: &[syn::ImplItemFn],
 ) -> syn::Result<proc_macro2::TokenStream> {
+    let is_stateful = state_type.is_some();
+    // Use () as the internal state type for stateless entities
+    let unit_type: syn::Type = syn::parse_quote!(());
+    let state_type: &syn::Type = state_type.unwrap_or(&unit_type);
     let trait_infos = trait_infos_from_paths(traits);
     let has_traits = !trait_infos.is_empty();
     let entity_impl = if has_traits {
@@ -2179,7 +1650,7 @@ fn generate_stateful_entity(
             }
         }
     };
-    let save_state_code = if state_persisted {
+    let save_state_code = if is_stateful {
         if has_traits {
             let composite_ref_name = format_ident!("{}CompositeStateRef", struct_name);
             let trait_state_refs: Vec<proc_macro2::TokenStream> = trait_infos
@@ -2255,7 +1726,7 @@ fn generate_stateful_entity(
         rpcs,
         true,
         Some(&save_state_code),
-        has_traits && state_persisted,
+        has_traits && is_stateful,
     );
     let client_methods = generate_client_methods(krate, rpcs);
 
@@ -2341,8 +1812,10 @@ fn generate_stateful_entity(
                     #block
             });
 
-            // Wrapper with activity scope if needed
-            if is_activity && state_persisted {
+            // Activities always use ActivityScope for transactional persistence
+            // (journal + state in one commit). Non-activity mutable methods use
+            // StateMutGuard directly.
+            if is_activity {
                 wrapper_methods.push(quote! {
                     #(#attrs)*
                     #vis async fn #method_name #generics (&self, #(#params),*) #output #where_clause {
@@ -2415,6 +1888,29 @@ fn generate_stateful_entity(
     }
 
     // Generate view struct definitions
+    //
+    // For stateless entities, views Deref to the entity struct so `self.field` resolves
+    // to entity fields. The `state` field is `()` and unused.
+    let view_deref_impls = if !is_stateful {
+        quote! {
+            impl ::std::ops::Deref for #read_view_name<'_> {
+                type Target = #struct_name;
+                fn deref(&self) -> &Self::Target {
+                    &self.__handler.__entity
+                }
+            }
+
+            impl ::std::ops::Deref for #mut_view_name<'_> {
+                type Target = #struct_name;
+                fn deref(&self) -> &Self::Target {
+                    &self.__handler.__entity
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let view_structs = quote! {
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
@@ -2431,77 +1927,88 @@ fn generate_stateful_entity(
             __handler: &'a #handler_name,
             state: &'a mut #state_type,
         }
+
+        #view_deref_impls
     };
 
     // Generate delegation methods for view structs
     // These let user code call handler methods directly on self instead of self.__handler
-    let view_delegation_methods = if state_persisted {
-        quote! {
-            /// Get the entity ID.
-            #[inline]
-            fn entity_id(&self) -> &#krate::types::EntityId {
-                self.__handler.entity_id()
-            }
-
-            /// Get a client to call back into this entity.
-            #[inline]
-            fn self_client(&self) -> ::std::option::Option<#krate::entity_client::EntityClient> {
-                self.__handler.self_client()
-            }
-
-            /// Durable sleep that survives entity restarts.
-            #[inline]
-            async fn sleep(&self, name: &str, duration: ::std::time::Duration) -> ::std::result::Result<(), #krate::error::ClusterError> {
-                self.__handler.sleep(name, duration).await
-            }
-
-            /// Wait for an external signal to resolve a typed value.
-            #[inline]
-            async fn await_deferred<T, K>(&self, key: K) -> ::std::result::Result<T, #krate::error::ClusterError>
-            where
-                T: serde::Serialize + serde::de::DeserializeOwned,
-                K: #krate::__internal::DeferredKeyLike<T>,
-            {
-                self.__handler.await_deferred(key).await
-            }
-
-            /// Resolve a deferred value, resuming any entity method waiting on it.
-            #[inline]
-            async fn resolve_deferred<T, K>(&self, key: K, value: &T) -> ::std::result::Result<(), #krate::error::ClusterError>
-            where
-                T: serde::Serialize,
-                K: #krate::__internal::DeferredKeyLike<T>,
-            {
-                self.__handler.resolve_deferred(key, value).await
-            }
-
-            /// Get the sharding interface for inter-entity communication.
-            #[inline]
-            fn sharding(&self) -> ::std::option::Option<&::std::sync::Arc<dyn #krate::sharding::Sharding>> {
-                self.__handler.sharding()
-            }
-
-            /// Get the entity's own address.
-            #[inline]
-            fn entity_address(&self) -> &#krate::types::EntityAddress {
-                self.__handler.entity_address()
-            }
+    let view_delegation_methods = quote! {
+        /// Get the entity ID.
+        #[inline]
+        fn entity_id(&self) -> &#krate::types::EntityId {
+            self.__handler.entity_id()
         }
-    } else {
-        quote! {}
+
+        /// Get a client to call back into this entity.
+        #[inline]
+        fn self_client(&self) -> ::std::option::Option<#krate::entity_client::EntityClient> {
+            self.__handler.self_client()
+        }
+
+        /// Durable sleep that survives entity restarts.
+        #[inline]
+        async fn sleep(&self, name: &str, duration: ::std::time::Duration) -> ::std::result::Result<(), #krate::error::ClusterError> {
+            self.__handler.sleep(name, duration).await
+        }
+
+        /// Wait for an external signal to resolve a typed value.
+        #[inline]
+        async fn await_deferred<T, K>(&self, key: K) -> ::std::result::Result<T, #krate::error::ClusterError>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned,
+            K: #krate::__internal::DeferredKeyLike<T>,
+        {
+            self.__handler.await_deferred(key).await
+        }
+
+        /// Resolve a deferred value, resuming any entity method waiting on it.
+        #[inline]
+        async fn resolve_deferred<T, K>(&self, key: K, value: &T) -> ::std::result::Result<(), #krate::error::ClusterError>
+        where
+            T: serde::Serialize,
+            K: #krate::__internal::DeferredKeyLike<T>,
+        {
+            self.__handler.resolve_deferred(key, value).await
+        }
+
+        /// Get the sharding interface for inter-entity communication.
+        #[inline]
+        fn sharding(&self) -> ::std::option::Option<&::std::sync::Arc<dyn #krate::sharding::Sharding>> {
+            self.__handler.sharding()
+        }
+
+        /// Get the entity's own address.
+        #[inline]
+        fn entity_address(&self) -> &#krate::types::EntityAddress {
+            self.__handler.entity_address()
+        }
     };
 
     // Generate activity delegation methods for read view (so workflows can call activities)
+    //
+    // When message_storage is available, activity calls are routed through
+    // `DurableContext::run()` for journaling: on first execution the result is
+    // cached in MessageStorage; on replay (crash recovery) the cached result
+    // is returned without re-executing the activity body.
+    //
+    // The journal key is derived from the activity arguments (serialized via
+    // msgpack), or from a user-provided `key(...)` closure if one was specified
+    // on the `#[activity(key(...))]` annotation. This matches the client-side
+    // idempotency key derivation.
     let activity_delegations: Vec<proc_macro2::TokenStream> = rpcs
         .iter()
         .filter(|rpc| matches!(rpc.kind, RpcKind::Activity))
         .map(|rpc| {
             let method_name = &rpc.name;
+            let method_name_str = method_name.to_string();
             let method_info = original_methods
                 .iter()
                 .find(|m| m.sig.ident == *method_name)
                 .unwrap();
+            // Collect all params (including DurableContext) for the method signature
             let params: Vec<_> = method_info.sig.inputs.iter().skip(1).collect();
+            // Collect all param names (including DurableContext)
             let param_names: Vec<_> = method_info
                 .sig
                 .inputs
@@ -2520,11 +2027,123 @@ fn generate_stateful_entity(
             let generics = &method_info.sig.generics;
             let where_clause = &generics.where_clause;
 
+            // Wire params are those that are NOT DurableContext (i.e., the actual
+            // user-visible arguments). These are the same params used by the client
+            // for serialization / idempotency key derivation.
+            let wire_param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
+            let wire_param_count = wire_param_names.len();
+
+            // Build the key-bytes computation.
+            // With an explicit key(...) closure: serialize the closure's output.
+            // Without: serialize the wire arguments (same as client-side default).
+            let key_bytes_code = if let Some(persist_key) = &rpc.persist_key {
+                match wire_param_count {
+                    0 => quote! {
+                        let __journal_key = (#persist_key)();
+                        let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                    1 => {
+                        let name = &wire_param_names[0];
+                        quote! {
+                            let __journal_key = (#persist_key)(#name);
+                            let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                                .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                    reason: ::std::format!("failed to serialize journal key: {e}"),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })?;
+                        }
+                    }
+                    _ => quote! {
+                        let __journal_key = (#persist_key)(#(&#wire_param_names),*);
+                        let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                }
+            } else {
+                // Default: serialize all wire arguments as the key (same as client-side)
+                match wire_param_count {
+                    0 => quote! {
+                        let __journal_key_bytes = rmp_serde::to_vec(&()).unwrap_or_default();
+                    },
+                    1 => {
+                        let name = &wire_param_names[0];
+                        quote! {
+                            let __journal_key_bytes = rmp_serde::to_vec(&#name)
+                                .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                    reason: ::std::format!("failed to serialize journal key: {e}"),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })?;
+                        }
+                    }
+                    _ => quote! {
+                        let __journal_key_bytes = rmp_serde::to_vec(&(#(&#wire_param_names),*))
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                }
+            };
+
+            // Journal wrapping: always wrap activity calls with DurableContext
+            // when engine, message_storage, and state_storage are available.
+            // The journal result is stored in WorkflowStorage (same transaction
+            // as state/journal changes) to ensure atomicity.
+            //
+            // The journal key includes the workflow execution's request ID (from
+            // WorkflowScope) so that activities are scoped per workflow execution.
+            // Without this, two different workflow executions calling the same
+            // zero-argument activity would collide on the same journal entry.
+            let journal_body = quote! {
+                if let (
+                    ::std::option::Option::Some(__engine),
+                    ::std::option::Option::Some(__msg_storage),
+                    ::std::option::Option::Some(__wf_storage),
+                ) = (
+                    self.__handler.__workflow_engine.as_ref(),
+                    self.__handler.__message_storage.as_ref(),
+                    self.__handler.__state_storage.as_ref(),
+                ) {
+                    #key_bytes_code
+                    // Prepend the workflow execution's request ID to the key bytes
+                    // so that the same activity called from different workflow
+                    // executions produces different journal keys.
+                    let __journal_key_bytes = {
+                        let mut __scoped = ::std::vec::Vec::new();
+                        if let ::std::option::Option::Some(__wf_id) = #krate::__internal::WorkflowScope::current() {
+                            __scoped.extend_from_slice(&__wf_id.to_le_bytes());
+                        }
+                        __scoped.extend_from_slice(&__journal_key_bytes);
+                        __scoped
+                    };
+                    let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
+                        ::std::sync::Arc::clone(__engine),
+                        self.__handler.ctx.address.entity_type.0.clone(),
+                        self.__handler.ctx.address.entity_id.0.clone(),
+                        ::std::sync::Arc::clone(__msg_storage),
+                        ::std::sync::Arc::clone(__wf_storage),
+                    );
+                    __journal_ctx.run(#method_name_str, &__journal_key_bytes, || {
+                        self.__handler.#method_name(#(#param_names),*)
+                    }).await
+                } else {
+                    // No journal available — execute directly (backward-compatible)
+                    self.__handler.#method_name(#(#param_names),*).await
+                }
+            };
+
             quote! {
                 #[inline]
                 async fn #method_name #generics (&mut self, #(#params),*) #output #where_clause {
-                    let __result = self.__handler.#method_name(#(#param_names),*).await;
-                    // Refresh state from ArcSwap after activity commits
+                    let __result = { #journal_body };
+                    // Refresh state from ArcSwap after activity commits (or journal hit)
                     self.state.__refresh(self.__handler.__state.load_full());
                     __result
                 }
@@ -2573,15 +2192,23 @@ fn generate_stateful_entity(
         #(#view_trait_access_impls)*
     };
 
-    // init goes on the entity struct itself
-    let init_method = original_methods
-        .iter()
-        .find(|m| m.sig.ident == "init")
-        .unwrap();
-    let init_sig = &init_method.sig;
-    let init_block = &init_method.block;
-    let init_attrs = &init_method.attrs;
-    let init_vis = &init_method.vis;
+    // init goes on the entity struct itself (only for stateful entities)
+    let init_method_impl = if is_stateful {
+        let init_method = original_methods
+            .iter()
+            .find(|m| m.sig.ident == "init")
+            .expect("stateful entity must have init method");
+        let init_sig = &init_method.sig;
+        let init_block = &init_method.block;
+        let init_attrs = &init_method.attrs;
+        let init_vis = &init_method.vis;
+        quote! {
+            #(#init_attrs)*
+            #init_vis #init_sig #init_block
+        }
+    } else {
+        quote! {}
+    };
 
     let struct_name_str = struct_name.to_string();
     let _state_wrapper_name = format_ident!("{}StateWrapper", struct_name);
@@ -2660,7 +2287,7 @@ fn generate_stateful_entity(
     let composite_state_name = format_ident!("{}CompositeState", struct_name);
     let composite_ref_name = format_ident!("{}CompositeStateRef", struct_name);
 
-    let composite_state_defs = if state_persisted && has_traits {
+    let composite_state_defs = if is_stateful && has_traits {
         let composite_fields: Vec<proc_macro2::TokenStream> = trait_infos
             .iter()
             .map(|info| {
@@ -2696,8 +2323,10 @@ fn generate_stateful_entity(
         quote! {}
     };
 
-    // Generate state loading code for persisted state (entity-only)
-    let state_init_code = if state_persisted {
+    // Generate state loading code (entity-only)
+    // For stateful entities: load from storage or fall back to init()
+    // For stateless entities: state is always ()
+    let state_init_code = if is_stateful {
         quote! {
             // Try to load persisted state from storage
             let state: #state_type = if let Some(ref storage) = ctx.state_storage {
@@ -2731,13 +2360,14 @@ fn generate_stateful_entity(
             };
         }
     } else {
+        // Stateless entity — no init method, state is ()
         quote! {
-            let state: #state_type = entity.init(&ctx)?;
+            let state: () = ();
         }
     };
 
     let state_init_with_traits_code = if has_traits {
-        if state_persisted {
+        if is_stateful {
             let composite_fields: Vec<proc_macro2::TokenStream> = trait_infos
                 .iter()
                 .map(|info| {
@@ -2803,67 +2433,66 @@ fn generate_stateful_entity(
             }
         } else {
             let trait_state_inits = &trait_state_inits;
-            quote! {
-                let state: #state_type = entity.init(&ctx)?;
-                #(#trait_state_inits)*
+            if is_stateful {
+                quote! {
+                    let state: #state_type = entity.init(&ctx)?;
+                    #(#trait_state_inits)*
+                }
+            } else {
+                quote! {
+                    let state: () = ();
+                    #(#trait_state_inits)*
+                }
             }
         }
     } else {
         quote! { #state_init_code }
     };
 
-    // For persisted-state entities, we always need the workflow engine for built-in methods
-    // (sleep, await_deferred, resolve_deferred, on_interrupt)
-    let has_durable = state_persisted || rpcs.iter().any(|r| r.has_durable_context);
+    // Workflow engine, message storage, and workflow storage are always needed for
+    // persistence (journaling, durable workflows, sharding).
+    let has_durable = true;
 
-    // For persisted state, the handler needs to store the storage reference
-    let handler_storage_field = if state_persisted {
-        quote! {
-            __state_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowStorage>>,
-            __state_key: ::std::string::String,
-        }
-    } else {
-        quote! {}
+    // Handler always has storage fields for persistence (journal, state if applicable)
+    let handler_storage_field = quote! {
+        __state_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowStorage>>,
+        __state_key: ::std::string::String,
     };
 
-    let handler_storage_init = if state_persisted {
-        quote! {
-            let __state_key = ::std::format!(
-                "entity/{}/{}/state",
-                ctx.address.entity_type.0,
-                ctx.address.entity_id.0,
-            );
-            let __state_storage = ctx.state_storage.clone();
-        }
-    } else {
-        quote! {}
+    let handler_storage_init = quote! {
+        let __state_key = ::std::format!(
+            "entity/{}/{}/state",
+            ctx.address.entity_type.0,
+            ctx.address.entity_id.0,
+        );
+        let __state_storage = ctx.state_storage.clone();
     };
 
-    let handler_storage_fields_init = if state_persisted {
-        quote! {
-            __state_storage,
-            __state_key,
-        }
-    } else {
-        quote! {}
+    let handler_storage_fields_init = quote! {
+        __state_storage,
+        __state_key,
     };
 
     let durable_field = if has_durable {
         quote! {
             __workflow_engine: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowEngine>>,
+            __message_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::MessageStorage>>,
         }
     } else {
         quote! {}
     };
     let durable_field_init = if has_durable {
-        quote! { __workflow_engine: ctx.workflow_engine.clone(), }
+        quote! {
+            __workflow_engine: ctx.workflow_engine.clone(),
+            __message_storage: ctx.message_storage.clone(),
+        }
     } else {
         quote! {}
     };
 
-    // Generate built-in durable methods (sleep, await_deferred, resolve_deferred) for persisted-state entities
-    // These are now generated as part of the Handler impl block
-    let durable_builtin_impls = if state_persisted {
+    // Generate built-in durable methods (sleep, await_deferred, resolve_deferred, on_interrupt)
+    // These are always generated — persistence is always enabled.
+    let durable_builtin_impls = {
         quote! {
             /// Durable sleep that survives entity restarts.
             ///
@@ -2946,13 +2575,10 @@ fn generate_stateful_entity(
                 ctx.on_interrupt().await
             }
         }
-    } else {
-        quote! {}
     };
 
-    // Generate sharding helper methods for persisted-state entities
-    // These are now generated as part of the Handler impl block
-    let sharding_builtin_impls = if state_persisted {
+    // Generate sharding helper methods — always generated.
+    let sharding_builtin_impls = {
         quote! {
             /// Get the sharding interface for inter-entity communication.
             ///
@@ -2983,22 +2609,15 @@ fn generate_stateful_entity(
                 })
             }
         }
-    } else {
-        quote! {}
     };
 
-    // Build the DurableContext for persisted-state entities
-    // Note: These wrapper fields are kept for future trait system migration
-    let _durable_ctx_wrapper_field = if state_persisted {
-        quote! {
-            /// Built-in durable context for `sleep()`, `await_deferred()`, `resolve_deferred()`.
-            __durable_ctx: ::std::option::Option<#krate::__internal::DurableContext>,
-        }
-    } else {
-        quote! {}
+    // Build the DurableContext wrapper fields — kept for future trait system migration
+    let _durable_ctx_wrapper_field = quote! {
+        /// Built-in durable context for `sleep()`, `await_deferred()`, `resolve_deferred()`.
+        __durable_ctx: ::std::option::Option<#krate::__internal::DurableContext>,
     };
 
-    let _durable_ctx_wrapper_init = if state_persisted {
+    let _durable_ctx_wrapper_init = {
         quote! {
             let __durable_ctx = ctx.workflow_engine.as_ref().map(|engine| {
                 #krate::__internal::DurableContext::new(
@@ -3008,62 +2627,64 @@ fn generate_stateful_entity(
                 )
             });
         }
-    } else {
-        quote! {}
     };
 
-    let _durable_ctx_wrapper_field_init = if state_persisted {
-        quote! { __durable_ctx, }
-    } else {
-        quote! {}
+    let _durable_ctx_wrapper_field_init = quote! { __durable_ctx, };
+
+    // Sharding context wrapper fields — kept for future trait system migration
+    let _sharding_ctx_wrapper_field = quote! {
+        /// Sharding interface for inter-entity communication and scheduled messages.
+        __sharding: ::std::option::Option<::std::sync::Arc<dyn #krate::sharding::Sharding>>,
+        /// Entity address for self-referencing in scheduled messages.
+        __entity_address: #krate::types::EntityAddress,
     };
 
-    // Build sharding context field for persisted-state entities
-    // Note: These wrapper fields are kept for future trait system migration
-    let _sharding_ctx_wrapper_field = if state_persisted {
-        quote! {
-            /// Sharding interface for inter-entity communication and scheduled messages.
-            __sharding: ::std::option::Option<::std::sync::Arc<dyn #krate::sharding::Sharding>>,
-            /// Entity address for self-referencing in scheduled messages.
-            __entity_address: #krate::types::EntityAddress,
-        }
-    } else {
-        quote! {}
+    let _sharding_ctx_wrapper_init = quote! {
+        let __sharding = ctx.sharding.clone();
+        let __entity_address = ctx.address.clone();
     };
 
-    let _sharding_ctx_wrapper_init = if state_persisted {
-        quote! {
+    let _sharding_ctx_wrapper_field_init = quote! { __sharding, __entity_address, };
+
+    // Sharding fields on Handler — always generated
+    let sharding_handler_field = quote! {
+        /// Sharding interface for inter-entity communication.
+        __sharding: ::std::option::Option<::std::sync::Arc<dyn #krate::sharding::Sharding>>,
+        /// Entity address for self-referencing.
+        __entity_address: #krate::types::EntityAddress,
+    };
+
+    // Handler construction is always async (may load state from storage)
+    let new_fn = quote! {
+        #[doc(hidden)]
+        pub async fn __new(entity: #struct_name, ctx: #krate::entity::EntityContext) -> ::std::result::Result<Self, #krate::error::ClusterError> {
+            #state_init_code
+            #handler_storage_init
             let __sharding = ctx.sharding.clone();
             let __entity_address = ctx.address.clone();
+            ::std::result::Result::Ok(Self {
+                __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
+                __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                __entity: entity,
+                #durable_field_init
+                ctx,
+                #handler_storage_fields_init
+                __sharding,
+                __entity_address,
+                #(#trait_field_init_none)*
+            })
         }
-    } else {
-        quote! {}
     };
 
-    let _sharding_ctx_wrapper_field_init = if state_persisted {
-        quote! { __sharding, __entity_address, }
-    } else {
-        quote! {}
-    };
-
-    // Sharding fields on Handler (for the new ArcSwap-based design)
-    let sharding_handler_field = if state_persisted {
-        quote! {
-            /// Sharding interface for inter-entity communication.
-            __sharding: ::std::option::Option<::std::sync::Arc<dyn #krate::sharding::Sharding>>,
-            /// Entity address for self-referencing.
-            __entity_address: #krate::types::EntityAddress,
-        }
-    } else {
-        quote! {}
-    };
-
-    // For persisted state, spawn must be async (to load from storage)
-    let new_fn = if state_persisted {
+    let new_with_traits_fn = if has_traits {
         quote! {
             #[doc(hidden)]
-            pub async fn __new(entity: #struct_name, ctx: #krate::entity::EntityContext) -> ::std::result::Result<Self, #krate::error::ClusterError> {
-                #state_init_code
+            pub async fn __new_with_traits(
+                entity: #struct_name,
+                #(#trait_params,)*
+                ctx: #krate::entity::EntityContext,
+            ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
+                #state_init_with_traits_code
                 #handler_storage_init
                 let __sharding = ctx.sharding.clone();
                 let __entity_address = ctx.address.clone();
@@ -3076,79 +2697,16 @@ fn generate_stateful_entity(
                     #handler_storage_fields_init
                     __sharding,
                     __entity_address,
-                    #(#trait_field_init_none)*
+                    #(#trait_field_init_some)*
                 })
-            }
-        }
-    } else {
-        quote! {
-            #[doc(hidden)]
-            pub async fn __new(entity: #struct_name, ctx: #krate::entity::EntityContext) -> ::std::result::Result<Self, #krate::error::ClusterError> {
-                #state_init_code
-                ::std::result::Result::Ok(Self {
-                    __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
-                    __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                    __entity: entity,
-                    #durable_field_init
-                    ctx,
-                    #(#trait_field_init_none)*
-                })
-            }
-        }
-    };
-
-    let new_with_traits_fn = if has_traits {
-        if state_persisted {
-            quote! {
-                #[doc(hidden)]
-                pub async fn __new_with_traits(
-                    entity: #struct_name,
-                    #(#trait_params,)*
-                    ctx: #krate::entity::EntityContext,
-                ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
-                    #state_init_with_traits_code
-                    #handler_storage_init
-                    let __sharding = ctx.sharding.clone();
-                    let __entity_address = ctx.address.clone();
-                    ::std::result::Result::Ok(Self {
-                        __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
-                        __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                        __entity: entity,
-                        #durable_field_init
-                        ctx,
-                        #handler_storage_fields_init
-                        __sharding,
-                        __entity_address,
-                        #(#trait_field_init_some)*
-                    })
-                }
-            }
-        } else {
-            quote! {
-                #[doc(hidden)]
-                pub async fn __new_with_traits(
-                    entity: #struct_name,
-                    #(#trait_params,)*
-                    ctx: #krate::entity::EntityContext,
-                ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
-                    #state_init_with_traits_code
-                    ::std::result::Result::Ok(Self {
-                        __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
-                        __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                        __entity: entity,
-                        #durable_field_init
-                        ctx,
-                        #(#trait_field_init_some)*
-                    })
-                }
             }
         }
     } else {
         quote! {}
     };
 
-    // Generate composite state save method for entities with traits and persistent state
-    let save_composite_state_method = if has_traits && state_persisted {
+    // Generate composite state save method for stateful entities with traits
+    let save_composite_state_method = if has_traits && is_stateful {
         let composite_ref_name = format_ident!("{}CompositeStateRef", struct_name);
         let trait_state_loads: Vec<proc_macro2::TokenStream> = trait_infos
             .iter()
@@ -3196,8 +2754,8 @@ fn generate_stateful_entity(
         .iter()
         .map(|info| {
             let field = &info.field;
-            // Save composite state after successful trait dispatch if entity has persistent state
-            let save_after_dispatch = if state_persisted {
+            // Save composite state after successful trait dispatch if entity has state
+            let save_after_dispatch = if is_stateful {
                 quote! {
                     self.__save_composite_state().await?;
                 }
@@ -3471,10 +3029,9 @@ fn generate_stateful_entity(
     Ok(quote! {
         #(#trait_use_tokens)*
 
-        // Emit `init` on the entity struct.
+        // Emit `init` on the entity struct (stateful entities only).
         impl #struct_name {
-            #(#init_attrs)*
-            #init_vis #init_sig #init_block
+            #init_method_impl
         }
 
         #composite_state_defs
@@ -3528,7 +3085,8 @@ fn generate_stateful_entity(
                 payload: &[u8],
                 headers: &::std::collections::HashMap<::std::string::String, ::std::string::String>,
             ) -> ::std::result::Result<::std::vec::Vec<u8>, #krate::error::ClusterError> {
-                let _ = headers;
+                #[allow(unused_variables)]
+                let headers = headers;
                 match tag {
                     #(#dispatch_arms,)*
                     _ => #trait_dispatch_fallback,
@@ -3659,13 +3217,31 @@ fn generate_dispatch_arms(
                 quote! {}
             };
 
+            // For workflow methods, wrap the call in a WorkflowScope so that
+            // activity journal keys are scoped per workflow execution.
+            let is_workflow = matches!(rpc.kind, RpcKind::Workflow);
+
             if stateful {
                 // Call method directly on self - method uses state() or state_mut() internally
+                let method_call = quote! { self.#method_name(#call_args).await };
+                let wrapped_call = if is_workflow {
+                    quote! {
+                        let __request_id = headers
+                            .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        #krate::__internal::WorkflowScope::run(__request_id, || async {
+                            #method_call
+                        }).await?
+                    }
+                } else {
+                    quote! { #method_call? }
+                };
                 quote! {
                     #tag => {
                         #deserialize_request
                         #durable_ctx_code
-                        let response = self.#method_name(#call_args).await?;
+                        let response = { #wrapped_call };
                         #post_call_save
                         rmp_serde::to_vec(&response)
                             .map_err(|e| #krate::error::ClusterError::MalformedMessage {
@@ -3676,11 +3252,25 @@ fn generate_dispatch_arms(
                 }
             } else {
                 // Stateless — call directly on entity
+                let method_call = quote! { self.entity.#method_name(#call_args).await };
+                let wrapped_call = if is_workflow {
+                    quote! {
+                        let __request_id = headers
+                            .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        #krate::__internal::WorkflowScope::run(__request_id, || async {
+                            #method_call
+                        }).await?
+                    }
+                } else {
+                    quote! { #method_call? }
+                };
                 quote! {
                     #tag => {
                         #deserialize_request
                         #durable_ctx_code
-                        let response = self.entity.#method_name(#call_args).await?;
+                        let response = { #wrapped_call };
                         rmp_serde::to_vec(&response)
                             .map_err(|e| #krate::error::ClusterError::MalformedMessage {
                                 reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
@@ -3865,35 +3455,6 @@ fn generate_client_methods(krate: &syn::Path, rpcs: &[RpcMethod]) -> Vec<proc_ma
                         }
                     },
                 }
-            }
-        })
-        .collect()
-}
-
-fn generate_method_impls(original_methods: &[syn::ImplItemFn]) -> Vec<proc_macro2::TokenStream> {
-    original_methods
-        .iter()
-        .map(|m| {
-            let sig = &m.sig;
-            let block = &m.block;
-            // Filter out RPC kind/visibility attributes — consumed by the macro
-            let attrs: Vec<_> = m
-                .attrs
-                .iter()
-                .filter(|a| {
-                    !a.path().is_ident("rpc")
-                        && !a.path().is_ident("workflow")
-                        && !a.path().is_ident("activity")
-                        && !a.path().is_ident("method")
-                        && !a.path().is_ident("public")
-                        && !a.path().is_ident("protected")
-                        && !a.path().is_ident("private")
-                })
-                .collect();
-            let vis = &m.vis;
-            quote! {
-                #(#attrs)*
-                #vis #sig #block
             }
         })
         .collect()
@@ -4195,7 +3756,6 @@ fn is_durable_context_type(ty: &syn::Type) -> bool {
 
 struct StateArgs {
     ty: syn::Type,
-    persistent: bool,
 }
 
 impl syn::parse::Parse for StateArgs {
@@ -4213,10 +3773,7 @@ impl syn::parse::Parse for StateArgs {
             ));
         }
 
-        Ok(StateArgs {
-            ty,
-            persistent: true,
-        })
+        Ok(StateArgs { ty })
     }
 }
 

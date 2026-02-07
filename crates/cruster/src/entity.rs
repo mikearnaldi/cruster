@@ -37,6 +37,13 @@ pub struct EntityContext {
     /// When present, entities can create clients to send messages to other entities
     /// or to themselves, including scheduled messages via `notify_at`.
     pub sharding: Option<Arc<dyn Sharding>>,
+    /// Optional message storage for activity journaling.
+    ///
+    /// When present, activities called from within `#[workflow]` methods are
+    /// journaled: their results are cached in `MessageStorage` so that on
+    /// crash-recovery replay the cached result is returned instead of
+    /// re-executing the activity body.
+    pub message_storage: Option<Arc<dyn crate::message_storage::MessageStorage>>,
 }
 
 /// Defines an entity type with its RPCs and behavior.
@@ -247,6 +254,7 @@ mod tests {
             state_storage: None,
             workflow_engine: None,
             sharding: None,
+            message_storage: None,
         };
         let handler = entity.spawn(ctx).await.unwrap();
         let result = handler
@@ -272,6 +280,7 @@ mod tests {
             state_storage: None,
             workflow_engine: None,
             sharding: None,
+            message_storage: None,
         };
         let handler = entity.spawn(ctx).await.unwrap();
         let err = handler
@@ -298,6 +307,7 @@ mod tests {
             state_storage: None,
             workflow_engine: None,
             sharding: None,
+            message_storage: None,
         };
         let handler = entity.spawn(ctx).await.unwrap();
         let mut stream = handler

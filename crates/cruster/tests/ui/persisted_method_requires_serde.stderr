@@ -7,14 +7,14 @@ error[E0277]: the trait bound `NotSerializable: serde::Serialize` is not satisfi
 15 |     async fn bad(&self, value: NotSerializable) -> Result<(), ClusterError> {
    |                         ^^^^^ unsatisfied trait bound
    |
-help: the trait `serde_core::ser::Serialize` is not implemented for `NotSerializable`
+help: the trait `Serialize` is not implemented for `NotSerializable`
   --> tests/ui/persisted_method_requires_serde.rs:4:1
    |
  4 | struct NotSerializable {
    | ^^^^^^^^^^^^^^^^^^^^^^
    = note: for local types consider adding `#[derive(serde::Serialize)]` to your `NotSerializable` type
    = note: for types from other crates check whether the crate offers a `serde` feature flag
-   = help: the following other types implement trait `serde_core::ser::Serialize`:
+   = help: the following other types implement trait `Serialize`:
              &'a T
              &'a mut T
              ()
@@ -39,14 +39,14 @@ error[E0277]: the trait bound `NotSerializable: serde::Serialize` is not satisfi
 12 | #[entity_impl]
    | ^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `serde_core::ser::Serialize` is not implemented for `NotSerializable`
+help: the trait `Serialize` is not implemented for `NotSerializable`
   --> tests/ui/persisted_method_requires_serde.rs:4:1
    |
  4 | struct NotSerializable {
    | ^^^^^^^^^^^^^^^^^^^^^^
    = note: for local types consider adding `#[derive(serde::Serialize)]` to your `NotSerializable` type
    = note: for types from other crates check whether the crate offers a `serde` feature flag
-   = help: the following other types implement trait `serde_core::ser::Serialize`:
+   = help: the following other types implement trait `Serialize`:
              &'a T
              &'a mut T
              ()
@@ -72,14 +72,14 @@ error[E0277]: the trait bound `NotSerializable: serde::Deserialize<'de>` is not 
 12 | #[entity_impl]
    | ^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `serde_core::de::Deserialize<'_>` is not implemented for `NotSerializable`
+help: the trait `Deserialize<'_>` is not implemented for `NotSerializable`
   --> tests/ui/persisted_method_requires_serde.rs:4:1
    |
  4 | struct NotSerializable {
    | ^^^^^^^^^^^^^^^^^^^^^^
    = note: for local types consider adding `#[derive(serde::Deserialize)]` to your `NotSerializable` type
    = note: for types from other crates check whether the crate offers a `serde` feature flag
-   = help: the following other types implement trait `serde_core::de::Deserialize<'de>`:
+   = help: the following other types implement trait `Deserialize<'de>`:
              &'a Path
              &'a [u8]
              &'a serde_json::raw::RawValue

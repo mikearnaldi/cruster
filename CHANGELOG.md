@@ -1,3 +1,27 @@
+## 0.0.14 (2026-02-07)
+
+### Fixes
+
+#### fix: prevent infinite gRPC self-loop in shard routing
+
+When `shard_assignments` marked a shard as owned by the local runner but `owned_shards` had not yet been populated (during the acquire phase window), `send()`, `notify()`, and `interrupt()` would route the message as "remote" via gRPC to the local runner itself. The gRPC handler called back into `sharding.send()`, hitting the same code path, creating an infinite loop that grew memory at ~350MB/s.
+
+Added self-send guards to all three routing methods: when `get_shard_owner_async()` returns the local runner's address, route locally instead of making a gRPC call. Also handles persisted messages correctly in the self-routed path.
+
+Concurrent `acquire_batch`/`refresh_batch` using `FuturesUnordered` with a concurrency limit of 64, reducing 2048-shard acquisition from 30+ seconds to under 5 seconds.
+
+#### fix: resolve stale state in workflows after activity calls
+
+`self.state` in `#[workflow]` and `#[rpc]` methods previously captured a
+point-in-time snapshot at method entry via `ArcSwap::load()`. After calling
+an activity that mutated state, subsequent reads of `self.state` within the
+same workflow would still return pre-activity values.
+
+Introduces `StateRef<S>`, a read-only proxy wrapping `Arc<S>` that implements
+`Deref<Target=S>`. The macro-generated activity delegation methods now refresh
+the proxy after each activity commits, so `self.state.field` always reflects
+the latest committed state. User-facing syntax is unchanged.
+
 ## 0.0.13 (2026-02-06)
 
 ### Features

@@ -2096,6 +2096,11 @@ fn generate_entity(
             // when engine, message_storage, and state_storage are available.
             // The journal result is stored in WorkflowStorage (same transaction
             // as state/journal changes) to ensure atomicity.
+            //
+            // The journal key includes the workflow execution's request ID (from
+            // WorkflowScope) so that activities are scoped per workflow execution.
+            // Without this, two different workflow executions calling the same
+            // zero-argument activity would collide on the same journal entry.
             let journal_body = quote! {
                 if let (
                     ::std::option::Option::Some(__engine),
@@ -2107,6 +2112,17 @@ fn generate_entity(
                     self.__handler.__state_storage.as_ref(),
                 ) {
                     #key_bytes_code
+                    // Prepend the workflow execution's request ID to the key bytes
+                    // so that the same activity called from different workflow
+                    // executions produces different journal keys.
+                    let __journal_key_bytes = {
+                        let mut __scoped = ::std::vec::Vec::new();
+                        if let ::std::option::Option::Some(__wf_id) = #krate::__internal::WorkflowScope::current() {
+                            __scoped.extend_from_slice(&__wf_id.to_le_bytes());
+                        }
+                        __scoped.extend_from_slice(&__journal_key_bytes);
+                        __scoped
+                    };
                     let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
                         ::std::sync::Arc::clone(__engine),
                         self.__handler.ctx.address.entity_type.0.clone(),
@@ -3069,7 +3085,8 @@ fn generate_entity(
                 payload: &[u8],
                 headers: &::std::collections::HashMap<::std::string::String, ::std::string::String>,
             ) -> ::std::result::Result<::std::vec::Vec<u8>, #krate::error::ClusterError> {
-                let _ = headers;
+                #[allow(unused_variables)]
+                let headers = headers;
                 match tag {
                     #(#dispatch_arms,)*
                     _ => #trait_dispatch_fallback,
@@ -3200,13 +3217,31 @@ fn generate_dispatch_arms(
                 quote! {}
             };
 
+            // For workflow methods, wrap the call in a WorkflowScope so that
+            // activity journal keys are scoped per workflow execution.
+            let is_workflow = matches!(rpc.kind, RpcKind::Workflow);
+
             if stateful {
                 // Call method directly on self - method uses state() or state_mut() internally
+                let method_call = quote! { self.#method_name(#call_args).await };
+                let wrapped_call = if is_workflow {
+                    quote! {
+                        let __request_id = headers
+                            .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        #krate::__internal::WorkflowScope::run(__request_id, || async {
+                            #method_call
+                        }).await?
+                    }
+                } else {
+                    quote! { #method_call? }
+                };
                 quote! {
                     #tag => {
                         #deserialize_request
                         #durable_ctx_code
-                        let response = self.#method_name(#call_args).await?;
+                        let response = { #wrapped_call };
                         #post_call_save
                         rmp_serde::to_vec(&response)
                             .map_err(|e| #krate::error::ClusterError::MalformedMessage {
@@ -3217,11 +3252,25 @@ fn generate_dispatch_arms(
                 }
             } else {
                 // Stateless — call directly on entity
+                let method_call = quote! { self.entity.#method_name(#call_args).await };
+                let wrapped_call = if is_workflow {
+                    quote! {
+                        let __request_id = headers
+                            .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        #krate::__internal::WorkflowScope::run(__request_id, || async {
+                            #method_call
+                        }).await?
+                    }
+                } else {
+                    quote! { #method_call? }
+                };
                 quote! {
                     #tag => {
                         #deserialize_request
                         #durable_ctx_code
-                        let response = self.entity.#method_name(#call_args).await?;
+                        let response = { #wrapped_call };
                         rmp_serde::to_vec(&response)
                             .map_err(|e| #krate::error::ClusterError::MalformedMessage {
                                 reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),

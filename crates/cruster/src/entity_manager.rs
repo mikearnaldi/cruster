@@ -1377,7 +1377,13 @@ impl EntityManager {
 
         let tag = snapshot.request.tag.clone();
         let payload = snapshot.request.payload.clone();
-        let headers = snapshot.request.headers.clone();
+        let mut headers = snapshot.request.headers.clone();
+        // Inject the envelope request_id so handler code (macro-generated workflow
+        // dispatch) can scope activity journals per workflow execution.
+        headers.insert(
+            crate::envelope::REQUEST_ID_HEADER_KEY.to_string(),
+            snapshot.request.request_id.0.to_string(),
+        );
 
         // SAFETY: We use AssertUnwindSafe because on panic we will discard the handler
         // entirely and respawn a fresh one. The handler state after a panic is never observed.

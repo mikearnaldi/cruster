@@ -27,6 +27,37 @@ use tokio::sync::Notify;
 /// Deferred key name used for interrupt signals.
 pub const INTERRUPT_SIGNAL: &str = "Workflow/InterruptSignal";
 
+// ── WorkflowScope ──────────────────────────────────────────────────────
+// Task-local that carries the current workflow execution's request ID.
+// Set by macro-generated dispatch code for `#[workflow]` methods so that
+// activity journal keys are scoped per workflow execution.
+
+tokio::task_local! {
+    static WORKFLOW_REQUEST_ID: i64;
+}
+
+/// Scope that carries the current workflow execution's request ID.
+///
+/// Used by the macro-generated dispatch code to make activity journal keys
+/// unique per workflow execution instead of globally per entity.
+pub struct WorkflowScope;
+
+impl WorkflowScope {
+    /// Execute `f` with the given workflow request ID in scope.
+    pub async fn run<F, Fut, T>(request_id: i64, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        WORKFLOW_REQUEST_ID.scope(request_id, f()).await
+    }
+
+    /// Get the current workflow request ID, if inside a `WorkflowScope`.
+    pub fn current() -> Option<i64> {
+        WORKFLOW_REQUEST_ID.try_with(|id| *id).ok()
+    }
+}
+
 /// Persistent key-value storage for durable state.
 ///
 /// Used by entity macros to persist state across restarts.

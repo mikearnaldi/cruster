@@ -109,8 +109,9 @@ mod durable;
 pub mod __internal {
     pub use crate::durable::{
         DeferredKey, DeferredKeyLike, DurableContext, MemoryWorkflowEngine, MemoryWorkflowStorage,
-        StorageTransaction, WorkflowEngine, WorkflowStorage,
+        StorageTransaction, WorkflowEngine, WorkflowScope, WorkflowStorage,
     };
+    pub use crate::envelope::REQUEST_ID_HEADER_KEY;
     pub use crate::message_storage::MessageStorage;
     #[cfg(feature = "sql")]
     pub use crate::state_guard::SqlTransactionHandle;

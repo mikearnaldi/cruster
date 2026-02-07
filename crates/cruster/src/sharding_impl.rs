@@ -854,9 +854,8 @@ impl ShardingImpl {
             all_newly_acquired.extend(batch_result.acquired.clone());
 
             // Log shards still pending (held by other runners)
-            let remaining = pending_acquire.len()
-                - batch_result.acquired.len()
-                - batch_result.failures.len();
+            let remaining =
+                pending_acquire.len() - batch_result.acquired.len() - batch_result.failures.len();
             if remaining > 0 {
                 tracing::info!(
                     acquired = batch_result.acquired.len(),

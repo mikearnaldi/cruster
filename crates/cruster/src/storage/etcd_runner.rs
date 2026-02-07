@@ -592,11 +592,7 @@ impl RunnerStorage for EtcdRunnerStorage {
                             CompareOp::Equal,
                             0,
                         )])
-                        .and_then([TxnOp::put(
-                            key.as_bytes(),
-                            value.as_bytes(),
-                            put_opts,
-                        )])
+                        .and_then([TxnOp::put(key.as_bytes(), value.as_bytes(), put_opts)])
                         .or_else([TxnOp::get(key.as_bytes(), None)]);
 
                     let result = client.txn(txn).await;
@@ -726,11 +722,7 @@ impl RunnerStorage for EtcdRunnerStorage {
                             CompareOp::Equal,
                             value.as_bytes(),
                         )])
-                        .and_then([TxnOp::put(
-                            key.as_bytes(),
-                            value.as_bytes(),
-                            put_opts,
-                        )]);
+                        .and_then([TxnOp::put(key.as_bytes(), value.as_bytes(), put_opts)]);
 
                     let result = client.txn(txn).await;
                     (shard_id, result)

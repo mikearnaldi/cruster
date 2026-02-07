@@ -111,6 +111,7 @@ pub mod __internal {
         DeferredKey, DeferredKeyLike, DurableContext, MemoryWorkflowEngine, MemoryWorkflowStorage,
         StorageTransaction, WorkflowEngine, WorkflowStorage,
     };
+    pub use crate::message_storage::MessageStorage;
     #[cfg(feature = "sql")]
     pub use crate::state_guard::SqlTransactionHandle;
     pub use crate::state_guard::{ActivityScope, StateMutGuard, StateRef, TraitStateMutGuard};

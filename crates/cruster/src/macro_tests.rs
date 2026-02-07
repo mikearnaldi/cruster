@@ -45,6 +45,7 @@ mod tests {
             state_storage: None,
             workflow_engine: None,
             sharding: None,
+            message_storage: None,
         }
     }
 
@@ -65,6 +66,7 @@ mod tests {
             cancellation: tokio_util::sync::CancellationToken::new(),
             state_storage: Some(storage),
             workflow_engine: None,
+            message_storage: None,
         }
     }
 
@@ -1390,6 +1392,7 @@ mod tests {
             state_storage: None,
             workflow_engine: Some(engine),
             sharding: None,
+            message_storage: None,
         }
     }
 
@@ -1558,6 +1561,7 @@ mod tests {
             state_storage: Some(storage),
             workflow_engine: Some(engine),
             sharding: None,
+            message_storage: None,
         }
     }
 
@@ -2212,5 +2216,470 @@ mod tests {
             .unwrap();
         let value: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(value, "updated:15");
+    }
+
+    // --- Activity Journaling tests ---
+
+    fn test_ctx_with_all_storage(
+        entity_type: &str,
+        entity_id: &str,
+        state_storage: Arc<dyn crate::durable::WorkflowStorage>,
+        engine: Arc<dyn crate::durable::WorkflowEngine>,
+        message_storage: Arc<dyn crate::message_storage::MessageStorage>,
+    ) -> EntityContext {
+        EntityContext {
+            address: EntityAddress {
+                shard_id: ShardId::new("default", 0),
+                entity_type: EntityType::new(entity_type),
+                entity_id: EntityId::new(entity_id),
+            },
+            runner_address: RunnerAddress::new("127.0.0.1", 9000),
+            snowflake: Arc::new(SnowflakeGenerator::new()),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            state_storage: Some(state_storage),
+            workflow_engine: Some(engine),
+            sharding: None,
+            message_storage: Some(message_storage),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_journal_caches_result_on_replay() {
+        // Entity with a workflow that calls an activity.
+        // We verify that with message_storage configured, the activity result
+        // is journaled and returned on "replay" (second dispatch of same workflow).
+        //
+        // We use a global AtomicUsize counter to track how many times the activity
+        // body actually executes, independent of state.
+
+        static JOURNAL_EXEC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct JournalState {
+            call_count: i32,
+        }
+
+        #[entity(krate = "crate")]
+        #[derive(Clone)]
+        struct JournalTestEntity;
+
+        #[entity_impl(krate = "crate")]
+        #[state(JournalState)]
+        impl JournalTestEntity {
+            fn init(&self, _ctx: &EntityContext) -> Result<JournalState, ClusterError> {
+                Ok(JournalState { call_count: 0 })
+            }
+
+            #[activity]
+            async fn counted_activity(&mut self) -> Result<String, ClusterError> {
+                JOURNAL_EXEC_COUNT.fetch_add(1, Ordering::SeqCst);
+                self.state.call_count += 1;
+                Ok(format!("executed:{}", self.state.call_count))
+            }
+
+            #[workflow]
+            async fn do_counted(&self) -> Result<String, ClusterError> {
+                self.counted_activity().await
+            }
+
+            #[rpc]
+            async fn get_call_count(&self) -> Result<i32, ClusterError> {
+                Ok(self.state.call_count)
+            }
+        }
+
+        JOURNAL_EXEC_COUNT.store(0, Ordering::SeqCst);
+
+        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
+        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
+            Arc::new(MemoryMessageStorage::new());
+
+        // First execution — activity runs and result is journaled
+        let ctx = test_ctx_with_all_storage(
+            "JournalTestEntity",
+            "j-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler = JournalTestEntity.spawn(ctx).await.unwrap();
+
+        let result = handler
+            .handle_request("do_counted", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "executed:1");
+        assert_eq!(
+            JOURNAL_EXEC_COUNT.load(Ordering::SeqCst),
+            1,
+            "activity should have executed once"
+        );
+
+        // Second execution (simulates crash recovery replay) — same entity, same message_storage.
+        // The workflow calls the activity again but the journal should return the cached result.
+        // The activity body should NOT re-execute.
+        let ctx2 = test_ctx_with_all_storage(
+            "JournalTestEntity",
+            "j-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler2 = JournalTestEntity.spawn(ctx2).await.unwrap();
+
+        let result2 = handler2
+            .handle_request("do_counted", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value2: String = rmp_serde::from_slice(&result2).unwrap();
+        assert_eq!(
+            value2, "executed:1",
+            "should return cached result from journal"
+        );
+
+        // The global counter should still be 1 — the activity body was NOT re-entered.
+        assert_eq!(
+            JOURNAL_EXEC_COUNT.load(Ordering::SeqCst),
+            1,
+            "activity body should not have re-executed on replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_journal_without_message_storage_executes_normally() {
+        // When no message_storage is configured, activities should execute normally
+        // without journaling (backward-compatible behavior).
+
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct NoJournalState {
+            count: i32,
+        }
+
+        #[entity(krate = "crate")]
+        #[derive(Clone)]
+        struct NoJournalEntity;
+
+        #[entity_impl(krate = "crate")]
+        #[state(NoJournalState)]
+        impl NoJournalEntity {
+            fn init(&self, _ctx: &EntityContext) -> Result<NoJournalState, ClusterError> {
+                Ok(NoJournalState { count: 0 })
+            }
+
+            #[activity]
+            async fn increment(&mut self) -> Result<i32, ClusterError> {
+                self.state.count += 1;
+                Ok(self.state.count)
+            }
+
+            #[workflow]
+            async fn do_increment(&self) -> Result<i32, ClusterError> {
+                self.increment().await
+            }
+        }
+
+        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
+        // NO message_storage — journaling disabled
+        let ctx = test_ctx_with_storage_and_engine(
+            "NoJournalEntity",
+            "nj-1",
+            state_storage.clone(),
+            engine.clone(),
+        );
+        let handler = NoJournalEntity.spawn(ctx).await.unwrap();
+
+        // Each call should execute the activity (no caching)
+        let result = handler
+            .handle_request("do_increment", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let v: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(v, 1);
+
+        let result = handler
+            .handle_request("do_increment", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let v: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(v, 2, "activity should execute again without journaling");
+    }
+
+    #[tokio::test]
+    async fn activity_journal_different_args_produce_different_entries() {
+        // Verify that the same activity called with different arguments
+        // produces different journal entries (different key bytes).
+
+        static ARG_JOURNAL_EXEC: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct ArgJournalState {
+            total: i32,
+        }
+
+        #[entity(krate = "crate")]
+        #[derive(Clone)]
+        struct ArgJournalEntity;
+
+        #[entity_impl(krate = "crate")]
+        #[state(ArgJournalState)]
+        impl ArgJournalEntity {
+            fn init(&self, _ctx: &EntityContext) -> Result<ArgJournalState, ClusterError> {
+                Ok(ArgJournalState { total: 0 })
+            }
+
+            #[activity]
+            async fn add(&mut self, amount: i32) -> Result<i32, ClusterError> {
+                ARG_JOURNAL_EXEC.fetch_add(1, Ordering::SeqCst);
+                self.state.total += amount;
+                Ok(self.state.total)
+            }
+
+            #[workflow]
+            async fn add_two_amounts(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
+                self.add(a).await?;
+                self.add(b).await
+            }
+        }
+
+        ARG_JOURNAL_EXEC.store(0, Ordering::SeqCst);
+
+        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
+        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
+            Arc::new(MemoryMessageStorage::new());
+
+        // First execution: add(10) then add(20) → total 30
+        let ctx = test_ctx_with_all_storage(
+            "ArgJournalEntity",
+            "aj-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler = ArgJournalEntity.spawn(ctx).await.unwrap();
+
+        let payload = rmp_serde::to_vec(&(10i32, 20i32)).unwrap();
+        let result = handler
+            .handle_request("add_two_amounts", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 30);
+        assert_eq!(
+            ARG_JOURNAL_EXEC.load(Ordering::SeqCst),
+            2,
+            "both activities should have executed"
+        );
+
+        // Replay: same workflow, same args → journal should return cached results for both
+        let ctx2 = test_ctx_with_all_storage(
+            "ArgJournalEntity",
+            "aj-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler2 = ArgJournalEntity.spawn(ctx2).await.unwrap();
+
+        let result2 = handler2
+            .handle_request("add_two_amounts", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value2: i32 = rmp_serde::from_slice(&result2).unwrap();
+        assert_eq!(value2, 30, "should return cached result");
+        assert_eq!(
+            ARG_JOURNAL_EXEC.load(Ordering::SeqCst),
+            2,
+            "no additional executions on replay — both activities served from journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn stateless_activity_journal_caches_result_on_replay() {
+        // Stateless entity with #[activity] + #[workflow].
+        // Verifies that the journal caches the activity result and
+        // returns it on replay without re-executing the body.
+        // This proves the unified codegen generates journal infrastructure
+        // for stateless entities.
+
+        static STATELESS_JOURNAL_EXEC: AtomicUsize = AtomicUsize::new(0);
+
+        #[entity(krate = "crate")]
+        #[derive(Clone)]
+        struct StatelessJournalEntity;
+
+        #[entity_impl(krate = "crate")]
+        impl StatelessJournalEntity {
+            #[activity]
+            async fn compute(&mut self, input: i32) -> Result<i32, ClusterError> {
+                STATELESS_JOURNAL_EXEC.fetch_add(1, Ordering::SeqCst);
+                Ok(input * 2 + 1)
+            }
+
+            #[workflow]
+            async fn do_compute(&self, input: i32) -> Result<i32, ClusterError> {
+                self.compute(input).await
+            }
+        }
+
+        STATELESS_JOURNAL_EXEC.store(0, Ordering::SeqCst);
+
+        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
+        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
+            Arc::new(MemoryMessageStorage::new());
+
+        // First execution — activity runs
+        let ctx = test_ctx_with_all_storage(
+            "StatelessJournalEntity",
+            "sj-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler = StatelessJournalEntity.spawn(ctx).await.unwrap();
+
+        let payload = rmp_serde::to_vec(&7i32).unwrap();
+        let result = handler
+            .handle_request("do_compute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 15); // 7*2+1
+        assert_eq!(
+            STATELESS_JOURNAL_EXEC.load(Ordering::SeqCst),
+            1,
+            "activity should have executed once"
+        );
+
+        // Replay — same entity, same storages.
+        // The journal should return the cached result.
+        let ctx2 = test_ctx_with_all_storage(
+            "StatelessJournalEntity",
+            "sj-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler2 = StatelessJournalEntity.spawn(ctx2).await.unwrap();
+
+        let result2 = handler2
+            .handle_request("do_compute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value2: i32 = rmp_serde::from_slice(&result2).unwrap();
+        assert_eq!(
+            value2, 15,
+            "should return cached result from journal on replay"
+        );
+        assert_eq!(
+            STATELESS_JOURNAL_EXEC.load(Ordering::SeqCst),
+            1,
+            "activity body should not have re-executed on replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_journal_with_explicit_key() {
+        // Verify that #[activity(key(...))] is used as the journal key.
+
+        static KEY_JOURNAL_EXEC: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct KeyJournalState {
+            last_processed: String,
+        }
+
+        #[entity(krate = "crate")]
+        #[derive(Clone)]
+        struct KeyJournalEntity;
+
+        #[entity_impl(krate = "crate")]
+        #[state(KeyJournalState)]
+        impl KeyJournalEntity {
+            fn init(&self, _ctx: &EntityContext) -> Result<KeyJournalState, ClusterError> {
+                Ok(KeyJournalState {
+                    last_processed: String::new(),
+                })
+            }
+
+            // The key is only the order_id — the body is ignored for idempotency.
+            #[activity(key(|order_id: &String, _body: &String| order_id.clone()))]
+            async fn process_order(
+                &mut self,
+                order_id: String,
+                body: String,
+            ) -> Result<String, ClusterError> {
+                KEY_JOURNAL_EXEC.fetch_add(1, Ordering::SeqCst);
+                self.state.last_processed = order_id.clone();
+                Ok(format!("{order_id}:{body}"))
+            }
+
+            #[workflow]
+            async fn do_process(
+                &self,
+                order_id: String,
+                body: String,
+            ) -> Result<String, ClusterError> {
+                self.process_order(order_id, body).await
+            }
+        }
+
+        KEY_JOURNAL_EXEC.store(0, Ordering::SeqCst);
+
+        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
+        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
+            Arc::new(MemoryMessageStorage::new());
+
+        // First execution
+        let ctx = test_ctx_with_all_storage(
+            "KeyJournalEntity",
+            "kj-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler = KeyJournalEntity.spawn(ctx).await.unwrap();
+
+        let payload =
+            rmp_serde::to_vec(&("order-1".to_string(), "first-body".to_string())).unwrap();
+        let result = handler
+            .handle_request("do_process", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "order-1:first-body");
+        assert_eq!(KEY_JOURNAL_EXEC.load(Ordering::SeqCst), 1);
+
+        // Replay with different body but same order_id — key is same, so journal hit
+        let ctx2 = test_ctx_with_all_storage(
+            "KeyJournalEntity",
+            "kj-1",
+            state_storage.clone(),
+            engine.clone(),
+            msg_storage.clone(),
+        );
+        let handler2 = KeyJournalEntity.spawn(ctx2).await.unwrap();
+
+        let payload2 =
+            rmp_serde::to_vec(&("order-1".to_string(), "different-body".to_string())).unwrap();
+        let result2 = handler2
+            .handle_request("do_process", &payload2, &HashMap::new())
+            .await
+            .unwrap();
+        let value2: String = rmp_serde::from_slice(&result2).unwrap();
+        assert_eq!(
+            value2, "order-1:first-body",
+            "should return cached result (same key despite different body)"
+        );
+        assert_eq!(
+            KEY_JOURNAL_EXEC.load(Ordering::SeqCst),
+            1,
+            "activity should not have re-executed (key matched)"
+        );
     }
 }

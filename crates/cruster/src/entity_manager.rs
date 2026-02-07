@@ -677,6 +677,7 @@ impl EntityManager {
             state_storage: self.state_storage.clone(),
             workflow_engine: self.workflow_engine.clone(),
             sharding: self.sharding.clone(),
+            message_storage: self.message_storage.clone(),
         };
 
         let cancel = ctx.cancellation.clone();
@@ -1197,6 +1198,7 @@ impl EntityManager {
                         state_storage: state_storage.clone(),
                         workflow_engine: workflow_engine.clone(),
                         sharding: sharding.clone(),
+                        message_storage: message_storage.clone(),
                     };
 
                     match entity.spawn(ctx).await {
@@ -1332,6 +1334,7 @@ impl EntityManager {
                         state_storage: state_storage.clone(),
                         workflow_engine: workflow_engine.clone(),
                         sharding: sharding.clone(),
+                        message_storage: message_storage.clone(),
                     };
 
                     match entity.spawn(ctx).await {

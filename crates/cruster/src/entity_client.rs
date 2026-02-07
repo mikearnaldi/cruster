@@ -37,7 +37,7 @@ impl EntityClientAccessor for EntityClient {
     }
 }
 
-fn persisted_request_id(
+pub(crate) fn persisted_request_id(
     entity_type: &EntityType,
     entity_id: &EntityId,
     tag: &str,

@@ -6,12 +6,19 @@
 //! It also provides `MemoryWorkflowEngine` and `MemoryWorkflowStorage` for testing
 //! entities that use durable workflows.
 
+use crate::entity_client::persisted_request_id;
+use crate::envelope::EnvelopeRequest;
 use crate::error::ClusterError;
+use crate::message_storage::{MessageStorage, SaveResult};
+use crate::reply::ExitResult;
+use crate::types::{EntityAddress, EntityId, EntityType, ShardId};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::Any;
+use std::collections::HashMap;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -333,10 +340,24 @@ impl<T> DeferredKeyLike<T> for &String {
 ///
 /// `DurableContext` provides durable capabilities (`sleep`, `await_deferred`, `resolve_deferred`)
 /// that can be used inside entity methods marked with `#[workflow]`.
+///
+/// When `message_storage` is present, also provides `run()` for activity journaling:
+/// activity results are cached in `MessageStorage` so that on crash-recovery replay
+/// the cached result is returned instead of re-executing the activity body.
 pub struct DurableContext {
     engine: Arc<dyn WorkflowEngine>,
     workflow_name: String,
     execution_id: String,
+    /// Optional message storage for activity journal duplicate detection.
+    message_storage: Option<Arc<dyn MessageStorage>>,
+    /// Optional workflow storage for loading journal results.
+    /// Journal results are stored here (not in MessageStorage) so they can be
+    /// committed atomically with state changes in the ActivityScope transaction.
+    workflow_storage: Option<Arc<dyn WorkflowStorage>>,
+    /// Entity type for building deterministic journal keys.
+    entity_type: EntityType,
+    /// Entity ID for building deterministic journal keys.
+    entity_id: EntityId,
 }
 
 impl DurableContext {
@@ -346,10 +367,42 @@ impl DurableContext {
         workflow_name: impl Into<String>,
         execution_id: impl Into<String>,
     ) -> Self {
+        let workflow_name = workflow_name.into();
+        let execution_id = execution_id.into();
         Self {
             engine,
-            workflow_name: workflow_name.into(),
-            execution_id: execution_id.into(),
+            entity_type: EntityType::new(&workflow_name),
+            entity_id: EntityId::new(&execution_id),
+            workflow_name,
+            execution_id,
+            message_storage: None,
+            workflow_storage: None,
+        }
+    }
+
+    /// Create a new `DurableContext` with message storage for activity journaling.
+    ///
+    /// The `message_storage` is used for duplicate detection (save_request).
+    /// The `workflow_storage` is used for loading cached journal results.
+    /// Journal results are written to WorkflowStorage via `ActivityScope::buffer_write`
+    /// to ensure atomicity with state changes.
+    pub fn with_journal_storage(
+        engine: Arc<dyn WorkflowEngine>,
+        workflow_name: impl Into<String>,
+        execution_id: impl Into<String>,
+        message_storage: Arc<dyn MessageStorage>,
+        workflow_storage: Arc<dyn WorkflowStorage>,
+    ) -> Self {
+        let workflow_name = workflow_name.into();
+        let execution_id = execution_id.into();
+        Self {
+            engine,
+            entity_type: EntityType::new(&workflow_name),
+            entity_id: EntityId::new(&execution_id),
+            workflow_name,
+            execution_id,
+            message_storage: Some(message_storage),
+            workflow_storage: Some(workflow_storage),
         }
     }
 
@@ -398,6 +451,209 @@ impl DurableContext {
         self.engine
             .on_interrupt(&self.workflow_name, &self.execution_id)
             .await
+    }
+
+    /// Check the journal for a cached activity result.
+    ///
+    /// This performs the duplicate-detection check against `MessageStorage` and
+    /// looks up the cached result in `WorkflowStorage`.
+    ///
+    /// Returns `Ok(Some(T))` if a cached result exists (replay hit),
+    /// `Ok(None)` if this is a first execution or re-execution after crash,
+    /// or if no `MessageStorage` is configured (backward-compatible mode).
+    pub async fn check_journal<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        key_bytes: &[u8],
+    ) -> Result<Option<T>, ClusterError> {
+        let msg_storage = match &self.message_storage {
+            Some(s) => s,
+            None => return Ok(None), // No journal — caller should execute directly
+        };
+
+        let journal_tag = format!("__journal/{name}");
+        let request_id =
+            persisted_request_id(&self.entity_type, &self.entity_id, &journal_tag, key_bytes);
+
+        // Build an envelope for duplicate detection
+        let envelope = EnvelopeRequest {
+            request_id,
+            address: EntityAddress {
+                shard_id: ShardId::new("default", 0),
+                entity_type: self.entity_type.clone(),
+                entity_id: self.entity_id.clone(),
+            },
+            tag: journal_tag,
+            payload: vec![],
+            headers: HashMap::new(),
+            span_id: None,
+            trace_id: None,
+            sampled: None,
+            persisted: true,
+            uninterruptible: Default::default(),
+            deliver_at: None,
+        };
+
+        match msg_storage.save_request(&envelope).await? {
+            SaveResult::Duplicate { .. } => {
+                // Duplicate request — check WorkflowStorage for the cached result.
+                // The result lives in WorkflowStorage (not MessageStorage) because
+                // it is written atomically with state changes in the ActivityScope
+                // transaction.
+                if let Some(wf_storage) = &self.workflow_storage {
+                    let storage_key = Self::journal_storage_key(
+                        name,
+                        key_bytes,
+                        &self.entity_type,
+                        &self.entity_id,
+                    );
+                    if let Some(bytes) = wf_storage.load(&storage_key).await? {
+                        let result: T = Self::deserialize_journal_result(&bytes)?;
+                        return Ok(Some(result));
+                    }
+                }
+                // Duplicate request but no stored result — crash happened after
+                // save_request but before the ActivityScope committed. Re-execute.
+                Ok(None)
+            }
+            SaveResult::Success => {
+                // First execution
+                Ok(None)
+            }
+        }
+    }
+
+    /// Compute the WorkflowStorage key for a journal entry.
+    ///
+    /// Journal results are stored in WorkflowStorage (same transaction as state)
+    /// under a deterministic key derived from the activity identity.
+    pub fn journal_storage_key(
+        name: &str,
+        key_bytes: &[u8],
+        entity_type: &EntityType,
+        entity_id: &EntityId,
+    ) -> String {
+        let journal_tag = format!("__journal/{name}");
+        let request_id = persisted_request_id(entity_type, entity_id, &journal_tag, key_bytes);
+        format!("__journal/{}", request_id.0)
+    }
+
+    /// Serialize an activity result for journal storage.
+    ///
+    /// The result is serialized as msgpack bytes suitable for storage in
+    /// WorkflowStorage. On success, the value is serialized directly.
+    /// On error, the error message is stored as an `ExitResult::Failure`.
+    pub fn serialize_journal_result<T: Serialize>(
+        result: &Result<T, ClusterError>,
+    ) -> Result<Vec<u8>, ClusterError> {
+        let exit = match result {
+            Ok(value) => {
+                let bytes =
+                    rmp_serde::to_vec(value).map_err(|e| ClusterError::PersistenceError {
+                        reason: format!("failed to serialize journal result: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+                ExitResult::Success(bytes)
+            }
+            Err(e) => ExitResult::Failure(e.to_string()),
+        };
+        rmp_serde::to_vec(&exit).map_err(|e| ClusterError::PersistenceError {
+            reason: format!("failed to serialize journal exit: {e}"),
+            source: Some(Box::new(e)),
+        })
+    }
+
+    /// Deserialize a journal result from WorkflowStorage bytes.
+    pub fn deserialize_journal_result<T: DeserializeOwned>(
+        bytes: &[u8],
+    ) -> Result<T, ClusterError> {
+        let exit: ExitResult =
+            rmp_serde::from_slice(bytes).map_err(|e| ClusterError::PersistenceError {
+                reason: format!("failed to deserialize journal exit: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        match exit {
+            ExitResult::Success(data) => {
+                rmp_serde::from_slice(&data).map_err(|e| ClusterError::PersistenceError {
+                    reason: format!("failed to deserialize cached journal result: {e}"),
+                    source: Some(Box::new(e)),
+                })
+            }
+            ExitResult::Failure(msg) => Err(ClusterError::PersistenceError {
+                reason: format!("cached journal result was a failure: {msg}"),
+                source: None,
+            }),
+        }
+    }
+
+    /// Check if journaling is enabled (message storage is configured).
+    pub fn has_journal(&self) -> bool {
+        self.message_storage.is_some()
+    }
+
+    /// Get the entity type for journal key computation.
+    pub fn entity_type(&self) -> &EntityType {
+        &self.entity_type
+    }
+
+    /// Get the entity ID for journal key computation.
+    pub fn entity_id(&self) -> &EntityId {
+        &self.entity_id
+    }
+
+    /// Execute a closure with journaled result caching.
+    ///
+    /// On first execution, runs the closure and persists the serialized result
+    /// atomically with the activity's state changes (via `ActivityScope::buffer_write`).
+    /// On replay (crash recovery), returns the cached result without re-executing.
+    ///
+    /// **Note:** This method is used by unit tests. The macro-generated code uses
+    /// `check_journal()` + `ActivityScope::buffer_write()` directly to ensure the
+    /// journal write is part of the same transaction as state persistence.
+    ///
+    /// If no `MessageStorage` is configured, the closure is executed directly
+    /// without journaling (backward-compatible fallback).
+    pub async fn run<T, F, Fut>(
+        &self,
+        name: &str,
+        key_bytes: &[u8],
+        f: F,
+    ) -> Result<T, ClusterError>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, ClusterError>>,
+    {
+        // Check for cached result
+        if let Some(cached) = self.check_journal::<T>(name, key_bytes).await? {
+            return Ok(cached);
+        }
+
+        if self.message_storage.is_none() {
+            // No journal — execute directly (backward-compatible)
+            return f().await;
+        }
+
+        // First execution (or re-execution after crash) — run the closure
+        let result = f().await;
+
+        // Buffer the journal write into the active ActivityScope transaction (if any).
+        // This ensures the journal entry is committed atomically with state changes.
+        let storage_key =
+            Self::journal_storage_key(name, key_bytes, &self.entity_type, &self.entity_id);
+        let journal_bytes = Self::serialize_journal_result(&result)?;
+
+        if crate::state_guard::ActivityScope::is_active() {
+            // Inside an ActivityScope — buffer into the same transaction
+            crate::state_guard::ActivityScope::buffer_write(storage_key, journal_bytes);
+        } else if let Some(wf_storage) = &self.workflow_storage {
+            // No ActivityScope but have storage — write directly to WorkflowStorage.
+            // This is NOT atomic with state, but is acceptable for test scenarios
+            // and activities that don't mutate state.
+            wf_storage.save(&storage_key, &journal_bytes).await?;
+        }
+
+        result
     }
 }
 
@@ -560,5 +816,237 @@ impl WorkflowEngine for MemoryWorkflowEngine {
             .await_deferred(workflow_name, execution_id, INTERRUPT_SIGNAL)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::memory_message::MemoryMessageStorage;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Build a DurableContext with message and workflow storage for testing.
+    fn test_ctx(
+        msg_storage: Arc<dyn MessageStorage>,
+        wf_storage: Arc<dyn WorkflowStorage>,
+    ) -> DurableContext {
+        let engine = Arc::new(MemoryWorkflowEngine::new());
+        DurableContext::with_journal_storage(engine, "TestEntity", "e-1", msg_storage, wf_storage)
+    }
+
+    /// Build a DurableContext *without* message storage (backward-compatible mode).
+    fn test_ctx_no_storage() -> DurableContext {
+        let engine = Arc::new(MemoryWorkflowEngine::new());
+        DurableContext::new(engine, "TestEntity", "e-1")
+    }
+
+    #[tokio::test]
+    async fn run_caches_result_on_first_execution() {
+        let msg = Arc::new(MemoryMessageStorage::new());
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let ctx = test_ctx(msg.clone(), wf.clone());
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: i32 = ctx
+            .run("my_activity", b"key1", || async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_returns_cached_on_replay() {
+        let msg = Arc::new(MemoryMessageStorage::new());
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+
+        // First execution — caches the result
+        {
+            let ctx = test_ctx(msg.clone(), wf.clone());
+            let result: i32 = ctx
+                .run("my_activity", b"key1", || async { Ok(42) })
+                .await
+                .unwrap();
+            assert_eq!(result, 42);
+        }
+
+        // Second execution (simulates replay) — should return cached result
+        {
+            let ctx = test_ctx(msg.clone(), wf.clone());
+            let call_count = Arc::new(AtomicU32::new(0));
+            let cc = call_count.clone();
+
+            let result: i32 = ctx
+                .run("my_activity", b"key1", || async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok(99) // Would return 99 if actually executed
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(result, 42, "should return cached result, not re-execute");
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                0,
+                "closure should not have been called"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_different_keys_execute_independently() {
+        let msg = Arc::new(MemoryMessageStorage::new());
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let ctx = test_ctx(msg.clone(), wf.clone());
+
+        let a: i32 = ctx
+            .run("activity_a", b"k1", || async { Ok(1) })
+            .await
+            .unwrap();
+        let b: i32 = ctx
+            .run("activity_b", b"k2", || async { Ok(2) })
+            .await
+            .unwrap();
+
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+
+        // Replay — both should return cached values
+        let ctx2 = test_ctx(msg.clone(), wf.clone());
+        let a2: i32 = ctx2
+            .run("activity_a", b"k1", || async { Ok(99) })
+            .await
+            .unwrap();
+        let b2: i32 = ctx2
+            .run("activity_b", b"k2", || async { Ok(99) })
+            .await
+            .unwrap();
+
+        assert_eq!(a2, 1, "activity_a should return cached value");
+        assert_eq!(b2, 2, "activity_b should return cached value");
+    }
+
+    #[tokio::test]
+    async fn run_same_name_different_args_execute_independently() {
+        let msg = Arc::new(MemoryMessageStorage::new());
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+        let ctx = test_ctx(msg.clone(), wf.clone());
+
+        // Same activity name but different key bytes (different arguments)
+        let a: i32 = ctx
+            .run("do_work", b"arg-1", || async { Ok(10) })
+            .await
+            .unwrap();
+        let b: i32 = ctx
+            .run("do_work", b"arg-2", || async { Ok(20) })
+            .await
+            .unwrap();
+
+        assert_eq!(a, 10);
+        assert_eq!(b, 20);
+
+        // Replay — each should return its own cached value
+        let ctx2 = test_ctx(msg.clone(), wf.clone());
+        let a2: i32 = ctx2
+            .run("do_work", b"arg-1", || async { Ok(99) })
+            .await
+            .unwrap();
+        let b2: i32 = ctx2
+            .run("do_work", b"arg-2", || async { Ok(99) })
+            .await
+            .unwrap();
+
+        assert_eq!(a2, 10, "arg-1 should return its cached value");
+        assert_eq!(b2, 20, "arg-2 should return its cached value");
+    }
+
+    #[tokio::test]
+    async fn run_without_storage_executes_directly() {
+        let ctx = test_ctx_no_storage();
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: i32 = ctx
+            .run("my_activity", b"key1", || async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_without_storage_always_re_executes() {
+        let ctx = test_ctx_no_storage();
+
+        let call_count = Arc::new(AtomicU32::new(0));
+
+        for _ in 0..3 {
+            let cc = call_count.clone();
+            let _: i32 = ctx
+                .run("my_activity", b"key1", || async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok(42)
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "without storage, every call should execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_caches_error_result() {
+        let msg = Arc::new(MemoryMessageStorage::new());
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
+
+        // First execution — fails
+        {
+            let ctx = test_ctx(msg.clone(), wf.clone());
+            let result: Result<i32, ClusterError> = ctx
+                .run("failing_activity", b"key1", || async {
+                    Err(ClusterError::PersistenceError {
+                        reason: "activity failed".into(),
+                        source: None,
+                    })
+                })
+                .await;
+            assert!(result.is_err());
+        }
+
+        // Replay — should return the cached failure
+        {
+            let ctx = test_ctx(msg.clone(), wf.clone());
+            let call_count = Arc::new(AtomicU32::new(0));
+            let cc = call_count.clone();
+
+            let result: Result<i32, ClusterError> = ctx
+                .run("failing_activity", b"key1", || async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok(99) // Would succeed if actually executed
+                })
+                .await;
+
+            assert!(result.is_err(), "should return cached failure");
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                0,
+                "closure should not have been called"
+            );
+        }
     }
 }

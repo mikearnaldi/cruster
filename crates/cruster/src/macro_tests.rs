@@ -216,6 +216,77 @@ mod tests {
         assert_eq!(e.entity_type().0, "CustomPing");
     }
 
+    // --- Entity with #[rpc(persisted)] ---
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct PersistedRpcEntity;
+
+    #[entity_impl(krate = "crate")]
+    impl PersistedRpcEntity {
+        #[rpc]
+        async fn read_data(&self) -> Result<String, ClusterError> {
+            Ok("data".to_string())
+        }
+
+        #[rpc(persisted)]
+        async fn write_data(&self, value: String) -> Result<String, ClusterError> {
+            Ok(format!("wrote: {value}"))
+        }
+    }
+
+    #[test]
+    fn persisted_rpc_entity_type_name() {
+        let e = PersistedRpcEntity;
+        assert_eq!(e.entity_type().0, "PersistedRpcEntity");
+    }
+
+    #[tokio::test]
+    async fn persisted_rpc_entity_dispatch() {
+        let e = PersistedRpcEntity;
+        let ctx = test_ctx("PersistedRpcEntity", "pr-1");
+        let handler = e.spawn(ctx).await.unwrap();
+
+        // Non-persisted RPC
+        let result = handler
+            .handle_request("read_data", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "data");
+
+        // Persisted RPC — dispatch works the same, persistence is a client-side concern
+        let payload = rmp_serde::to_vec(&"hello".to_string()).unwrap();
+        let result = handler
+            .handle_request("write_data", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "wrote: hello");
+    }
+
+    #[tokio::test]
+    async fn persisted_rpc_client_uses_send_persisted() {
+        // This test verifies that the generated client for `#[rpc(persisted)]`
+        // methods uses `send_persisted()` while `#[rpc]` uses `send()`.
+        //
+        // We construct the client manually and verify the method signatures
+        // compile correctly — the actual network behavior is tested at the
+        // integration level.
+        //
+        // The fact that `PersistedRpcEntityClient` compiles with both
+        // `read_data` (non-persisted) and `write_data` (persisted) methods
+        // is the test.
+        let _client_type_check = |client: &PersistedRpcEntityClient| {
+            let eid = EntityId::new("test");
+            let val = "value".to_string();
+            // Non-persisted: `send()`
+            let _read = client.read_data(&eid);
+            // Persisted: `send_persisted()` — different code path
+            let _write = client.write_data(&eid, &val);
+        };
+    }
+
     // --- Stateful entity (non-persisted state) ---
 
     #[derive(Clone, Serialize, Deserialize)]

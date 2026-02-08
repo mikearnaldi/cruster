@@ -272,27 +272,32 @@ pub fn state(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
-/// Marks an async method as an RPC handler (read-only operations).
+/// Marks an async method as an RPC handler.
 ///
-/// Use `#[rpc]` for methods that **do not modify state**. These are simple
-/// request/response handlers for queries and reads.
+/// Use `#[rpc]` for request/response handlers. By default, RPCs use best-effort
+/// delivery. Use `#[rpc(persisted)]` for at-least-once delivery via `MessageStorage`
+/// deduplication.
 ///
-/// For methods that modify state, use `#[workflow]` instead.
+/// # Variants
+///
+/// | Variant | Delivery | Idempotency | Use case |
+/// |---|---|---|---|
+/// | `#[rpc]` | Best-effort | None | Reads, queries |
+/// | `#[rpc(persisted)]` | At-least-once | Via `MessageStorage` dedup | Writes, mutations |
 ///
 /// # Usage
 ///
 /// ```text
 /// #[entity_impl]
-/// #[state(MyState)]
 /// impl MyEntity {
 ///     #[rpc]
 ///     async fn get_count(&self) -> Result<i32, ClusterError> {
-///         Ok(self.state().count)  // Read-only access
+///         Ok(42)
 ///     }
 ///
-///     #[rpc]
-///     async fn get_status(&self) -> Result<Status, ClusterError> {
-///         Ok(self.state().status.clone())
+///     #[rpc(persisted)]
+///     async fn update_count(&self, value: i32) -> Result<(), ClusterError> {
+///         Ok(())
 ///     }
 /// }
 /// ```
@@ -302,16 +307,12 @@ pub fn state(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// By default, `#[rpc]` methods are `#[public]` (externally callable).
 /// Combine with `#[protected]` or `#[private]` to restrict access.
 ///
-/// # When to Use
-///
-/// - **Use `#[rpc]`** for read-only queries that don't modify state
-/// - **Use `#[workflow]`** for any operation that calls `state_mut()`
-///
 /// # Generated Code
 ///
 /// For each `#[rpc]` method, the macro generates:
 /// - A dispatch arm in `handle_request` for the method tag
 /// - A typed client method with the same signature
+/// - For `#[rpc(persisted)]`, the client uses `send_persisted()` instead of `send()`
 #[proc_macro_attribute]
 pub fn rpc(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -908,6 +909,13 @@ impl RpcKind {
     }
 }
 
+impl RpcMethod {
+    /// Whether the client should use persisted delivery for this RPC.
+    fn uses_persisted_delivery(&self) -> bool {
+        self.kind.is_persisted() || self.rpc_persisted
+    }
+}
+
 impl RpcVisibility {
     fn is_public(&self) -> bool {
         matches!(self, RpcVisibility::Public)
@@ -930,6 +938,8 @@ struct RpcMethod {
     persist_key: Option<syn::ExprClosure>,
     /// Whether this RPC takes a `&DurableContext` parameter — enables workflow capabilities.
     has_durable_context: bool,
+    /// Whether this RPC uses persisted (at-least-once) delivery via `#[rpc(persisted)]`.
+    rpc_persisted: bool,
 }
 
 impl RpcMethod {
@@ -3332,7 +3342,7 @@ fn generate_client_methods(krate: &syn::Path, rpcs: &[RpcMethod]) -> Vec<proc_ma
                 .zip(param_types.iter())
                 .map(|(name, ty)| quote! { #name: &#ty })
                 .collect();
-            if rpc.kind.is_persisted() {
+            if rpc.uses_persisted_delivery() {
                 match (persist_key, param_count) {
                     (Some(persist_key), 0) => quote! {
                         pub async fn #method_name(
@@ -3602,7 +3612,7 @@ fn generate_trait_client_ext(
                 .map(|(name, ty)| quote! { #name: &#ty })
                 .collect();
 
-            if rpc.kind.is_persisted() {
+            if rpc.uses_persisted_delivery() {
                 match (persist_key, param_count) {
                     (Some(persist_key), 0) => quote! {
                         async fn #method_name(
@@ -3831,6 +3841,34 @@ fn parse_state_attr(attrs: &mut Vec<syn::Attribute>) -> syn::Result<Option<State
     Ok(state_attr)
 }
 
+struct RpcArgs {
+    persisted: bool,
+}
+
+impl syn::parse::Parse for RpcArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut args = RpcArgs { persisted: false };
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            match ident.to_string().as_str() {
+                "persisted" => {
+                    args.persisted = true;
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("unknown rpc attribute: {other}; expected `persisted`"),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+        Ok(args)
+    }
+}
+
 struct KeyArgs {
     key: Option<syn::ExprClosure>,
 }
@@ -3880,9 +3918,10 @@ impl syn::parse::Parse for KeyArgs {
 
 fn parse_kind_attr(
     attrs: &[syn::Attribute],
-) -> syn::Result<Option<(RpcKind, Option<syn::ExprClosure>)>> {
+) -> syn::Result<Option<(RpcKind, Option<syn::ExprClosure>, bool)>> {
     let mut kind: Option<RpcKind> = None;
     let mut key: Option<syn::ExprClosure> = None;
+    let mut rpc_persisted = false;
 
     for attr in attrs {
         if attr.path().is_ident("rpc") {
@@ -3893,10 +3932,15 @@ fn parse_kind_attr(
                 syn::Meta::Path(_) => {
                     kind = Some(RpcKind::Rpc);
                 }
+                syn::Meta::List(_) => {
+                    let args = attr.parse_args::<RpcArgs>()?;
+                    kind = Some(RpcKind::Rpc);
+                    rpc_persisted = args.persisted;
+                }
                 _ => {
                     return Err(syn::Error::new(
                         attr.span(),
-                        "#[rpc] does not take arguments",
+                        "expected #[rpc] or #[rpc(persisted)]",
                     ))
                 }
             }
@@ -3960,7 +4004,7 @@ fn parse_kind_attr(
         }
     }
 
-    Ok(kind.map(|kind| (kind, key)))
+    Ok(kind.map(|kind| (kind, key, rpc_persisted)))
 }
 
 fn parse_visibility_attr(attrs: &[syn::Attribute]) -> syn::Result<Option<RpcVisibility>> {
@@ -4007,7 +4051,7 @@ fn parse_rpc_method(method: &syn::ImplItemFn) -> syn::Result<Option<RpcMethod>> 
     let kind_info = parse_kind_attr(&method.attrs)?;
     let visibility_attr = parse_visibility_attr(&method.attrs)?;
 
-    let (kind, persist_key) = match kind_info {
+    let (kind, persist_key, rpc_persisted) = match kind_info {
         Some(info) => info,
         None => {
             if visibility_attr.is_some() {
@@ -4032,6 +4076,14 @@ fn parse_rpc_method(method: &syn::ImplItemFn) -> syn::Result<Option<RpcMethod>> 
         return Err(syn::Error::new(
             method.sig.span(),
             "#[rpc] and #[method] do not support key(...) — use #[workflow(key(...))] or #[activity(key(...))]",
+        ));
+    }
+
+    // #[rpc(persisted)] cannot be combined with #[method] or other kinds
+    if rpc_persisted && !matches!(kind, RpcKind::Rpc) {
+        return Err(syn::Error::new(
+            method.sig.span(),
+            "persisted flag is only valid on #[rpc(persisted)]",
         ));
     }
 
@@ -4155,6 +4207,7 @@ fn parse_rpc_method(method: &syn::ImplItemFn) -> syn::Result<Option<RpcMethod>> 
         visibility,
         persist_key,
         has_durable_context,
+        rpc_persisted,
     }))
 }
 

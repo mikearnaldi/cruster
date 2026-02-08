@@ -561,7 +561,7 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
    - Emit compile error if `&mut self` found on any entity method
    - Remove `WorkflowScope`, `DurableContext`, `ActivityScope` wiring from entity codegen
 
-3. **Add `#[rpc(persisted)]` variant**
+3. **Add `#[rpc(persisted)]` variant** ✅
    - Parse `persisted` flag on `#[rpc]` attribute
    - Persisted RPCs use `send_persisted()` on the client (existing infrastructure)
    - Non-persisted RPCs use `send()` (existing infrastructure)

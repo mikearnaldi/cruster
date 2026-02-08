@@ -53,6 +53,8 @@ pub struct AppState {
     pub shards_per_group: i32,
     /// List of registered entity types.
     pub registered_entity_types: Vec<String>,
+    /// Database pool for debug queries.
+    pub pool: sqlx::PgPool,
 }
 
 /// Health check response.
@@ -126,6 +128,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Debug routes
         .route("/debug/shards", get(debug_shards))
         .route("/debug/entities", get(debug_entities))
+        .route("/debug/messages", get(debug_messages))
+        .route("/debug/replies", get(debug_replies))
+        .route("/debug/journal", get(debug_journal))
         .with_state(state)
 }
 
@@ -911,6 +916,245 @@ async fn debug_entities(State(state): State<Arc<AppState>>) -> Json<EntityInfo> 
         entity_types: state.registered_entity_types.clone(),
         active_count: state.sharding.active_entity_count(),
     })
+}
+
+// ============================================================================
+// Debug DB query handlers
+// ============================================================================
+
+/// Query parameters for debug message queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugMessageQuery {
+    /// Filter by entity type.
+    pub entity_type: Option<String>,
+    /// Filter by entity ID.
+    pub entity_id: Option<String>,
+    /// Filter by processed status.
+    pub processed: Option<bool>,
+    /// Filter by tag (message method name).
+    pub tag: Option<String>,
+    /// Maximum number of results (default 100).
+    pub limit: Option<i64>,
+}
+
+/// A message record from the database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugMessageRecord {
+    /// Message request ID.
+    pub request_id: i64,
+    /// Shard group.
+    pub shard_group: String,
+    /// Shard ID.
+    pub shard_id: i32,
+    /// Entity type.
+    pub entity_type: String,
+    /// Entity ID.
+    pub entity_id: String,
+    /// Message tag/method name.
+    pub tag: String,
+    /// Whether this is a request (vs fire-and-forget).
+    pub is_request: bool,
+    /// Whether the message has been processed.
+    pub processed: bool,
+    /// Number of delivery retries.
+    pub retry_count: i32,
+    /// Creation timestamp.
+    pub created_at: String,
+}
+
+/// Query messages from the database.
+async fn debug_messages(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DebugMessageQuery>,
+) -> Result<Json<Vec<DebugMessageRecord>>, AppError> {
+    let limit = params.limit.unwrap_or(100);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT request_id, shard_group, shard_id, entity_type, entity_id,
+               tag, is_request, processed, retry_count, created_at
+        FROM cluster_messages
+        WHERE ($1::text IS NULL OR entity_type = $1)
+          AND ($2::text IS NULL OR entity_id = $2)
+          AND ($3::boolean IS NULL OR processed = $3)
+          AND ($4::text IS NULL OR tag = $4)
+        ORDER BY created_at DESC
+        LIMIT $5
+        "#,
+    )
+    .bind(&params.entity_type)
+    .bind(&params.entity_id)
+    .bind(params.processed)
+    .bind(&params.tag)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("debug messages query failed: {e}"))?;
+
+    let records: Vec<DebugMessageRecord> = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            DebugMessageRecord {
+                request_id: row.get("request_id"),
+                shard_group: row.get("shard_group"),
+                shard_id: row.get("shard_id"),
+                entity_type: row.get("entity_type"),
+                entity_id: row.get("entity_id"),
+                tag: row.get("tag"),
+                is_request: row.get("is_request"),
+                processed: row.get("processed"),
+                retry_count: row.get("retry_count"),
+                created_at: created_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
+}
+
+/// Query parameters for debug reply queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugReplyQuery {
+    /// Filter by request ID.
+    pub request_id: Option<i64>,
+    /// Filter by exit status only.
+    pub is_exit: Option<bool>,
+    /// Maximum number of results (default 100).
+    pub limit: Option<i64>,
+}
+
+/// A reply record from the database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugReplyRecord {
+    /// Reply ID.
+    pub id: i64,
+    /// Associated request ID.
+    pub request_id: i64,
+    /// Reply sequence number.
+    pub sequence: i32,
+    /// Whether this is a final exit reply.
+    pub is_exit: bool,
+    /// Creation timestamp.
+    pub created_at: String,
+}
+
+/// Query replies from the database.
+async fn debug_replies(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DebugReplyQuery>,
+) -> Result<Json<Vec<DebugReplyRecord>>, AppError> {
+    let limit = params.limit.unwrap_or(100);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, request_id, sequence, is_exit, created_at
+        FROM cluster_replies
+        WHERE ($1::bigint IS NULL OR request_id = $1)
+          AND ($2::boolean IS NULL OR is_exit = $2)
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(params.request_id)
+    .bind(params.is_exit)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("debug replies query failed: {e}"))?;
+
+    let records: Vec<DebugReplyRecord> = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            DebugReplyRecord {
+                id: row.get("id"),
+                request_id: row.get("request_id"),
+                sequence: row.get("sequence"),
+                is_exit: row.get("is_exit"),
+                created_at: created_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
+}
+
+/// Query parameters for debug workflow journal queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugJournalQuery {
+    /// Filter by key prefix.
+    pub prefix: Option<String>,
+    /// Filter to only completed entries.
+    pub completed: Option<bool>,
+    /// Maximum number of results (default 100).
+    pub limit: Option<i64>,
+}
+
+/// A workflow journal record from the database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugJournalRecord {
+    /// Journal key.
+    pub key: String,
+    /// Size of the stored value in bytes.
+    pub value_size: i32,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last update timestamp.
+    pub updated_at: String,
+    /// Completion timestamp (null if not completed).
+    pub completed_at: Option<String>,
+}
+
+/// Query workflow journal entries from the database.
+async fn debug_journal(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DebugJournalQuery>,
+) -> Result<Json<Vec<DebugJournalRecord>>, AppError> {
+    let limit = params.limit.unwrap_or(100);
+    let prefix_pattern = params
+        .prefix
+        .as_ref()
+        .map(|p| format!("{}%", p))
+        .unwrap_or_else(|| "%".to_string());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT key, octet_length(value) as value_size, created_at, updated_at, completed_at
+        FROM cluster_workflow_journal
+        WHERE key LIKE $1
+          AND ($2::boolean IS NULL OR ($2 = TRUE AND completed_at IS NOT NULL) OR ($2 = FALSE AND completed_at IS NULL))
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(&prefix_pattern)
+    .bind(params.completed)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("debug journal query failed: {e}"))?;
+
+    let records: Vec<DebugJournalRecord> = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
+            let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
+            DebugJournalRecord {
+                key: row.get("key"),
+                value_size: row.get("value_size"),
+                created_at: created_at.to_rfc3339(),
+                updated_at: updated_at.to_rfc3339(),
+                completed_at: completed_at.map(|t| t.to_rfc3339()),
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
 }
 
 /// Application error type.

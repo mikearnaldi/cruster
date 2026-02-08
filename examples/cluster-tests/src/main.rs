@@ -320,6 +320,7 @@ async fn main() -> Result<()> {
             "SqlActivityTest".to_string(),
             "SingletonTest (singleton)".to_string(),
         ],
+        pool: cluster.pool(),
     });
 
     // Create HTTP router

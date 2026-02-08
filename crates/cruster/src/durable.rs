@@ -34,6 +34,7 @@ pub const INTERRUPT_SIGNAL: &str = "Workflow/InterruptSignal";
 
 tokio::task_local! {
     static WORKFLOW_REQUEST_ID: i64;
+    static WORKFLOW_JOURNAL_KEYS: std::cell::RefCell<Vec<String>>;
 }
 
 /// Scope that carries the current workflow execution's request ID.
@@ -44,17 +45,41 @@ pub struct WorkflowScope;
 
 impl WorkflowScope {
     /// Execute `f` with the given workflow request ID in scope.
-    pub async fn run<F, Fut, T>(request_id: i64, f: F) -> T
+    ///
+    /// Also sets up a journal key collector so that activity journal keys
+    /// written during this workflow execution can be marked as completed
+    /// when the workflow finishes. Returns `(result, journal_keys)`.
+    pub async fn run<F, Fut, T>(request_id: i64, f: F) -> (T, Vec<String>)
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        WORKFLOW_REQUEST_ID.scope(request_id, f()).await
+        WORKFLOW_REQUEST_ID
+            .scope(
+                request_id,
+                WORKFLOW_JOURNAL_KEYS.scope(std::cell::RefCell::new(Vec::new()), async {
+                    let result = f().await;
+                    let keys = WORKFLOW_JOURNAL_KEYS
+                        .with(|keys| keys.borrow_mut().drain(..).collect());
+                    (result, keys)
+                }),
+            )
+            .await
     }
 
     /// Get the current workflow request ID, if inside a `WorkflowScope`.
     pub fn current() -> Option<i64> {
         WORKFLOW_REQUEST_ID.try_with(|id| *id).ok()
+    }
+
+    /// Register a journal key written during this workflow execution.
+    ///
+    /// Called by `DurableContext` when a journal entry is written so that
+    /// all keys can be marked as completed when the workflow finishes.
+    pub fn register_journal_key(key: String) {
+        let _ = WORKFLOW_JOURNAL_KEYS.try_with(|keys| {
+            keys.borrow_mut().push(key);
+        });
     }
 }
 
@@ -539,6 +564,8 @@ impl DurableContext {
                         &self.entity_id,
                     );
                     if let Some(bytes) = wf_storage.load(&storage_key).await? {
+                        // Register key for completion even on replay hits
+                        WorkflowScope::register_journal_key(storage_key);
                         let result: T = Self::deserialize_journal_result(&bytes)?;
                         return Ok(Some(result));
                     }
@@ -673,6 +700,9 @@ impl DurableContext {
         let storage_key =
             Self::journal_storage_key(name, key_bytes, &self.entity_type, &self.entity_id);
         let journal_bytes = Self::serialize_journal_result(&result)?;
+
+        // Register this journal key so it can be marked completed when the workflow finishes
+        WorkflowScope::register_journal_key(storage_key.clone());
 
         if crate::state_guard::ActivityScope::is_active() {
             // Inside an ActivityScope — buffer into the same transaction

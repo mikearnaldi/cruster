@@ -58,6 +58,20 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    if [[ "$1" == *"$2"* ]]; then
+        echo "FAIL: expected '$1' to NOT contain '$2'"
+        exit 1
+    fi
+}
+
+assert_ge() {
+    if [ "$1" -lt "$2" ] 2>/dev/null; then
+        echo "FAIL: expected $1 >= $2"
+        exit 1
+    fi
+}
+
 # Test lifecycle
 test_start() { echo "=== $1 ==="; }
 test_pass() { echo "PASS: $1"; }

@@ -3221,61 +3221,94 @@ fn generate_dispatch_arms(
             // activity journal keys are scoped per workflow execution.
             let is_workflow = matches!(rpc.kind, RpcKind::Workflow);
 
+            // After a workflow completes successfully, mark all journal entries
+            // as completed so they become eligible for TTL-based cleanup.
+            let mark_journal_completed_code = quote! {
+                if let ::std::option::Option::Some(ref __wf_storage) = self.__state_storage {
+                    for __key in &__journal_keys {
+                        let _ = __wf_storage.mark_completed(__key).await;
+                    }
+                }
+            };
+
             if stateful {
                 // Call method directly on self - method uses state() or state_mut() internally
                 let method_call = quote! { self.#method_name(#call_args).await };
-                let wrapped_call = if is_workflow {
+                if is_workflow {
                     quote! {
-                        let __request_id = headers
-                            .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        #krate::__internal::WorkflowScope::run(__request_id, || async {
-                            #method_call
-                        }).await?
+                        #tag => {
+                            #deserialize_request
+                            #durable_ctx_code
+                            let __request_id = headers
+                                .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .unwrap_or(0);
+                            let (__wf_result, __journal_keys) = #krate::__internal::WorkflowScope::run(__request_id, || async {
+                                #method_call
+                            }).await;
+                            let response = __wf_result?;
+                            #post_call_save
+                            #mark_journal_completed_code
+                            rmp_serde::to_vec(&response)
+                                .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                    reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })
+                        }
                     }
                 } else {
-                    quote! { #method_call? }
-                };
-                quote! {
-                    #tag => {
-                        #deserialize_request
-                        #durable_ctx_code
-                        let response = { #wrapped_call };
-                        #post_call_save
-                        rmp_serde::to_vec(&response)
-                            .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                                reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
-                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                            })
+                    let wrapped_call = quote! { #method_call? };
+                    quote! {
+                        #tag => {
+                            #deserialize_request
+                            #durable_ctx_code
+                            let response = { #wrapped_call };
+                            #post_call_save
+                            rmp_serde::to_vec(&response)
+                                .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                    reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })
+                        }
                     }
                 }
             } else {
                 // Stateless — call directly on entity
                 let method_call = quote! { self.entity.#method_name(#call_args).await };
-                let wrapped_call = if is_workflow {
+                if is_workflow {
                     quote! {
-                        let __request_id = headers
-                            .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        #krate::__internal::WorkflowScope::run(__request_id, || async {
-                            #method_call
-                        }).await?
+                        #tag => {
+                            #deserialize_request
+                            #durable_ctx_code
+                            let __request_id = headers
+                                .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .unwrap_or(0);
+                            let (__wf_result, __journal_keys) = #krate::__internal::WorkflowScope::run(__request_id, || async {
+                                #method_call
+                            }).await;
+                            let response = __wf_result?;
+                            #mark_journal_completed_code
+                            rmp_serde::to_vec(&response)
+                                .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                    reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })
+                        }
                     }
                 } else {
-                    quote! { #method_call? }
-                };
-                quote! {
-                    #tag => {
-                        #deserialize_request
-                        #durable_ctx_code
-                        let response = { #wrapped_call };
-                        rmp_serde::to_vec(&response)
-                            .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                                reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
-                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                            })
+                    let wrapped_call = quote! { #method_call? };
+                    quote! {
+                        #tag => {
+                            #deserialize_request
+                            #durable_ctx_code
+                            let response = { #wrapped_call };
+                            rmp_serde::to_vec(&response)
+                                .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                    reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })
+                        }
                     }
                 }
             }

@@ -60,6 +60,9 @@ echo ""
 "$SCRIPT_DIR/test_sql_activity.sh"
 echo ""
 
+"$SCRIPT_DIR/test_db_persistence.sh"
+echo ""
+
 "$SCRIPT_DIR/test_shard_topology.sh"
 echo ""
 

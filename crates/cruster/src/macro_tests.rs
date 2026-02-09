@@ -4319,4 +4319,241 @@ mod tests {
         // Entity type should be the original struct name
         assert_eq!(entity_with_groups.entity_type().0, "RpcGroupEntity");
     }
+
+    // =============================================================================
+    // Workflow key extraction tests (#[workflow_impl(key = |req| ..., hash = ...)])
+    // =============================================================================
+
+    // --- Workflow with custom key extraction (hashed, default) ---
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct KeyedOrderRequest {
+        order_id: String,
+        amount: i32,
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct KeyedWorkflow;
+
+    #[workflow_impl(krate = "crate", key = |req: &KeyedOrderRequest| req.order_id.clone())]
+    impl KeyedWorkflow {
+        async fn execute(
+            &self,
+            request: KeyedOrderRequest,
+        ) -> Result<String, ClusterError> {
+            Ok(format!("{}:{}", request.order_id, request.amount))
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_key_extracts_custom_field_hashed() {
+        // Verify that two requests with the same order_id but different amount
+        // produce the same entity_id (because key only uses order_id)
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = KeyedWorkflowClient::new(Arc::clone(&sharding));
+
+        let req1 = KeyedOrderRequest {
+            order_id: "order-42".to_string(),
+            amount: 100,
+        };
+        let req2 = KeyedOrderRequest {
+            order_id: "order-42".to_string(),
+            amount: 200,
+        };
+
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        // Both should target the same entity_id since key only uses order_id
+        assert_eq!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same order_id should produce same entity_id"
+        );
+        // The entity_id should be the SHA-256 hash of the serialized order_id
+        let expected_id = crate::hash::sha256_hex(
+            &rmp_serde::to_vec(&"order-42".to_string()).unwrap(),
+        );
+        assert_eq!(
+            captured[0].address.entity_id.0, expected_id,
+            "entity_id should be SHA-256 of serialized key value"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_key_different_keys_different_entity_ids() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = KeyedWorkflowClient::new(Arc::clone(&sharding));
+
+        let req1 = KeyedOrderRequest {
+            order_id: "order-1".to_string(),
+            amount: 100,
+        };
+        let req2 = KeyedOrderRequest {
+            order_id: "order-2".to_string(),
+            amount: 100,
+        };
+
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_ne!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "different order_ids should produce different entity_ids"
+        );
+    }
+
+    // --- Workflow with custom key, hash = false ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct RawKeyWorkflow;
+
+    #[workflow_impl(krate = "crate", key = |req: &KeyedOrderRequest| req.order_id.clone(), hash = false)]
+    impl RawKeyWorkflow {
+        async fn execute(
+            &self,
+            request: KeyedOrderRequest,
+        ) -> Result<String, ClusterError> {
+            Ok(format!("raw:{}:{}", request.order_id, request.amount))
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_key_raw_uses_value_directly() {
+        // With hash = false, the key closure result is used directly as entity_id
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "my-raw-key-123".to_string(),
+            amount: 50,
+        };
+
+        let _: String = client.execute(&req).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        // Entity ID should be the raw order_id, no hashing
+        assert_eq!(
+            captured[0].address.entity_id.0, "my-raw-key-123",
+            "raw key should be used directly as entity_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_key_raw_same_key_same_entity_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req1 = KeyedOrderRequest {
+            order_id: "same-id".to_string(),
+            amount: 1,
+        };
+        let req2 = KeyedOrderRequest {
+            order_id: "same-id".to_string(),
+            amount: 9999,
+        };
+
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same order_id with raw key should produce same entity_id"
+        );
+        assert_eq!(captured[0].address.entity_id.0, "same-id");
+    }
+
+    // --- Workflow key with start() ---
+
+    #[tokio::test]
+    async fn workflow_key_raw_start_returns_raw_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "start-raw-key".to_string(),
+            amount: 0,
+        };
+
+        let exec_id = client.start(&req).await.unwrap();
+        // start() returns the entity_id which should be the raw key
+        assert_eq!(exec_id, "start-raw-key");
+    }
+
+    #[tokio::test]
+    async fn workflow_key_hashed_start_returns_hashed_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = KeyedWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "order-hashed".to_string(),
+            amount: 0,
+        };
+
+        let exec_id = client.start(&req).await.unwrap();
+        // start() returns the entity_id which should be hashed
+        let expected_id = crate::hash::sha256_hex(
+            &rmp_serde::to_vec(&"order-hashed".to_string()).unwrap(),
+        );
+        assert_eq!(exec_id, expected_id);
+    }
+
+    // --- Verify with_key still overrides custom key extraction ---
+
+    #[tokio::test]
+    async fn workflow_with_key_overrides_custom_key() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "should-be-ignored".to_string(),
+            amount: 0,
+        };
+
+        // with_key_raw overrides the key extraction from the closure
+        let _: String = client.with_key_raw("override-key").execute(&req).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].address.entity_id.0, "override-key",
+            "with_key_raw should override the custom key extraction"
+        );
+    }
 }

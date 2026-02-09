@@ -217,13 +217,13 @@ Workflows are a standalone top-level construct, **stateless by design**, separat
 ```rust
 use cruster::prelude::*;
 
-#[workflow(key = |req| req.order_id.clone(), hash = false)]
+#[workflow]
 #[derive(Clone)]
 pub struct ProcessOrder {
     http: HttpClient,
 }
 
-#[workflow_impl]
+#[workflow_impl(key = |req: &OrderRequest| req.order_id.clone(), hash = false)]
 impl ProcessOrder {
     /// The single entry point.
     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
@@ -274,18 +274,22 @@ impl ProcessOrder {
 }
 ```
 
-### Workflow Attributes
+### Workflow Key Configuration
+
+The `key` and `hash` attributes are specified on `#[workflow_impl]` (where the client is generated), not on the struct-level `#[workflow]`:
 
 ```rust
-#[workflow]                                            // default: key = hash(serialize(request))
-#[workflow(key = |req| req.order_id.clone())]          // custom key, hashed (SHA-256)
-#[workflow(key = |req| req.order_id.clone(), hash = false)]  // custom key, used as-is
+#[workflow_impl]                                                          // default: key = hash(serialize(request))
+#[workflow_impl(key = |req: &OrderRequest| req.order_id.clone())]         // custom key, hashed (SHA-256)
+#[workflow_impl(key = |req: &OrderRequest| req.order_id.clone(), hash = false)]  // custom key, used as-is
 ```
+
+> **Note:** The `key`/`hash` are on `#[workflow_impl]` because proc macros cannot share data between separate attribute macro invocations (`#[workflow]` on the struct and `#[workflow_impl]` on the impl block).
 
 | Attribute | Type | Default | Description |
 |---|---|---|---|
-| `key` | closure | `\|req\| req` (whole request) | Extracts value used to derive idempotency key |
-| `hash` | bool | `true` | Whether to SHA-256 hash the key. When true, serializes the extracted value and hashes it. When false, uses the extracted value directly (must be `String` or `ToString`). |
+| `key` | closure | `\|req\| req` (whole request) | Extracts value used to derive idempotency key. Takes `&RequestType` as input. |
+| `hash` | bool | `true` | Whether to SHA-256 hash the key. When true, serializes the extracted value and hashes it. When false, uses the extracted value directly (must implement `ToString`). |
 
 ### Activity Attributes
 
@@ -546,7 +550,7 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 
 ### Current Status
 
-- **Phase 3 & 4 (Workflow macros + Client):** ✅ Done — `#[workflow]` / `#[workflow_impl]` macros exist and delegate to shared codegen. Tests for the new names added.
+- **Phase 3 & 4 (Workflow macros + Client):** ✅ Done — `#[workflow]` / `#[workflow_impl]` macros exist and delegate to shared codegen. Tests for the new names added. Custom key extraction via `#[workflow_impl(key = |req| ..., hash = false)]` implemented and tested — `derive_entity_id` uses the key closure when provided, with configurable hashing (SHA-256 by default, raw when `hash = false`).
 - **Phase 5 (Activity groups):** ✅ Done — `#[activity_group]` / `#[activity_group_impl]` macros implemented with composition into workflows via `activity_groups(...)`.
 - **Phase 6 (Activity retry support):** ✅ Done — `#[activity(retries = N, backoff = "...")]` implemented for both standalone workflow activities and activity group activities. Retry loop uses attempt-indexed journal keys for independent journaling per retry. Durable sleep between retries via `WorkflowEngine::sleep()`. Backoff strategies: exponential (default, capped at 60s) and constant. `compute_retry_backoff()` utility added. Tests cover: retries with success, constant backoff, retry exhaustion, activity groups with retries, and backoff computation.
 - **Phase 7 (Poll and execution lifecycle):** ✅ Done — `poll` method added to generated workflow client and `ClientWithKey`. `Sharding` trait extended with `replies_for(request_id)` (default returns empty, `ShardingImpl` delegates to `MessageStorage`). `EntityClient::poll_reply` computes deterministic request_id and queries storage. Workflow `execute`/`start`/`ClientWithKey` methods now use entity_id-based key_bytes for consistent request_id derivation, enabling poll without original request payload. Tests: poll returns None for unknown, poll returns result after execute, poll with key, compile-time method existence.

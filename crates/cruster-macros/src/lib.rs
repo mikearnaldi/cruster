@@ -6600,6 +6600,10 @@ impl syn::parse::Parse for WorkflowStructArgs {
 struct WorkflowImplArgs {
     krate: Option<syn::Path>,
     activity_groups: Vec<syn::Path>,
+    /// Optional key extraction closure, e.g. `key = |req| req.order_id.clone()`.
+    key: Option<syn::ExprClosure>,
+    /// Whether to SHA-256 hash the key. Default `true`.
+    hash: bool,
 }
 
 impl syn::parse::Parse for WorkflowImplArgs {
@@ -6607,6 +6611,8 @@ impl syn::parse::Parse for WorkflowImplArgs {
         let mut args = WorkflowImplArgs {
             krate: None,
             activity_groups: Vec::new(),
+            key: None,
+            hash: true,
         };
         while !input.is_empty() {
             let ident: syn::Ident = input.parse()?;
@@ -6626,6 +6632,30 @@ impl syn::parse::Parse for WorkflowImplArgs {
                             content.parse::<syn::Token![,]>()?;
                         }
                     }
+                }
+                "key" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let expr: syn::Expr = if input.peek(syn::token::Paren) {
+                        let content;
+                        syn::parenthesized!(content in input);
+                        content.parse()?
+                    } else {
+                        input.parse()?
+                    };
+                    match expr {
+                        syn::Expr::Closure(closure) => args.key = Some(closure),
+                        _ => {
+                            return Err(syn::Error::new(
+                                expr.span(),
+                                "key must be a closure, e.g. #[workflow_impl(key = |req| ...)]",
+                            ))
+                        }
+                    }
+                }
+                "hash" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let lit: syn::LitBool = input.parse()?;
+                    args.hash = lit.value;
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -7857,6 +7887,58 @@ fn workflow_impl_inner(
     // --- Generate Client ---
     let struct_name_str = entity_name;
     let client_with_key_name = format_ident!("{}ClientWithKey", struct_name);
+
+    // Generate derive_entity_id based on key/hash configuration
+    let derive_entity_id_fn = if let Some(ref key_closure) = args.key {
+        if args.hash {
+            // Custom key, hashed: extract key via closure, serialize, SHA-256
+            quote! {
+                fn derive_entity_id(
+                    request: &#request_type,
+                ) -> ::std::result::Result<#krate::types::EntityId, #krate::error::ClusterError> {
+                    let key_value = (#key_closure)(request);
+                    let key_bytes = rmp_serde::to_vec(&key_value)
+                        .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                            reason: ::std::format!("failed to serialize workflow key: {e}"),
+                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                        })?;
+                    ::std::result::Result::Ok(#krate::types::EntityId::new(
+                        #krate::hash::sha256_hex(&key_bytes)
+                    ))
+                }
+            }
+        } else {
+            // Custom key, no hash: extract key via closure, use ToString directly
+            quote! {
+                fn derive_entity_id(
+                    request: &#request_type,
+                ) -> ::std::result::Result<#krate::types::EntityId, #krate::error::ClusterError> {
+                    let key_value = (#key_closure)(request);
+                    ::std::result::Result::Ok(#krate::types::EntityId::new(
+                        key_value.to_string()
+                    ))
+                }
+            }
+        }
+    } else {
+        // Default: serialize entire request and SHA-256 hash
+        quote! {
+            /// Derive the entity ID from a request (SHA-256 hash of serialized request).
+            fn derive_entity_id(
+                request: &#request_type,
+            ) -> ::std::result::Result<#krate::types::EntityId, #krate::error::ClusterError> {
+                let key_bytes = rmp_serde::to_vec(request)
+                    .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                        reason: ::std::format!("failed to serialize workflow request: {e}"),
+                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                    })?;
+                ::std::result::Result::Ok(#krate::types::EntityId::new(
+                    #krate::hash::sha256_hex(&key_bytes)
+                ))
+            }
+        }
+    };
+
     let client_impl = quote! {
         /// Generated typed client for the standalone workflow.
         pub struct #client_name {
@@ -7905,19 +7987,7 @@ fn workflow_impl_inner(
                 }
             }
 
-            /// Derive the entity ID from a request (SHA-256 hash of serialized request).
-            fn derive_entity_id(
-                request: &#request_type,
-            ) -> ::std::result::Result<#krate::types::EntityId, #krate::error::ClusterError> {
-                let key_bytes = rmp_serde::to_vec(request)
-                    .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                        reason: ::std::format!("failed to serialize workflow request: {e}"),
-                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                    })?;
-                ::std::result::Result::Ok(#krate::types::EntityId::new(
-                    #krate::hash::sha256_hex(&key_bytes)
-                ))
-            }
+            #derive_entity_id_fn
 
             /// Execute the workflow and wait for completion.
             ///

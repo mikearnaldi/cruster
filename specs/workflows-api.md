@@ -222,7 +222,7 @@ Workflows are a standalone top-level construct, **stateless by design**, separat
 - **`&self` everywhere** — both `execute` and activities take `&self`. Activities are side-effecting but stateless.
 - **Durable primitives on `self`** — sleep, deferred, execution metadata are all accessible via `self` (no separate `WorkflowContext` parameter).
 - **Cross-workflow calls go through clients** — workflows call other workflows via generated clients, never inline. This prevents nesting.
-- **Activities run in DB transactions** — arbitrary SQL is safe inside activities; the journal entry commits in the same transaction.
+- **Activities run in DB transactions automatically** — the framework provides the DB connection via `self.db()` inside activities; the journal entry commits in the same transaction. Workflows should **not** carry a `PgPool` field for activity SQL.
 
 ### Workflow Definition
 
@@ -275,11 +275,10 @@ impl ProcessOrder {
 
     #[activity]
     async fn confirm_shipment(&self, reservation_id: String) -> Result<(), ClusterError> {
-        // SQL within the activity transaction
-        let tx = self.transaction();
+        // self.db() returns the activity's DB transaction — atomic with journal entry
         sqlx::query("UPDATE shipments SET status = 'confirmed' WHERE reservation_id = $1")
             .bind(&reservation_id)
-            .execute(&mut *tx)
+            .execute(self.db())
             .await?;
         Ok(())
     }
@@ -398,10 +397,12 @@ The macro generates a view struct that provides durable primitives and struct fi
 
 | Method | Signature | Description |
 |---|---|---|
-| `transaction` | `fn transaction(&self) -> SqlTransactionHandle` | Access the current activity's DB transaction for arbitrary SQL. Only available with `sql` feature. |
-| Struct fields | via `Deref` | `self.http`, etc. |
+| `db` | `fn db(&self) -> &mut PgConnection` | The activity's DB transaction. All SQL executed through this handle commits atomically with the journal entry. This is the **only** way to do DB writes in activities — workflows should not carry a `PgPool` field. |
+| Struct fields | via `Deref` | `self.http`, etc. (non-DB fields only) |
 
 Activities do **not** have access to `sleep`, `await_deferred`, or other durable primitives. Those are orchestration concerns that belong in `execute`.
+
+> **Important:** Workflows should **not** carry a `PgPool` field. Using `self.pool` in an activity bypasses the framework transaction — SQL commits independently of the journal entry, breaking atomicity on replay. Use `self.db()` instead, which is automatically provided by the framework.
 
 ### Workflow Registration (Type-Safe)
 
@@ -519,7 +520,7 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 | **Backed by** | Entity directly | Hidden entity (`Workflow/{Name}`) | Composed into entity | Composed into workflow |
 | **Registration** | `instance.register(sharding)` | `instance.register(sharding)` | Struct field on parent entity | Struct field on parent workflow |
 | **Client** | `T::client(&cluster)` or from `register` | `T::client(&cluster)` or from `register` | Methods on parent entity's client | Called via `self` in workflow body |
-| **DB transactions** | No (use DB directly in RPCs) | Yes, inside `#[activity]` via `self.transaction()` | No | Yes, via `self.transaction()` |
+| **DB transactions** | No (use DB directly in RPCs) | Yes, inside `#[activity]` via `self.db()` | No | Yes, via `self.db()` |
 | **Durable primitives** | No | Yes, in `execute` (`sleep`, `await_deferred`, etc.) | No | No |
 
 ---
@@ -587,13 +588,11 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 - **Phase 9 (integration test migration, TimerTest):** ✅ Done — TimerTest entity migrated from old stateful API (`#[state(TimerTestState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC entity (`TimerTest` with `pool: PgPool` for reads/mutations: `get_timer_fires`, `get_pending_timers` as `#[rpc]`, `cancel_timer`, `clear_fires` as `#[rpc(persisted)]`) + standalone workflow (`ScheduleTimerWorkflow`) using `#[workflow]`/`#[workflow_impl]` with activities that write to PG `timer_test_pending` and `timer_test_fires` tables. Durable `self.sleep()` for timer delay. HTTP routes updated: schedule uses standalone workflow client, reads/cancel/clear use entity client. SQL migration 0023 added.
  - **Phase 9 (integration test migration, TraitTest):** ✅ Done — TraitTest entity migrated from old stateful API (`#[entity_impl(traits(Auditable, Versioned))]`, `#[state(TraitTestState)]`, `#[entity_trait]`/`#[entity_trait_impl]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC entity with RPC groups (`#[entity(rpc_groups(Auditable, Versioned))]`). Auditable and Versioned converted from `#[entity_trait]`/`#[entity_trait_impl]` with framework-managed state to `#[rpc_group]`/`#[rpc_group_impl]` with direct PG via `trait_test_audit_log` and `trait_test_versions` tables. TraitTest entity uses `#[rpc]` and `#[rpc(persisted)]` with direct PG via `trait_test_data` table. SQL migration 0024 added.
  - **Phase 9 (integration test migration, SqlActivityTest):** ✅ Done — SqlActivityTest entity migrated from old stateful API (`#[state(SqlActivityTestState)]`, `#[workflow]`, `#[activity]`, `&mut self`, `ActivityScope::sql_transaction()`) to new pure-RPC entity (`SqlActivityTest` with `pool: PgPool` for reading state from `sql_activity_test_state` table) + 3 standalone workflows (`SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, `SqlCountWorkflow`) using `#[workflow]`/`#[workflow_impl]` with activities that use `ActivityScope::sql_transaction()` to atomically write to both `sql_activity_test_state` and `sql_activity_test_transfers` tables. Rollback test verifies both tables are rolled back on activity failure. SQL migration 0025 added.
- - **Phase 9 (chess-cluster migration, MatchmakingService):** ✅ Done — MatchmakingService migrated from old stateful API (`#[state(MatchmakingState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC API (`#[rpc]`, `#[rpc(persisted)]`). Ephemeral queue state held via `Arc<Mutex<MatchmakingState>>` field (no DB persistence needed — state is intentionally ephemeral). `find_match` and `cancel_search` converted from `#[workflow]` + `#[activity]` pattern to `#[rpc(persisted)]` with inline mutex-guarded state mutations. `get_queue_status`, `is_in_queue`, `get_queue_position` remain as `#[rpc]`. `init()` method and `EntityContext` import removed. Test registrations updated from `MatchmakingService.register()` to `MatchmakingService::new().register()`.
- - **Phase 9 (chess-cluster migration, Leaderboard):** ✅ Done — Leaderboard entity migrated from old stateful API (`#[state(LeaderboardState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC API (`#[rpc]`, `#[rpc(persisted)]`). Ephemeral state held via `Arc<Mutex<LeaderboardState>>` field (same pattern as MatchmakingService). `record_game_result` and `ensure_player_rating` converted from `#[workflow]` + `#[activity]` pattern to `#[rpc(persisted)]` with inline mutex-guarded state mutations. Read RPCs (`get_player_rating`, `get_top_players`, `get_rankings_around`, `get_total_games`, `get_total_players`) updated to lock mutex for state access. `init()` method and `EntityContext` import removed. Test registrations updated from `Leaderboard.register()` to `Leaderboard::new().register()`.
- - **Phase 9 (chess-cluster migration, ChessGame):** ✅ Done — ChessGame entity migrated from old stateful API (`#[state(ChessGameState)]`, `#[workflow]`, `#[activity]`, `&mut self`, `init()`, `self.self_client()`, `self.entity_id()`) to new pure-RPC API (`#[rpc]`, `#[rpc(persisted)]`). Ephemeral per-game state held via `Arc<Mutex<HashMap<String, ChessGameState>>>` field keyed by game_id string. All `#[workflow]` + `#[activity]` pairs collapsed into single `#[rpc(persisted)]` methods (`create`, `make_move`, `offer_draw`, `accept_draw`, `resign`, `handle_timeout`, `abort`). Read RPCs (`get_state`, `get_legal_moves`, `get_move_history`) take game_id parameter for state lookup. Request structs (`CreateGameRequest`, `MakeMoveRequest`, `DrawOfferRequest`, `DrawAcceptRequest`, `ResignRequest`) updated with `game_id: GameId` field. New request structs added: `HandleTimeoutRequest`, `AbortRequest`, `GetLegalMovesRequest`. Timeout scheduling via `self.self_client().notify_at()` removed (not available in pure-RPC pattern). `EntityContext` import removed. Test registrations updated from `ChessGame.register()` to `ChessGame::new().register()`.
- - **Phase 9 (chess-cluster migration, Auditable):** ✅ Done — Auditable trait migrated from old `#[entity_trait]`/`#[entity_trait_impl]`/`#[state(AuditLog)]` with `&mut self` activities and `#[protected]` visibility to new `#[rpc_group]`/`#[rpc_group_impl]` with `&self` and ephemeral state via `Arc<Mutex<AuditLog>>`. `log_player_action` and `log_system_action` converted from `#[activity]`/`#[protected]` to `#[rpc(persisted)]`. Read RPCs (`get_audit_log`, `get_audit_log_by_actor`, `get_audit_log_by_action`) use mutex lock for state access. `init()` method removed. Module docs updated.
+ - **chess-cluster:** ✅ Removed — was a poor example (ephemeral in-memory state via `Arc<Mutex<...>>` instead of real DB, no workflows, no activity transactions). The `examples/cluster-tests/` suite is the canonical reference for correct patterns. Directory deleted, workspace Cargo.toml, knope.toml, README.md, and .rulesync rules updated.
  - **Phase 1 (entity compile errors + old codegen removal):** ✅ Done — `entity_impl_block_inner` now emits compile errors for: `#[state(...)]` ("entities are stateless; use a database for state management"), `#[workflow]` on entity methods ("use standalone #[workflow] for durable orchestration"), `#[activity]` on entity methods ("activities belong on workflows, not entities"), `&mut self` on entity methods ("entity methods must use &self"), `init()` method ("entities are stateless; fn init is no longer needed"), `traits(...)` on entity_impl ("entity traits have been replaced by #[rpc_group]"). Old stateful entity codegen path (`generate_entity`, `generate_dispatch_arms`, `TraitInfo`, `trait_infos_from_paths`) removed (~2000 lines). All entities now go through `generate_pure_rpc_entity`. UI trybuild tests updated to verify new compile errors.
  - **Phase 9 (old entity_trait and state infrastructure removal):** ✅ Done — Removed `#[entity_trait]` / `#[entity_trait_impl]` proc macro codegen (~480 lines `entity_trait_impl_inner`, ~280 lines `generate_trait_dispatch_impl` + `generate_trait_client_ext`). Macros now emit compile errors directing to `#[rpc_group]`/`#[rpc_group_impl]`. Removed `StateMutGuard`, `TraitStateMutGuard`, `StateRef` from `state_guard.rs` (~500 lines); kept `ActivityScope` (still used by workflow journaling) and `SqlTransactionHandle`. Removed `ArcSwap` dependency and `arc-swap` from all Cargo.toml files. Cleaned up lib.rs re-exports and prelude. Updated doc comments on `#[entity_impl]`. Updated UI trybuild test to not depend on removed macros.
-  - **Remaining work:** None — all phases complete.
+   - **Remaining work:**
+     - Phase 10: Replace `self.transaction()` with `self.db()` in activity view codegen; fix cluster-tests anti-patterns (workflows/activity groups carrying `pool: PgPool` and using `self.pool` in activities instead of the framework transaction)
 
 ### Phase 1: Simplify Entities
 
@@ -682,7 +681,7 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 
 4. **Generate view structs** ✅
    - `__ExecuteView` — used by `execute`. `Deref<Target = UserStruct>`. Provides durable primitives (`sleep`, `await_deferred`, `resolve_deferred`, `on_interrupt`, `execution_id`). Provides activity delegation methods routing through `DurableContext::run()`.
-   - `__ActivityView` — used by `#[activity]` methods. `Deref<Target = UserStruct>`. Provides `transaction()`. No durable primitives.
+   - `__ActivityView` — used by `#[activity]` methods. `Deref<Target = UserStruct>`. Provides `db()` (the activity's DB transaction). No durable primitives.
 
 5. **Generate dispatch** ✅
    - Single match arm for tag `"execute"`: deserialize request, wrap in `WorkflowScope::run(request_id)`, construct `__ExecuteView`, call `execute`, serialize response.
@@ -811,3 +810,48 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
    - How to extract workflows from existing entities into standalone workflows
    - How to replace entity state with direct database access
    - How to convert entity traits to RPC groups / activity groups
+
+### Phase 10: Automatic Activity Transactions (`self.db()`)
+
+**Goal:** Activities get the DB transaction automatically via `self.db()`. Workflows and activity groups should not carry `PgPool` fields for activity SQL. Fix all cluster-tests anti-patterns.
+
+#### 10.1: Framework changes
+
+1. **Replace `self.transaction()` with `self.db()` in `__ActivityView`**
+   - Rename the generated method from `transaction()` to `db()`
+   - Return type: `&mut PgConnection` (or equivalent executor that is the activity's transaction)
+   - The transaction is opened automatically by the activity delegation wrapper (already happens via `ActivityScope`)
+   - `self.db()` is available in both workflow activities and activity group activities
+
+2. **Remove `SqlTransactionHandle` from public API** (if `self.db()` replaces it)
+   - Or keep as an internal type used by the generated code
+
+3. **Update `ActivityScope`** to make the transaction accessible through the view struct rather than requiring `ActivityScope::sql_transaction()` calls
+
+#### 10.2: Fix cluster-tests workflows (remove `pool: PgPool`, use `self.db()`)
+
+All workflows below carry `pool: PgPool` and use `self.pool` in `#[activity]` methods, bypassing the framework transaction. Each must be refactored to: remove the `pool` field, use `self.db()` in activities.
+
+1. **`SimpleWorkflow`** (`workflow_test.rs:138`) — 3 activities (`create_execution`, `complete_step`, `mark_completed`) use `self.pool`
+2. **`FailingWorkflow`** (`workflow_test.rs:257`) — 4 activities (`create_execution`, `complete_step`, `mark_completed`, `mark_failed`) use `self.pool`
+3. **`LongWorkflow`** (`workflow_test.rs:407`) — 3 activities (`create_execution`, `complete_step`, `mark_completed`) use `self.pool`
+4. **`ActivityWorkflow`** (`activity_test.rs:119`) — 1 activity (`log_activity`) uses `self.pool`
+5. **`ScheduleTimerWorkflow`** (`timer_test.rs:224`) — 4 activities (`add_pending_timer`, `check_cancelled`, `record_timer_fire`, `remove_pending_timer`) use `self.pool`; `record_timer_fire` runs 2 SQL statements outside any transaction
+6. **`OrderWorkflow`** (`activity_group_test.rs:188`) — 1 local activity (`summarize`) uses `self.pool`
+
+#### 10.3: Fix cluster-tests activity groups (remove `pool: PgPool`, use `self.db()`)
+
+1. **`Inventory`** (`activity_group_test.rs:24`) — 2 activities (`reserve_items`, `confirm_reservation`) use `self.pool`
+2. **`Payments`** (`activity_group_test.rs:108`) — 1 activity (`charge_payment`) uses `self.pool`
+
+#### 10.4: Update registration in `main.rs`
+
+Remove `pool: cluster.pool()` from all workflow and activity group constructions. Workflows become unit structs or carry only non-DB fields (e.g., HTTP clients). Entity registrations (which legitimately need `pool`) remain unchanged.
+
+**Total: 8 structs, 22 activity methods to fix.**
+
+> **Note:** The `SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, and `SqlCountWorkflow` in `sql_activity_test.rs` already use `ActivityScope::sql_transaction()` correctly — they are the exemplar pattern and do not need changes beyond renaming to `self.db()`.
+
+#### 10.5: Delete `examples/chess-cluster/` ✅
+
+Deleted the entire `examples/chess-cluster/` directory and removed all references from workspace `Cargo.toml`, `knope.toml`, `README.md`, and `.rulesync/rules/` files.

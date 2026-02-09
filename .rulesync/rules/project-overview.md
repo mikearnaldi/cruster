@@ -23,7 +23,6 @@ Cruster is a Rust framework for building distributed, stateful entity systems wi
 │   │   └── tests/              # Integration tests
 │   └── cruster-macros/         # Procedural macros
 ├── examples/                   # Example applications
-│   ├── chess-cluster/          # Distributed chess server
 │   └── cluster-tests/          # E2E test suite
 └── nix/                        # Nix flake development shells
 ```

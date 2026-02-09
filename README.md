@@ -452,8 +452,7 @@ sharding.start().await?;
 
 See [`examples/`](examples/) for complete examples:
 
-- **cluster-tests** - E2E test suite covering all features
-- **chess-cluster** - Distributed chess server with matchmaking
+- **cluster-tests** - E2E test suite covering all features (entities, workflows, RPC groups, activity groups)
 
 ## License
 

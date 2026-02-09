@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/cruster",
     "crates/cruster-macros",
-    "examples/chess-cluster",
     "examples/cluster-tests",
 ]
 

@@ -17,7 +17,6 @@ crates/cruster/
     └── storage_retry_exhaustion.rs
 
 examples/
-├── chess-cluster/tests/       # Chess example integration tests
 └── cluster-tests/tests/       # E2E shell scripts
 ```
 
@@ -29,9 +28,6 @@ cargo test -p cruster --lib
 
 # All tests including integration
 cargo test -p cruster
-
-# Chess-cluster example tests
-cargo test -p chess-cluster
 
 # Specific test
 cargo test -p cruster --lib test_name

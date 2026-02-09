@@ -53,7 +53,10 @@ pub use timer_test::{
     PendingTimer, ScheduleTimerRequest, ScheduleTimerWorkflow, ScheduleTimerWorkflowClient,
     TimerFire, TimerTest, TimerTestClient,
 };
-pub use trait_test::{AuditEntry, Auditable, TraitTest, TraitTestClient, UpdateRequest, Versioned};
+pub use trait_test::{
+    AuditEntry, Auditable, GetAuditLogRequest, GetTraitDataRequest, GetVersionRequest, TraitTest,
+    TraitTestClient, UpdateRequest, Versioned,
+};
 pub use workflow_test::{
     FailingWorkflow, FailingWorkflowClient, GetExecutionRequest, ListExecutionsRequest,
     LongWorkflow, LongWorkflowClient, RunFailingWorkflowRequest, RunLongWorkflowRequest,

@@ -151,12 +151,14 @@ impl TimerTest {
 
         Ok(rows
             .into_iter()
-            .map(|(timer_id, scheduled_at, delay_ms, cancelled)| PendingTimer {
-                timer_id,
-                scheduled_at,
-                delay_ms,
-                cancelled,
-            })
+            .map(
+                |(timer_id, scheduled_at, delay_ms, cancelled)| PendingTimer {
+                    timer_id,
+                    scheduled_at,
+                    delay_ms,
+                    cancelled,
+                },
+            )
             .collect())
     }
 
@@ -165,10 +167,7 @@ impl TimerTest {
     /// Returns true if the timer was found and cancelled, false if not found
     /// or already cancelled/fired.
     #[rpc(persisted)]
-    pub async fn cancel_timer(
-        &self,
-        request: CancelTimerRequest,
-    ) -> Result<bool, ClusterError> {
+    pub async fn cancel_timer(&self, request: CancelTimerRequest) -> Result<bool, ClusterError> {
         let result = sqlx::query(
             "UPDATE timer_test_pending SET cancelled = true
              WHERE entity_id = $1 AND timer_id = $2 AND cancelled = false",
@@ -187,10 +186,7 @@ impl TimerTest {
 
     /// Clear the timer fire history.
     #[rpc(persisted)]
-    pub async fn clear_fires(
-        &self,
-        request: ClearFiresRequest,
-    ) -> Result<(), ClusterError> {
+    pub async fn clear_fires(&self, request: ClearFiresRequest) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM timer_test_fires WHERE entity_id = $1")
             .bind(&request.entity_id)
             .execute(&self.pool)
@@ -251,7 +247,9 @@ impl ScheduleTimerWorkflow {
         self.sleep(Duration::from_millis(delay_ms)).await?;
 
         // After sleep completes, check if timer was cancelled
-        let was_cancelled = self.check_cancelled(entity_id.clone(), timer_id.clone()).await?;
+        let was_cancelled = self
+            .check_cancelled(entity_id.clone(), timer_id.clone())
+            .await?;
 
         if !was_cancelled {
             // Record the fire and remove from pending

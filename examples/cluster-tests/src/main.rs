@@ -295,10 +295,20 @@ async fn main() -> Result<()> {
     .expect("failed to register ActivityWorkflow");
     tracing::info!("Registered ActivityWorkflow");
 
-    let trait_test_client = TraitTest
-        .register(sharding.clone(), Auditable, Versioned)
-        .await
-        .expect("failed to register TraitTest entity");
+    let trait_test_client = TraitTest {
+        pool: cluster.pool(),
+    }
+    .register(
+        sharding.clone(),
+        Auditable {
+            pool: cluster.pool(),
+        },
+        Versioned {
+            pool: cluster.pool(),
+        },
+    )
+    .await
+    .expect("failed to register TraitTest entity");
     tracing::info!("Registered TraitTest entity");
 
     let timer_test_client = TimerTest {

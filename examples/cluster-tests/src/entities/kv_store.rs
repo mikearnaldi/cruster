@@ -79,12 +79,11 @@ impl KVStore {
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
     pub async fn set(&self, request: SetRequest) -> Result<(), ClusterError> {
-        let value_bytes = serde_json::to_vec(&request.value).map_err(|e| {
-            ClusterError::MalformedMessage {
+        let value_bytes =
+            serde_json::to_vec(&request.value).map_err(|e| ClusterError::MalformedMessage {
                 reason: format!("failed to serialize value: {e}"),
                 source: None,
-            }
-        })?;
+            })?;
         sqlx::query(
             "INSERT INTO kv_store_entries (entity_id, key, value)
              VALUES ($1, $2, $3)
@@ -111,25 +110,22 @@ impl KVStore {
         &self,
         request: GetRequest,
     ) -> Result<Option<serde_json::Value>, ClusterError> {
-        let result: Option<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT value FROM kv_store_entries WHERE entity_id = $1 AND key = $2",
-        )
-        .bind(&request.entity_id)
-        .bind(&request.key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| ClusterError::PersistenceError {
-            reason: format!("get failed: {e}"),
-            source: None,
-        })?;
+        let result: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value FROM kv_store_entries WHERE entity_id = $1 AND key = $2")
+                .bind(&request.entity_id)
+                .bind(&request.key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| ClusterError::PersistenceError {
+                    reason: format!("get failed: {e}"),
+                    source: None,
+                })?;
         match result {
             Some((bytes,)) => {
                 let value: serde_json::Value =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        ClusterError::MalformedMessage {
-                            reason: format!("failed to deserialize value: {e}"),
-                            source: None,
-                        }
+                    serde_json::from_slice(&bytes).map_err(|e| ClusterError::MalformedMessage {
+                        reason: format!("failed to deserialize value: {e}"),
+                        source: None,
                     })?;
                 Ok(Some(value))
             }
@@ -142,17 +138,15 @@ impl KVStore {
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
     pub async fn delete(&self, request: DeleteRequest) -> Result<bool, ClusterError> {
-        let result = sqlx::query(
-            "DELETE FROM kv_store_entries WHERE entity_id = $1 AND key = $2",
-        )
-        .bind(&request.entity_id)
-        .bind(&request.key)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| ClusterError::PersistenceError {
-            reason: format!("delete failed: {e}"),
-            source: None,
-        })?;
+        let result = sqlx::query("DELETE FROM kv_store_entries WHERE entity_id = $1 AND key = $2")
+            .bind(&request.entity_id)
+            .bind(&request.key)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ClusterError::PersistenceError {
+                reason: format!("delete failed: {e}"),
+                source: None,
+            })?;
         Ok(result.rows_affected() > 0)
     }
 

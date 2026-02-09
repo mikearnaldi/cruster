@@ -156,10 +156,7 @@ impl CrossEntity {
     ///
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
-    pub async fn clear_messages(
-        &self,
-        request: ClearMessagesRequest,
-    ) -> Result<(), ClusterError> {
+    pub async fn clear_messages(&self, request: ClearMessagesRequest) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM cross_entity_messages WHERE entity_id = $1")
             .bind(&request.entity_id)
             .execute(&self.pool)
@@ -200,10 +197,7 @@ impl CrossEntity {
     ///
     /// Uses `#[rpc]` (non-persisted) since this is a read-only operation.
     #[rpc]
-    pub async fn get_ping_count(
-        &self,
-        request: GetPingCountRequest,
-    ) -> Result<u32, ClusterError> {
+    pub async fn get_ping_count(&self, request: GetPingCountRequest) -> Result<u32, ClusterError> {
         let result: Option<(i32,)> =
             sqlx::query_as("SELECT ping_count FROM cross_entity_ping_counts WHERE entity_id = $1")
                 .bind(&request.entity_id)

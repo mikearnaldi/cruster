@@ -16,18 +16,19 @@ use crate::entities::{
     ActivityRecord, ActivityTestClient, ActivityWorkflowClient, AuditEntry, CancelTimerRequest,
     ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient,
     DecrementRequest, DeleteRequest, FailingTransferRequest, FailingWorkflowClient,
-    GetActivityLogRequest, GetCounterRequest, GetExecutionRequest, GetMessagesRequest,
-    GetPendingTimersRequest, GetRequest, GetSqlCountRequest, GetTimerFiresRequest,
-    IncrementRequest, KVStoreClient, ListExecutionsRequest, ListKeysRequest, LongWorkflowClient,
-    Message, PendingTimer, PingRequest, ReceiveRequest, ResetCounterRequest, ResetPingCountRequest,
-    RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
-    RunWithActivitiesRequest, ScheduleTimerRequest, ScheduleTimerWorkflowClient, SetRequest,
-    SimpleWorkflowClient, SingletonManager, SingletonState, SqlActivityTestClient,
-    SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
+    GetActivityLogRequest, GetAuditLogRequest, GetCounterRequest, GetExecutionRequest,
+    GetMessagesRequest, GetPendingTimersRequest, GetRequest, GetSqlCountRequest,
+    GetTimerFiresRequest, GetTraitDataRequest, GetVersionRequest, IncrementRequest, KVStoreClient,
+    ListExecutionsRequest, ListKeysRequest, LongWorkflowClient, Message, PendingTimer, PingRequest,
+    ReceiveRequest, ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
+    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
+    ScheduleTimerRequest, ScheduleTimerWorkflowClient, SetRequest, SimpleWorkflowClient,
+    SingletonManager, SingletonState, SqlActivityTestClient, SqlActivityTestState,
+    StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
     StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
     TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
 };
-// Import trait client extensions to make trait methods available on TraitTestClient
+// Import RPC group client extensions to make group methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
 
 /// Shared application state.
@@ -292,13 +293,7 @@ async fn kv_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .kv_store_client
-        .get(
-            &entity_id,
-            &GetRequest {
-                entity_id: id,
-                key,
-            },
-        )
+        .get(&entity_id, &GetRequest { entity_id: id, key })
         .await?;
     Ok(Json(value))
 }
@@ -311,13 +306,7 @@ async fn kv_delete(
     let entity_id = EntityId::new(&id);
     let deleted = state
         .kv_store_client
-        .delete(
-            &entity_id,
-            &DeleteRequest {
-                entity_id: id,
-                key,
-            },
-        )
+        .delete(&entity_id, &DeleteRequest { entity_id: id, key })
         .await?;
     Ok(Json(deleted))
 }
@@ -330,12 +319,7 @@ async fn kv_list_keys(
     let entity_id = EntityId::new(&id);
     let keys = state
         .kv_store_client
-        .list_keys(
-            &entity_id,
-            &ListKeysRequest {
-                entity_id: id,
-            },
-        )
+        .list_keys(&entity_id, &ListKeysRequest { entity_id: id })
         .await?;
     Ok(Json(keys))
 }
@@ -348,12 +332,7 @@ async fn kv_clear(
     let entity_id = EntityId::new(&id);
     state
         .kv_store_client
-        .clear(
-            &entity_id,
-            &ClearRequest {
-                entity_id: id,
-            },
-        )
+        .clear(&entity_id, &ClearRequest { entity_id: id })
         .await?;
     Ok(Json(()))
 }
@@ -464,12 +443,7 @@ async fn workflow_list_executions(
     let entity_id = EntityId::new(&id);
     let executions = state
         .workflow_test_client
-        .list_executions(
-            &entity_id,
-            &ListExecutionsRequest {
-                entity_id: id,
-            },
-        )
+        .list_executions(&entity_id, &ListExecutionsRequest { entity_id: id })
         .await?;
     Ok(Json(executions))
 }
@@ -509,12 +483,7 @@ async fn activity_get_log(
     let entity_id = EntityId::new(&id);
     let log = state
         .activity_test_client
-        .get_activity_log(
-            &entity_id,
-            &GetActivityLogRequest {
-                entity_id: id,
-            },
-        )
+        .get_activity_log(&entity_id, &GetActivityLogRequest { entity_id: id })
         .await?;
     Ok(Json(log))
 }
@@ -617,7 +586,15 @@ async fn trait_get(
     Path(id): Path<String>,
 ) -> Result<Json<String>, AppError> {
     let entity_id = EntityId::new(&id);
-    let value = state.trait_test_client.get(&entity_id).await?;
+    let value = state
+        .trait_test_client
+        .get(
+            &entity_id,
+            &GetTraitDataRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(value))
 }
 
@@ -630,28 +607,50 @@ async fn trait_update(
     let entity_id = EntityId::new(&id);
     state
         .trait_test_client
-        .update(&entity_id, &UpdateRequest { data: body.data })
+        .update(
+            &entity_id,
+            &UpdateRequest {
+                entity_id: id.clone(),
+                data: body.data,
+            },
+        )
         .await?;
     Ok(Json(()))
 }
 
-/// Get audit log from Auditable trait.
+/// Get audit log from Auditable RPC group.
 async fn trait_get_audit_log(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<AuditEntry>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let log = state.trait_test_client.get_audit_log(&entity_id).await?;
+    let log = state
+        .trait_test_client
+        .get_audit_log(
+            &entity_id,
+            &GetAuditLogRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(log))
 }
 
-/// Get version from Versioned trait.
+/// Get version from Versioned RPC group.
 async fn trait_get_version(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<u64>, AppError> {
     let entity_id = EntityId::new(&id);
-    let version = state.trait_test_client.get_version(&entity_id).await?;
+    let version = state
+        .trait_test_client
+        .get_version(
+            &entity_id,
+            &GetVersionRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(version))
 }
 
@@ -722,12 +721,7 @@ async fn timer_get_fires(
     let entity_id = EntityId::new(&id);
     let fires = state
         .timer_test_client
-        .get_timer_fires(
-            &entity_id,
-            &GetTimerFiresRequest {
-                entity_id: id,
-            },
-        )
+        .get_timer_fires(&entity_id, &GetTimerFiresRequest { entity_id: id })
         .await?;
     Ok(Json(fires))
 }
@@ -761,12 +755,7 @@ async fn timer_get_pending(
     let entity_id = EntityId::new(&id);
     let pending = state
         .timer_test_client
-        .get_pending_timers(
-            &entity_id,
-            &GetPendingTimersRequest {
-                entity_id: id,
-            },
-        )
+        .get_pending_timers(&entity_id, &GetPendingTimersRequest { entity_id: id })
         .await?;
     Ok(Json(pending))
 }
@@ -869,12 +858,7 @@ async fn cross_get_messages(
     let entity_id = EntityId::new(&id);
     let messages = state
         .cross_entity_client
-        .get_messages(
-            &entity_id,
-            &GetMessagesRequest {
-                entity_id: id,
-            },
-        )
+        .get_messages(&entity_id, &GetMessagesRequest { entity_id: id })
         .await?;
     Ok(Json(messages))
 }
@@ -887,12 +871,7 @@ async fn cross_clear_messages(
     let entity_id = EntityId::new(&id);
     state
         .cross_entity_client
-        .clear_messages(
-            &entity_id,
-            &ClearMessagesRequest {
-                entity_id: id,
-            },
-        )
+        .clear_messages(&entity_id, &ClearMessagesRequest { entity_id: id })
         .await?;
     Ok(Json(()))
 }

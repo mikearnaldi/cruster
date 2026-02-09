@@ -538,10 +538,7 @@ async fn test_full_matchmaking_to_game_flow() {
         .await
         .unwrap();
 
-    let state = game_client
-        .get_state(&game_entity, &game_id)
-        .await
-        .unwrap();
+    let state = game_client.get_state(&game_entity, &game_id).await.unwrap();
     assert_eq!(state.moves.len(), 2);
     assert_eq!(state.status, GameStatus::InProgress);
 

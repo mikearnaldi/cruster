@@ -267,10 +267,7 @@ impl PlayerSession {
 
         match sessions.get(&key) {
             Some(state) => Ok(StatusResponse {
-                connected: state
-                    .info
-                    .as_ref()
-                    .is_some_and(|i| i.status.is_connected()),
+                connected: state.info.as_ref().is_some_and(|i| i.status.is_connected()),
                 info: state.info.clone(),
             }),
             None => Ok(StatusResponse {
@@ -282,15 +279,17 @@ impl PlayerSession {
 
     /// Join the matchmaking queue.
     #[rpc(persisted)]
-    pub async fn join_matchmaking_queue(
-        &self,
-        player_id: PlayerId,
-    ) -> Result<u32, ClusterError> {
+    pub async fn join_matchmaking_queue(&self, player_id: PlayerId) -> Result<u32, ClusterError> {
         let mut sessions = self.sessions.lock().unwrap();
         let key = player_id.to_string();
 
-        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
-        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+        let state = sessions
+            .get_mut(&key)
+            .ok_or(PlayerSessionError::NotConnected)?;
+        let info = state
+            .info
+            .as_mut()
+            .ok_or(PlayerSessionError::NotConnected)?;
 
         if !info.status.can_join_queue() {
             return Err(PlayerSessionError::CannotJoinQueue {
@@ -310,8 +309,13 @@ impl PlayerSession {
         let mut sessions = self.sessions.lock().unwrap();
         let key = player_id.to_string();
 
-        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
-        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+        let state = sessions
+            .get_mut(&key)
+            .ok_or(PlayerSessionError::NotConnected)?;
+        let info = state
+            .info
+            .as_mut()
+            .ok_or(PlayerSessionError::NotConnected)?;
 
         if info.status != PlayerStatus::InQueue {
             return Err(PlayerSessionError::NotInQueue.into());
@@ -328,8 +332,13 @@ impl PlayerSession {
         let mut sessions = self.sessions.lock().unwrap();
         let key = player_id.to_string();
 
-        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
-        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+        let state = sessions
+            .get_mut(&key)
+            .ok_or(PlayerSessionError::NotConnected)?;
+        let info = state
+            .info
+            .as_mut()
+            .ok_or(PlayerSessionError::NotConnected)?;
 
         let game_id = info.current_game_id.ok_or(PlayerSessionError::NotInGame)?;
         info.current_game_id = None;
@@ -347,8 +356,13 @@ impl PlayerSession {
         let mut sessions = self.sessions.lock().unwrap();
         let key = request.player_id.to_string();
 
-        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
-        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+        let state = sessions
+            .get_mut(&key)
+            .ok_or(PlayerSessionError::NotConnected)?;
+        let info = state
+            .info
+            .as_mut()
+            .ok_or(PlayerSessionError::NotConnected)?;
 
         match &request.event {
             GameEvent::GameStarted { game_id, .. } => {
@@ -377,7 +391,10 @@ impl PlayerSession {
         let state = sessions
             .get_mut(&key)
             .ok_or(PlayerSessionError::NotConnected)?;
-        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+        let info = state
+            .info
+            .as_mut()
+            .ok_or(PlayerSessionError::NotConnected)?;
 
         info.current_game_id = Some(notification.game_id);
         info.status = PlayerStatus::InGame;

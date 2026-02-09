@@ -45,7 +45,6 @@ anyhow = { workspace = true }
 
 # Required by cruster macros
 async-trait = { workspace = true }
-arc-swap = { workspace = true }
 rmp-serde = "1"
 
 # Concurrency

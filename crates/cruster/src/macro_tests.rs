@@ -1837,7 +1837,7 @@ mod tests {
     // =============================================================================
 
     /// A pure-RPC entity: no #[state], no #[workflow], no #[activity].
-    /// Uses the simplified handler codegen without ArcSwap, write locks, or view structs.
+    /// Uses the simplified handler codegen without write locks or view structs.
     #[entity(krate = "crate")]
     #[derive(Clone)]
     struct PureRpcEntity {

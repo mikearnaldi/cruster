@@ -1,26 +1,7 @@
-//! Autopilot cluster entity framework.
+//! Cruster — stateless entity framework with durable workflows.
 //!
-//! ```compile_fail
-//! use cruster::{entity, entity_impl};
-//! use cruster::error::ClusterError;
-//!
-//! struct NotSerializable {
-//!     value: std::cell::Cell<i32>,
-//! }
-//!
-//! #[entity]
-//! #[derive(Clone)]
-//! struct BadEntity;
-//!
-//! #[entity_impl]
-//! impl BadEntity {
-//!     #[workflow]
-//!     async fn bad(&self, value: NotSerializable) -> Result<(), ClusterError> {
-//!         let _ = value;
-//!         Ok(())
-//!     }
-//! }
-//! ```
+//! Entities are addressable stateless RPC handlers. Workflows provide durable orchestration.
+//! State management is the application's responsibility (use your database directly).
 
 pub mod config;
 pub mod cron;
@@ -57,10 +38,13 @@ pub mod transport;
 pub mod types;
 
 /// Re-export proc macros for entity definition.
-pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
+pub use cruster_macros::{entity, entity_impl};
+
+/// Re-export deprecated entity_trait macros (emit compile errors directing to replacements).
+pub use cruster_macros::{entity_trait, entity_trait_impl};
 
 /// Re-export proc macros for standalone workflow definition.
-/// `#[workflow]` is dual-purpose (struct-level → standalone workflow, method-level → marker).
+/// `#[workflow]` is dual-purpose (struct-level -> standalone workflow, method-level -> marker).
 /// `#[workflow_impl]` is used on the workflow impl block.
 pub use cruster_macros::workflow_impl;
 
@@ -77,7 +61,7 @@ pub use cruster_macros::{rpc_group, rpc_group_impl};
 /// Prelude module for convenient glob imports.
 ///
 /// This module re-exports all commonly used items including proc-macro attributes.
-/// Use `use cruster::prelude::*;` to import everything needed for entity definitions.
+/// Use `use cruster::prelude::*;` to import everything needed for entity and workflow definitions.
 ///
 /// # Example
 ///
@@ -86,30 +70,31 @@ pub use cruster_macros::{rpc_group, rpc_group_impl};
 ///
 /// #[entity]
 /// #[derive(Clone)]
-/// struct Counter;
+/// struct MyEntity {
+///     db: PgPool,
+/// }
 ///
 /// #[entity_impl]
-/// #[state(CounterState)]
-/// impl Counter {
-///     fn init(&self, _ctx: &EntityContext) -> Result<CounterState, ClusterError> {
-///         Ok(CounterState { count: 0 })
-///     }
-///
-///     #[activity]
-///     async fn increment(&mut self, amount: i32) -> Result<i32, ClusterError> {
-///         self.state.count += amount;
-///         Ok(self.state.count)
-///     }
-///
+/// impl MyEntity {
 ///     #[rpc]
-///     async fn get_count(&self) -> Result<i32, ClusterError> {
-///         Ok(self.state.count)
+///     async fn get_value(&self, key: String) -> Result<String, ClusterError> {
+///         // Query your database directly
+///         todo!()
+///     }
+///
+///     #[rpc(persisted)]
+///     async fn set_value(&self, key: String, value: String) -> Result<(), ClusterError> {
+///         // Write to your database directly
+///         todo!()
 ///     }
 /// }
 /// ```
 pub mod prelude {
     // Main macros
-    pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
+    pub use cruster_macros::{entity, entity_impl};
+
+    // Deprecated macros (emit compile errors)
+    pub use cruster_macros::{entity_trait, entity_trait_impl};
 
     // Workflow impl macro (workflow is already exported as helper attribute)
     pub use cruster_macros::workflow_impl;
@@ -138,9 +123,9 @@ pub mod __internal {
     };
     pub use crate::envelope::REQUEST_ID_HEADER_KEY;
     pub use crate::message_storage::MessageStorage;
+    pub use crate::state_guard::ActivityScope;
     #[cfg(feature = "sql")]
     pub use crate::state_guard::SqlTransactionHandle;
-    pub use crate::state_guard::{ActivityScope, StateMutGuard, StateRef, TraitStateMutGuard};
     #[cfg(feature = "sql")]
     pub use crate::storage::sql_workflow_engine::SqlWorkflowEngine;
 }

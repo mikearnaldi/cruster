@@ -89,15 +89,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
-name = "arc-swap"
-version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51d03449bb8ca2cc2ef70869af31463d1ae5ccc8fa3e334b307203fbf815207e"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,7 +320,6 @@ name = "chess-cluster"
 version = "0.0.15"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-trait",
  "axum",
  "chrono",
@@ -439,7 +429,6 @@ name = "cluster-tests"
 version = "0.0.15"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-trait",
  "axum",
  "chrono",
@@ -606,7 +595,6 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 name = "cruster"
 version = "0.0.15"
 dependencies = [
- "arc-swap",
  "async-trait",
  "chrono",
  "criterion",

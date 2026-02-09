@@ -358,10 +358,7 @@ impl ChessGame {
 
     /// Get the move history.
     #[rpc]
-    pub async fn get_move_history(
-        &self,
-        game_id: GameId,
-    ) -> Result<Vec<MoveRecord>, ClusterError> {
+    pub async fn get_move_history(&self, game_id: GameId) -> Result<Vec<MoveRecord>, ClusterError> {
         let games = self.games.lock().unwrap();
         let key = game_id.to_string();
         let state = Self::get_game(&games, &key)?;
@@ -469,10 +466,7 @@ impl ChessGame {
 
     /// Accept a draw offer.
     #[rpc(persisted)]
-    pub async fn accept_draw(
-        &self,
-        request: DrawAcceptRequest,
-    ) -> Result<GameState, ClusterError> {
+    pub async fn accept_draw(&self, request: DrawAcceptRequest) -> Result<GameState, ClusterError> {
         let mut games = self.games.lock().unwrap();
         let key = request.game_id.to_string();
         let state = Self::get_game(&games, &key)?;

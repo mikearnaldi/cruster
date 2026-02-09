@@ -85,53 +85,34 @@ pub fn entity(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Attribute macro for entity impl blocks.
 ///
-/// Each `async fn` annotated with `#[rpc]` or `#[workflow]` becomes an RPC handler.
-/// Unannotated async functions are treated as internal helpers.
+/// Entities are stateless RPC handlers. Each `async fn` annotated with `#[rpc]`
+/// becomes a dispatchable handler. Use `#[rpc(persisted)]` for at-least-once delivery.
 ///
 /// # Attributes
 ///
 /// - `#[entity_impl]` — default crate path
 /// - `#[entity_impl(krate = "crate")]` — for internal use within cruster
-/// - `#[entity_impl(traits(TraitA, TraitB))]` — compose entity traits
+/// - `#[entity_impl(rpc_groups(GroupA, GroupB))]` — compose RPC groups
 /// - `#[entity_impl(deferred_keys(SIGNAL: i32 = "signal"))]` — generate `DeferredKey` constants
 ///
-/// # State Attribute
-///
-/// Use `#[state(Type)]` on the impl block to define per-instance persistent state:
+/// # Example
 ///
 /// ```text
 /// #[entity_impl]
-/// #[state(MyState)]
 /// impl MyEntity {
-///     fn init(&self, ctx: &EntityContext) -> Result<MyState, ClusterError> {
-///         Ok(MyState::default())
-///     }
-///
 ///     #[rpc]
-///     async fn get_value(&self) -> Result<i32, ClusterError> {
-///         Ok(self.state.value)  // self.state is &MyState (read-only)
+///     async fn get_value(&self, key: String) -> Result<String, ClusterError> {
+///         // Query your database directly
+///         todo!()
 ///     }
 ///
-///     #[activity]
-///     async fn set_value(&mut self, value: i32) -> Result<(), ClusterError> {
-///         self.state.value = value;  // self.state is &mut MyState
-///         Ok(())  // State auto-persisted on activity completion
-///     }
-///
-///     #[workflow]
-///     async fn do_set(&self, value: i32) -> Result<(), ClusterError> {
-///         self.set_value(value).await  // Workflows call activities
+///     #[rpc(persisted)]
+///     async fn set_value(&self, key: String, value: String) -> Result<(), ClusterError> {
+///         // Write to your database directly (at-least-once delivery)
+///         todo!()
 ///     }
 /// }
 /// ```
-///
-/// The state type must implement `Clone + Serialize + DeserializeOwned + Send + Sync`.
-///
-/// ## State Access Pattern
-///
-/// - `#[rpc]` / `#[workflow]` methods use `&self` and access `self.state` as `&State` (read-only)
-/// - `#[activity]` methods use `&mut self` and access `self.state` as `&mut State` (mutable)
-/// - Activities are called from workflows via `self.activity_name()` (auto-delegated)
 #[proc_macro_attribute]
 pub fn entity_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as ImplArgs);
@@ -142,70 +123,32 @@ pub fn entity_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Attribute macro for trait capability struct definitions.
+/// **Removed.** Entity traits have been replaced by `#[rpc_group]` / `#[rpc_group_impl]`.
 ///
-/// Currently a marker with optional crate path override.
+/// This macro now emits a compile error directing users to the replacement.
 #[proc_macro_attribute]
-pub fn entity_trait(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let _args = parse_macro_input!(attr as TraitArgs);
-    let input = parse_macro_input!(item as syn::ItemStruct);
-    quote! { #input }.into()
+pub fn entity_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let _ = item;
+    syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "entity traits have been removed; use #[rpc_group] instead",
+    )
+    .to_compile_error()
+    .into()
 }
 
-/// Attribute macro for trait capability impl blocks.
+/// **Removed.** Entity trait impls have been replaced by `#[rpc_group_impl]`.
 ///
-/// Each `async fn` annotated with `#[rpc]`, `#[workflow]`, or `#[activity]` becomes
-/// an RPC handler that can be called on entities using this trait.
-///
-/// # Attributes
-///
-/// - `#[entity_trait_impl]` — default crate path
-/// - `#[entity_trait_impl(krate = "crate")]` — for internal use within cruster
-///
-/// # Method Annotations
-///
-/// - `#[rpc]` — Read-only RPC handler (no state mutation)
-/// - `#[workflow]` — Durable workflow handler (state mutations)
-/// - `#[activity]` — Durable activity handler (external side effects)
-///
-/// # Visibility Annotations
-///
-/// - `#[public]` — Callable by external clients (default for `#[rpc]` and `#[workflow]`)
-/// - `#[protected]` — Callable only by other entities (entity-to-entity)
-/// - `#[private]` — Internal only (default for `#[activity]`)
-///
-/// # Example
-///
-/// ```text
-/// #[entity_trait_impl]
-/// #[state(AuditLog)]
-/// impl Auditable {
-///     fn init(&self) -> Result<AuditLog, ClusterError> {
-///         Ok(AuditLog::default())
-///     }
-///
-///     #[activity]
-///     #[protected]
-///     async fn log_action(&self, action: String) -> Result<(), ClusterError> {
-///         let mut state = self.state_mut().await;
-///         state.log(action);
-///         Ok(())
-///     }
-///
-///     #[rpc]
-///     async fn get_log(&self) -> Result<Vec<String>, ClusterError> {
-///         Ok(self.state().entries.clone())
-///     }
-/// }
-/// ```
+/// This macro now emits a compile error directing users to the replacement.
 #[proc_macro_attribute]
-pub fn entity_trait_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as TraitArgs);
-    let input = parse_macro_input!(item as syn::ItemImpl);
-    match entity_trait_impl_inner(args, input) {
-        Ok(tokens) => tokens.into(),
-        Err(e) => e.to_compile_error().into(),
-    }
+pub fn entity_trait_impl(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let _ = item;
+    syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "entity trait impls have been removed; use #[rpc_group_impl] instead",
+    )
+    .to_compile_error()
+    .into()
 }
 
 /// Defines persistent state for an entity or entity trait.
@@ -971,7 +914,7 @@ impl syn::parse::Parse for TraitArgs {
                 other => {
                     return Err(syn::Error::new(
                         ident.span(),
-                        format!("unknown entity_trait attribute: {other}"),
+                        format!("unknown attribute: {other}"),
                     ));
                 }
             }
@@ -1154,7 +1097,8 @@ struct RpcMethod {
     visibility: RpcVisibility,
     /// Optional idempotency key closure for workflows/activities.
     persist_key: Option<syn::ExprClosure>,
-    /// Whether this RPC takes a `&DurableContext` parameter — enables workflow capabilities.
+    /// Whether this RPC takes a `&DurableContext` parameter.
+    #[allow(dead_code)]
     has_durable_context: bool,
     /// Whether this RPC uses persisted (at-least-once) delivery via `#[rpc(persisted)]`.
     rpc_persisted: bool,
@@ -1357,496 +1301,6 @@ fn generate_deferred_key_consts(
     })
 }
 
-fn entity_trait_impl_inner(
-    args: TraitArgs,
-    input: syn::ItemImpl,
-) -> syn::Result<proc_macro2::TokenStream> {
-    let krate = args.krate.unwrap_or_else(default_crate_path);
-    let mut input = input;
-    let state_info = parse_state_attr(&mut input.attrs)?;
-    let self_ty = &input.self_ty;
-
-    let trait_ident = match self_ty.as_ref() {
-        syn::Type::Path(tp) => tp
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident.clone())
-            .ok_or_else(|| syn::Error::new(self_ty.span(), "expected trait struct name"))?,
-        _ => {
-            return Err(syn::Error::new(
-                self_ty.span(),
-                "expected trait struct name",
-            ))
-        }
-    };
-
-    let mut rpcs = Vec::new();
-    let state_type: Option<syn::Type> = state_info.as_ref().map(|info| info.ty.clone());
-    let mut has_init = false;
-    let mut init_method: Option<syn::ImplItemFn> = None;
-    let mut original_methods = Vec::new();
-
-    for item in &input.items {
-        match item {
-            syn::ImplItem::Type(type_item) if type_item.ident == "State" => {
-                return Err(syn::Error::new(
-                    type_item.span(),
-                    "use #[state(Type)] on the impl block instead of `type State`",
-                ));
-            }
-            syn::ImplItem::Fn(method) => {
-                let has_rpc_attrs = parse_kind_attr(&method.attrs)?.is_some()
-                    || parse_visibility_attr(&method.attrs)?.is_some();
-                if method.sig.ident == "init" && method.sig.asyncness.is_none() {
-                    if has_rpc_attrs {
-                        return Err(syn::Error::new(
-                            method.sig.span(),
-                            "RPC annotations are only valid on async methods",
-                        ));
-                    }
-                    has_init = true;
-                    init_method = Some(method.clone());
-                } else if method.sig.asyncness.is_some() {
-                    if let Some(rpc) = parse_rpc_method(method)? {
-                        if rpc.has_durable_context {
-                            return Err(syn::Error::new(
-                                method.sig.span(),
-                                "DurableContext parameters are not supported in entity traits",
-                            ));
-                        }
-                        rpcs.push(rpc);
-                    }
-                } else if has_rpc_attrs {
-                    return Err(syn::Error::new(
-                        method.sig.span(),
-                        "RPC annotations are only valid on async methods",
-                    ));
-                }
-                original_methods.push(method.clone());
-            }
-            _ => {}
-        }
-    }
-
-    let is_stateful = state_type.is_some();
-
-    if is_stateful && !has_init {
-        return Err(syn::Error::new(
-            input.self_ty.span(),
-            "entity traits with #[state(...)] must define `fn init(&self) -> Result<State, ClusterError>`",
-        ));
-    }
-
-    if has_init && !is_stateful {
-        return Err(syn::Error::new(
-            init_method.as_ref().unwrap().sig.span(),
-            "`fn init` is only valid when #[state(...)] is also defined",
-        ));
-    }
-
-    let mut cleaned_impl = input.clone();
-    cleaned_impl.attrs.retain(|a| !a.path().is_ident("state"));
-    for item in &mut cleaned_impl.items {
-        if let syn::ImplItem::Fn(method) = item {
-            method.attrs.retain(|a| {
-                !a.path().is_ident("rpc")
-                    && !a.path().is_ident("workflow")
-                    && !a.path().is_ident("activity")
-                    && !a.path().is_ident("method")
-                    && !a.path().is_ident("public")
-                    && !a.path().is_ident("protected")
-                    && !a.path().is_ident("private")
-            });
-        }
-    }
-    cleaned_impl.items.retain(|item| match item {
-        syn::ImplItem::Type(_) => false,
-        syn::ImplItem::Fn(method) => method.sig.asyncness.is_none() && method.sig.ident != "init",
-        _ => true,
-    });
-
-    let wrapper_name = format_ident!("{}StateWrapper", trait_ident);
-    let state_type = state_type.unwrap_or_else(|| syn::parse_str("()").unwrap());
-
-    let init_takes_ctx = if let Some(init_method) = init_method.as_ref() {
-        match init_method.sig.inputs.len() {
-            1 => false,
-            2 => true,
-            _ => {
-                return Err(syn::Error::new(
-                    init_method.sig.span(),
-                    "trait init must take either `&self` or `&self, &EntityContext`",
-                ))
-            }
-        }
-    } else {
-        false
-    };
-
-    let init_call = if is_stateful {
-        if init_takes_ctx {
-            quote! { self.init(ctx) }
-        } else {
-            quote! {
-                let _ = ctx;
-                self.init()
-            }
-        }
-    } else {
-        quote! {
-            let _ = ctx;
-            ::std::result::Result::Ok(())
-        }
-    };
-
-    let init_method_impl = if is_stateful {
-        let init_method = init_method.as_ref().unwrap();
-        let init_sig = &init_method.sig;
-        let init_block = &init_method.block;
-        let init_attrs = &init_method.attrs;
-        let init_vis = &init_method.vis;
-        quote! {
-            impl #trait_ident {
-                #(#init_attrs)*
-                #init_vis #init_sig #init_block
-            }
-        }
-    } else {
-        quote! {}
-    };
-
-    // Generate view structs for trait methods (similar to entity view structs)
-    let read_view_name = format_ident!("__{}ReadView", wrapper_name);
-    let mut_view_name = format_ident!("__{}MutView", wrapper_name);
-
-    let mut read_methods = Vec::new();
-    let mut mut_methods = Vec::new();
-    let mut wrapper_methods = Vec::new();
-
-    for method in original_methods
-        .iter()
-        .filter(|m| m.sig.asyncness.is_some())
-    {
-        let method_name = &method.sig.ident;
-        let rpc_info = rpcs.iter().find(|r| r.name == *method_name);
-        let is_activity = rpc_info.is_some_and(|r| matches!(r.kind, RpcKind::Activity));
-
-        let block = &method.block;
-        let output = &method.sig.output;
-        let generics = &method.sig.generics;
-        let where_clause = &generics.where_clause;
-        let attrs: Vec<_> = method
-            .attrs
-            .iter()
-            .filter(|a| {
-                !a.path().is_ident("rpc")
-                    && !a.path().is_ident("workflow")
-                    && !a.path().is_ident("activity")
-                    && !a.path().is_ident("method")
-                    && !a.path().is_ident("public")
-                    && !a.path().is_ident("protected")
-                    && !a.path().is_ident("private")
-            })
-            .collect();
-        let vis = &method.vis;
-
-        // Get params excluding &self or &mut self
-        let params: Vec<_> = method.sig.inputs.iter().skip(1).cloned().collect();
-        let param_names: Vec<_> = method
-            .sig
-            .inputs
-            .iter()
-            .skip(1)
-            .filter_map(|arg| {
-                if let syn::FnArg::Typed(pat_type) = arg {
-                    if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
-                        return Some(pat_ident.ident.clone());
-                    }
-                }
-                None
-            })
-            .collect();
-
-        if is_activity {
-            // Activity methods go on MutView with &mut self, access self.state directly
-            mut_methods.push(quote! {
-                #(#attrs)*
-                #vis async fn #method_name #generics (&mut self, #(#params),*) #output #where_clause
-                    #block
-            });
-
-            // Wrapper acquires write lock and creates MutView
-            wrapper_methods.push(quote! {
-                #(#attrs)*
-                #vis async fn #method_name #generics (&self, #(#params),*) #output #where_clause {
-                    let __lock = self.__write_lock.clone().lock_owned().await;
-                    let mut __guard = #krate::__internal::TraitStateMutGuard::new(
-                        self.__state.clone(),
-                        __lock,
-                    );
-                    let mut __view = #mut_view_name {
-                        __wrapper: self,
-                        state: &mut *__guard,
-                    };
-                    __view.#method_name(#(#param_names),*).await
-                }
-            });
-        } else {
-            // Read-only methods go on ReadView with &mut self, access self.state via StateRef proxy
-            read_methods.push(quote! {
-                #(#attrs)*
-                #vis async fn #method_name #generics (&mut self, #(#params),*) #output #where_clause
-                    #block
-            });
-
-            // Wrapper loads state into StateRef and creates ReadView
-            wrapper_methods.push(quote! {
-                #(#attrs)*
-                #vis async fn #method_name #generics (&self, #(#params),*) #output #where_clause {
-                    let mut __view = #read_view_name {
-                        __wrapper: self,
-                        state: #krate::__internal::StateRef::__new(self.__state.load_full()),
-                    };
-                    __view.#method_name(#(#param_names),*).await
-                }
-            });
-        }
-    }
-
-    // Generate activity delegation methods for read view (so workflows can call activities)
-    let activity_delegations: Vec<proc_macro2::TokenStream> = rpcs
-        .iter()
-        .filter(|rpc| matches!(rpc.kind, RpcKind::Activity))
-        .map(|rpc| {
-            let method_name = &rpc.name;
-            let method_info = original_methods
-                .iter()
-                .find(|m| m.sig.ident == *method_name)
-                .unwrap();
-            let params: Vec<_> = method_info.sig.inputs.iter().skip(1).collect();
-            let param_names: Vec<_> = method_info
-                .sig
-                .inputs
-                .iter()
-                .skip(1)
-                .filter_map(|arg| {
-                    if let syn::FnArg::Typed(pat_type) = arg {
-                        if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
-                            return Some(&pat_ident.ident);
-                        }
-                    }
-                    None
-                })
-                .collect();
-            let output = &method_info.sig.output;
-            let generics = &method_info.sig.generics;
-            let where_clause = &generics.where_clause;
-
-            quote! {
-                #[inline]
-                async fn #method_name #generics (&mut self, #(#params),*) #output #where_clause {
-                    let __result = self.__wrapper.#method_name(#(#param_names),*).await;
-                    // Refresh state from ArcSwap after activity commits
-                    self.state.__refresh(self.__wrapper.__state.load_full());
-                    __result
-                }
-            }
-        })
-        .collect();
-
-    let view_structs = quote! {
-        #[doc(hidden)]
-        #[allow(non_camel_case_types)]
-        struct #read_view_name<'a> {
-            #[allow(dead_code)]
-            __wrapper: &'a #wrapper_name,
-            state: #krate::__internal::StateRef<#state_type>,
-        }
-
-        #[doc(hidden)]
-        #[allow(non_camel_case_types)]
-        struct #mut_view_name<'a> {
-            #[allow(dead_code)]
-            __wrapper: &'a #wrapper_name,
-            state: &'a mut #state_type,
-        }
-
-        // Allow trait methods to access the underlying trait struct's fields via Deref
-        impl ::std::ops::Deref for #read_view_name<'_> {
-            type Target = #trait_ident;
-            fn deref(&self) -> &Self::Target {
-                &self.__wrapper.__trait
-            }
-        }
-
-        impl ::std::ops::Deref for #mut_view_name<'_> {
-            type Target = #trait_ident;
-            fn deref(&self) -> &Self::Target {
-                &self.__wrapper.__trait
-            }
-        }
-    };
-
-    let view_impls = quote! {
-        impl #read_view_name<'_> {
-            #(#activity_delegations)*
-            #(#read_methods)*
-        }
-
-        impl #mut_view_name<'_> {
-            #(#mut_methods)*
-        }
-    };
-
-    let dispatch_impl = generate_trait_dispatch_impl(&krate, &wrapper_name, &rpcs);
-    let client_ext = generate_trait_client_ext(&krate, &trait_ident, &rpcs);
-    let access_trait_ident = format_ident!("__{}TraitAccess", trait_ident);
-    let methods_trait_ident = format_ident!("__{}TraitMethods", trait_ident);
-    let state_info_ident = format_ident!("__{}TraitStateInfo", trait_ident);
-    let state_init_ident = format_ident!("__{}TraitStateInit", trait_ident);
-    let missing_reason = format!("missing trait dependency: {trait_ident}");
-
-    // With ArcSwap pattern, all methods use &self - mutability is handled via state_mut()
-    let methods_impls: Vec<proc_macro2::TokenStream> = rpcs
-        .iter()
-        .filter(|rpc| rpc.is_trait_visible())
-        .map(|rpc| {
-            let method_name = &rpc.name;
-            let resp_type = &rpc.response_type;
-            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
-            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
-            let param_defs: Vec<_> = param_names
-                .iter()
-                .zip(param_types.iter())
-                .map(|(name, ty)| quote! { #name: #ty })
-                .collect();
-            quote! {
-                async fn #method_name(
-                    &self,
-                    #(#param_defs),*
-                ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                    let __trait = self.__trait_ref().ok_or_else(|| #krate::error::ClusterError::MalformedMessage {
-                        reason: ::std::string::String::from(#missing_reason),
-                        source: ::std::option::Option::None,
-                    })?;
-                    __trait.#method_name(#(#param_names),*).await
-                }
-            }
-        })
-        .collect();
-
-    let trait_helpers = quote! {
-        #[doc(hidden)]
-        pub trait #access_trait_ident {
-            fn __trait_ref(&self) -> ::std::option::Option<&::std::sync::Arc<#wrapper_name>>;
-        }
-
-        #[doc(hidden)]
-        #[async_trait::async_trait]
-        pub trait #methods_trait_ident: #access_trait_ident {
-            #(#methods_impls)*
-        }
-
-        #[async_trait::async_trait]
-        impl<T> #methods_trait_ident for T where T: #access_trait_ident + ::std::marker::Sync + ::std::marker::Send {}
-    };
-
-    let state_traits = quote! {
-        #[doc(hidden)]
-        pub trait #state_info_ident {
-            type State;
-        }
-
-        impl #state_info_ident for #trait_ident {
-            type State = #state_type;
-        }
-
-        #[doc(hidden)]
-        pub trait #state_init_ident {
-            fn __init_state(
-                &self,
-                ctx: &#krate::entity::EntityContext,
-            ) -> ::std::result::Result<#state_type, #krate::error::ClusterError>;
-        }
-
-        impl #state_init_ident for #trait_ident {
-            fn __init_state(
-                &self,
-                ctx: &#krate::entity::EntityContext,
-            ) -> ::std::result::Result<#state_type, #krate::error::ClusterError> {
-                #init_call
-            }
-        }
-    };
-
-    let wrapper_def = quote! {
-        #[doc(hidden)]
-        pub struct #wrapper_name {
-            /// State with lock-free reads via ArcSwap.
-            __state: ::std::sync::Arc<arc_swap::ArcSwap<#state_type>>,
-            /// Write lock for state mutations.
-            __write_lock: ::std::sync::Arc<tokio::sync::Mutex<()>>,
-            /// The trait instance.
-            __trait: #trait_ident,
-        }
-
-        impl ::std::ops::Deref for #wrapper_name {
-            type Target = #trait_ident;
-            fn deref(&self) -> &Self::Target {
-                &self.__trait
-            }
-        }
-
-        #view_structs
-
-        #view_impls
-
-        impl #wrapper_name {
-            #[doc(hidden)]
-            pub fn __new(inner: #trait_ident, state: #state_type) -> Self {
-                Self {
-                    __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
-                    __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                    __trait: inner,
-                }
-            }
-
-            #[doc(hidden)]
-            pub fn __state_arc(&self) -> &::std::sync::Arc<arc_swap::ArcSwap<#state_type>> {
-                &self.__state
-            }
-
-            #(#wrapper_methods)*
-        }
-    };
-
-    // Only output cleaned_impl if it has non-init sync methods
-    // Outputting an empty impl block can confuse rust-analyzer's source mapping
-    let cleaned_impl_tokens = if cleaned_impl.items.is_empty() {
-        quote! {}
-    } else {
-        quote! { #cleaned_impl }
-    };
-
-    Ok(quote! {
-        #cleaned_impl_tokens
-        #init_method_impl
-        #state_traits
-        #wrapper_def
-        #dispatch_impl
-        #client_ext
-        #trait_helpers
-    })
-}
-
-/// Generate code for entities (both stateful and stateless).
-///
-/// When `state_type` is `Some`, the entity has user-defined state accessed via `self.state`.
-/// When `state_type` is `None`, the entity is stateless — `()` is used internally and
-/// views Deref to the entity struct so `self.field` keeps working.
-///
-/// Persistence infrastructure (storage, sharding, journaling, durable builtins) is
 /// Generate simplified entity code for "pure RPC" entities.
 ///
 /// Pure-RPC entities have no `#[state]`, no `#[workflow]`, no `#[activity]`,
@@ -2538,286 +1992,6 @@ fn generate_client_methods(krate: &syn::Path, rpcs: &[RpcMethod]) -> Vec<proc_ma
         .collect()
 }
 
-fn generate_trait_dispatch_impl(
-    krate: &syn::Path,
-    trait_ident: &syn::Ident,
-    rpcs: &[RpcMethod],
-) -> proc_macro2::TokenStream {
-    let dispatch_arms: Vec<_> = rpcs
-        .iter()
-        .filter(|rpc| rpc.is_dispatchable())
-        .map(|rpc| {
-            let tag = &rpc.tag;
-            let method_name = &rpc.name;
-            let param_count = rpc.params.len();
-            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
-            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
-
-            let deserialize_request = match param_count {
-                0 => quote! {},
-                1 => {
-                    let name = &param_names[0];
-                    let ty = &param_types[0];
-                    quote! {
-                        let #name: #ty = rmp_serde::from_slice(payload)
-                            .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                                reason: ::std::format!("failed to deserialize request for '{}': {e}", #tag),
-                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                            })?;
-                    }
-                }
-                _ => quote! {
-                    let (#(#param_names),*): (#(#param_types),*) = rmp_serde::from_slice(payload)
-                        .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                            reason: ::std::format!("failed to deserialize request for '{}': {e}", #tag),
-                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                        })?;
-                },
-            };
-
-            let mut call_args = Vec::new();
-            match param_count {
-                0 => {}
-                1 => {
-                    let name = &param_names[0];
-                    call_args.push(quote! { #name });
-                }
-                _ => {
-                    for name in &param_names {
-                        call_args.push(quote! { #name });
-                    }
-                }
-            }
-            let call_args = quote! { #(#call_args),* };
-
-            // With ArcSwap pattern, methods handle their own locking via state_mut()
-            quote! {
-                #tag => {
-                    #deserialize_request
-                    let response = self.#method_name(#call_args).await?;
-                    let bytes = rmp_serde::to_vec(&response)
-                        .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                            reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
-                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                        })?;
-                    ::std::result::Result::Ok(::std::option::Option::Some(bytes))
-                }
-            }
-        })
-        .collect();
-
-    quote! {
-        impl #trait_ident {
-            #[doc(hidden)]
-            pub async fn __dispatch(
-                &self,
-                tag: &str,
-                payload: &[u8],
-                headers: &::std::collections::HashMap<::std::string::String, ::std::string::String>,
-            ) -> ::std::result::Result<::std::option::Option<::std::vec::Vec<u8>>, #krate::error::ClusterError> {
-                let _ = headers;
-                match tag {
-                    #(#dispatch_arms,)*
-                    _ => ::std::result::Result::Ok(::std::option::Option::None),
-                }
-            }
-        }
-    }
-}
-
-fn generate_trait_client_ext(
-    krate: &syn::Path,
-    trait_ident: &syn::Ident,
-    rpcs: &[RpcMethod],
-) -> proc_macro2::TokenStream {
-    let client_methods: Vec<_> = rpcs
-        .iter()
-        .filter(|rpc| rpc.is_client_visible())
-        .map(|rpc| {
-            let method_name = &rpc.name;
-            let tag = &rpc.tag;
-            let resp_type = &rpc.response_type;
-            let persist_key = rpc.persist_key.as_ref();
-            let param_count = rpc.params.len();
-            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
-            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
-            let param_defs: Vec<_> = param_names
-                .iter()
-                .zip(param_types.iter())
-                .map(|(name, ty)| quote! { #name: &#ty })
-                .collect();
-
-            if rpc.uses_persisted_delivery() {
-                match (persist_key, param_count) {
-                    (Some(persist_key), 0) => quote! {
-                        async fn #method_name(
-                            &self,
-                            entity_id: &#krate::types::EntityId,
-                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                            let key = (#persist_key)();
-                            let key_bytes = rmp_serde::to_vec(&key)
-                                .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                                    reason: ::std::format!(
-                                        "failed to serialize persist key for '{}': {e}",
-                                        #tag
-                                    ),
-                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                                })?;
-                            self.entity_client()
-                                .send_persisted_with_key(
-                                    entity_id,
-                                    #tag,
-                                    &(),
-                                    ::std::option::Option::Some(key_bytes),
-                                    #krate::schema::Uninterruptible::No,
-                                )
-                                .await
-                        }
-                    },
-                    (Some(persist_key), 1) => {
-                        let name = &param_names[0];
-                        let def = &param_defs[0];
-                        quote! {
-                            async fn #method_name(
-                                &self,
-                                entity_id: &#krate::types::EntityId,
-                                #def,
-                            ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                                let key = (#persist_key)(#name);
-                                let key_bytes = rmp_serde::to_vec(&key)
-                                    .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                                        reason: ::std::format!(
-                                            "failed to serialize persist key for '{}': {e}",
-                                            #tag
-                                        ),
-                                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                                    })?;
-                                self.entity_client()
-                                    .send_persisted_with_key(
-                                        entity_id,
-                                        #tag,
-                                        #name,
-                                        ::std::option::Option::Some(key_bytes),
-                                        #krate::schema::Uninterruptible::No,
-                                    )
-                                    .await
-                            }
-                        }
-                    }
-                    (Some(persist_key), _) => quote! {
-                        async fn #method_name(
-                            &self,
-                            entity_id: &#krate::types::EntityId,
-                            #(#param_defs),*
-                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                            let key = (#persist_key)(#(#param_names),*);
-                            let key_bytes = rmp_serde::to_vec(&key)
-                                .map_err(|e| #krate::error::ClusterError::MalformedMessage {
-                                    reason: ::std::format!(
-                                        "failed to serialize persist key for '{}': {e}",
-                                        #tag
-                                    ),
-                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                                })?;
-                            let request = (#(#param_names),*);
-                            self.entity_client()
-                                .send_persisted_with_key(
-                                    entity_id,
-                                    #tag,
-                                    &request,
-                                    ::std::option::Option::Some(key_bytes),
-                                    #krate::schema::Uninterruptible::No,
-                                )
-                                .await
-                        }
-                    },
-                    (None, 0) => quote! {
-                        async fn #method_name(
-                            &self,
-                            entity_id: &#krate::types::EntityId,
-                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                            self.entity_client()
-                                .send_persisted(entity_id, #tag, &(), #krate::schema::Uninterruptible::No)
-                                .await
-                        }
-                    },
-                    (None, 1) => {
-                        let def = &param_defs[0];
-                        let name = &param_names[0];
-                        quote! {
-                            async fn #method_name(
-                                &self,
-                                entity_id: &#krate::types::EntityId,
-                                #def,
-                            ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                                self.entity_client()
-                                    .send_persisted(entity_id, #tag, #name, #krate::schema::Uninterruptible::No)
-                                    .await
-                            }
-                        }
-                    }
-                    (None, _) => quote! {
-                        async fn #method_name(
-                            &self,
-                            entity_id: &#krate::types::EntityId,
-                            #(#param_defs),*
-                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                            let request = (#(#param_names),*);
-                            self.entity_client()
-                                .send_persisted(entity_id, #tag, &request, #krate::schema::Uninterruptible::No)
-                                .await
-                        }
-                    },
-                }
-            } else {
-                match param_count {
-                    0 => quote! {
-                        async fn #method_name(
-                            &self,
-                            entity_id: &#krate::types::EntityId,
-                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                            self.entity_client().send(entity_id, #tag, &()).await
-                        }
-                    },
-                    1 => {
-                        let def = &param_defs[0];
-                        let name = &param_names[0];
-                        quote! {
-                            async fn #method_name(
-                                &self,
-                                entity_id: &#krate::types::EntityId,
-                                #def,
-                            ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                                self.entity_client().send(entity_id, #tag, #name).await
-                            }
-                        }
-                    }
-                    _ => quote! {
-                        async fn #method_name(
-                            &self,
-                            entity_id: &#krate::types::EntityId,
-                            #(#param_defs),*
-                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                            let request = (#(#param_names),*);
-                            self.entity_client().send(entity_id, #tag, &request).await
-                        }
-                    },
-                }
-            }
-        })
-        .collect();
-
-    let client_ext_name = format_ident!("{}ClientExt", trait_ident);
-    quote! {
-        #[async_trait::async_trait]
-        pub trait #client_ext_name: #krate::entity_client::EntityClientAccessor {
-            #(#client_methods)*
-        }
-
-        impl<T> #client_ext_name for T where T: #krate::entity_client::EntityClientAccessor {}
-    }
-}
-
 /// Check if a type is `DurableContext` or `&DurableContext`.
 fn is_durable_context_type(ty: &syn::Type) -> bool {
     match ty {
@@ -2833,6 +2007,7 @@ fn is_durable_context_type(ty: &syn::Type) -> bool {
 }
 
 struct StateArgs {
+    #[allow(dead_code)]
     ty: syn::Type,
     /// Span of the `#[state(...)]` attribute, used for error reporting.
     span: proc_macro2::Span,

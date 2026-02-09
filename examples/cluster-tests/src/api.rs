@@ -15,11 +15,12 @@ use std::sync::Arc;
 use crate::entities::{
     ActivityRecord, ActivityTestClient, AuditEntry, CancelTimerRequest, ClearFiresRequest,
     ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient, DecrementRequest,
-    DeleteRequest, FailingTransferRequest, GetCounterRequest, GetExecutionRequest, GetRequest,
-    GetSqlCountRequest, IncrementRequest, KVStoreClient, ListKeysRequest, Message, PendingTimer,
-    PingRequest, ReceiveRequest, ResetCounterRequest, ResetPingCountRequest,
-    RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
-    RunWithActivitiesRequest, ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState,
+    DeleteRequest, FailingTransferRequest, FailingWorkflowClient, GetCounterRequest,
+    GetExecutionRequest, GetRequest, GetSqlCountRequest, IncrementRequest, KVStoreClient,
+    ListExecutionsRequest, ListKeysRequest, LongWorkflowClient, Message, PendingTimer, PingRequest,
+    ReceiveRequest, ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
+    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
+    ScheduleTimerRequest, SetRequest, SimpleWorkflowClient, SingletonManager, SingletonState,
     SqlActivityTestClient, SqlActivityTestState, StatelessCounterClient,
     StatelessDecrementRequest, StatelessGetRequest, StatelessIncrementRequest,
     StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient, TransferRequest,
@@ -34,8 +35,14 @@ pub struct AppState {
     pub counter_client: CounterClient,
     /// KVStore entity client.
     pub kv_store_client: KVStoreClient,
-    /// WorkflowTest entity client.
+    /// WorkflowTest entity client (for read queries).
     pub workflow_test_client: WorkflowTestClient,
+    /// SimpleWorkflow client (standalone workflow).
+    pub simple_workflow_client: SimpleWorkflowClient,
+    /// FailingWorkflow client (standalone workflow).
+    pub failing_workflow_client: FailingWorkflowClient,
+    /// LongWorkflow client (standalone workflow).
+    pub long_workflow_client: LongWorkflowClient,
     /// ActivityTest entity client.
     pub activity_test_client: ActivityTestClient,
     /// TraitTest entity client.
@@ -381,15 +388,12 @@ async fn workflow_run_simple(
     Path(id): Path<String>,
     Json(body): Json<WorkflowRunSimpleBody>,
 ) -> Result<Json<String>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .workflow_test_client
-        .run_simple_workflow(
-            &entity_id,
-            &RunSimpleWorkflowRequest {
-                exec_id: body.exec_id,
-            },
-        )
+        .simple_workflow_client
+        .execute(&RunSimpleWorkflowRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -400,16 +404,13 @@ async fn workflow_run_failing(
     Path(id): Path<String>,
     Json(body): Json<WorkflowRunFailingBody>,
 ) -> Result<Json<String>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .workflow_test_client
-        .run_failing_workflow(
-            &entity_id,
-            &RunFailingWorkflowRequest {
-                exec_id: body.exec_id,
-                fail_at: body.fail_at,
-            },
-        )
+        .failing_workflow_client
+        .execute(&RunFailingWorkflowRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+            fail_at: body.fail_at,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -420,16 +421,13 @@ async fn workflow_run_long(
     Path(id): Path<String>,
     Json(body): Json<WorkflowRunLongBody>,
 ) -> Result<Json<String>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .workflow_test_client
-        .run_long_workflow(
-            &entity_id,
-            &RunLongWorkflowRequest {
-                exec_id: body.exec_id,
-                steps: body.steps,
-            },
-        )
+        .long_workflow_client
+        .execute(&RunLongWorkflowRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+            steps: body.steps,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -442,7 +440,13 @@ async fn workflow_get_execution(
     let entity_id = EntityId::new(&id);
     let execution = state
         .workflow_test_client
-        .get_execution(&entity_id, &GetExecutionRequest { exec_id })
+        .get_execution(
+            &entity_id,
+            &GetExecutionRequest {
+                entity_id: id,
+                exec_id,
+            },
+        )
         .await?;
     Ok(Json(execution))
 }
@@ -455,7 +459,12 @@ async fn workflow_list_executions(
     let entity_id = EntityId::new(&id);
     let executions = state
         .workflow_test_client
-        .list_executions(&entity_id)
+        .list_executions(
+            &entity_id,
+            &ListExecutionsRequest {
+                entity_id: id,
+            },
+        )
         .await?;
     Ok(Json(executions))
 }

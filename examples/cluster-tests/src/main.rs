@@ -34,8 +34,9 @@ mod entities;
 
 use api::{create_router, AppState};
 use entities::{
-    ActivityTest, Auditable, Counter, CrossEntity, KVStore, SingletonManager, SqlActivityTest,
-    StatelessCounter, TimerTest, TraitTest, Versioned, WorkflowTest,
+    ActivityTest, Auditable, Counter, CrossEntity, FailingWorkflow, KVStore, LongWorkflow,
+    SimpleWorkflow, SingletonManager, SqlActivityTest, StatelessCounter, TimerTest, TraitTest,
+    Versioned, WorkflowTest,
 };
 
 /// Parse a "host:port" string into a RunnerAddress.
@@ -246,11 +247,37 @@ async fn main() -> Result<()> {
     .expect("failed to register KVStore entity");
     tracing::info!("Registered KVStore entity");
 
-    let workflow_test_client = WorkflowTest
-        .register(sharding.clone())
-        .await
-        .expect("failed to register WorkflowTest entity");
+    let workflow_test_client = WorkflowTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register WorkflowTest entity");
     tracing::info!("Registered WorkflowTest entity");
+
+    let simple_workflow_client = SimpleWorkflow {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register SimpleWorkflow");
+    tracing::info!("Registered SimpleWorkflow");
+
+    let failing_workflow_client = FailingWorkflow {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register FailingWorkflow");
+    tracing::info!("Registered FailingWorkflow");
+
+    let long_workflow_client = LongWorkflow {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register LongWorkflow");
+    tracing::info!("Registered LongWorkflow");
 
     let activity_test_client = ActivityTest
         .register(sharding.clone())
@@ -312,6 +339,9 @@ async fn main() -> Result<()> {
         counter_client,
         kv_store_client,
         workflow_test_client,
+        simple_workflow_client,
+        failing_workflow_client,
+        long_workflow_client,
         activity_test_client,
         trait_test_client,
         timer_test_client,
@@ -326,6 +356,9 @@ async fn main() -> Result<()> {
             "Counter".to_string(),
             "KVStore".to_string(),
             "WorkflowTest".to_string(),
+            "Workflow/SimpleWorkflow".to_string(),
+            "Workflow/FailingWorkflow".to_string(),
+            "Workflow/LongWorkflow".to_string(),
             "ActivityTest".to_string(),
             "TraitTest".to_string(),
             "TimerTest".to_string(),

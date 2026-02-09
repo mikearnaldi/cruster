@@ -53,6 +53,8 @@ pub use timer_test::{
 };
 pub use trait_test::{AuditEntry, Auditable, TraitTest, TraitTestClient, UpdateRequest, Versioned};
 pub use workflow_test::{
-    GetExecutionRequest, RunFailingWorkflowRequest, RunLongWorkflowRequest,
-    RunSimpleWorkflowRequest, WorkflowExecution, WorkflowTest, WorkflowTestClient,
+    FailingWorkflow, FailingWorkflowClient, GetExecutionRequest, ListExecutionsRequest,
+    LongWorkflow, LongWorkflowClient, RunFailingWorkflowRequest, RunLongWorkflowRequest,
+    RunSimpleWorkflowRequest, SimpleWorkflow, SimpleWorkflowClient, WorkflowExecution,
+    WorkflowTest, WorkflowTestClient,
 };

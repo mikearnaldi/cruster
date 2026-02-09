@@ -14,15 +14,16 @@ use std::sync::Arc;
 
 use crate::entities::{
     ActivityRecord, ActivityTestClient, AuditEntry, CancelTimerRequest, ClearFiresRequest,
-    ClearMessagesRequest, CounterClient, CrossEntityClient, DecrementRequest, DeleteRequest,
-    FailingTransferRequest, GetCounterRequest, GetExecutionRequest, GetRequest, GetSqlCountRequest,
-    IncrementRequest, KVStoreClient, Message, PendingTimer, PingRequest, ReceiveRequest,
-    ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
-    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
-    ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState, SqlActivityTestClient,
-    SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
-    StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
-    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
+    ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient, DecrementRequest,
+    DeleteRequest, FailingTransferRequest, GetCounterRequest, GetExecutionRequest, GetRequest,
+    GetSqlCountRequest, IncrementRequest, KVStoreClient, ListKeysRequest, Message, PendingTimer,
+    PingRequest, ReceiveRequest, ResetCounterRequest, ResetPingCountRequest,
+    RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
+    RunWithActivitiesRequest, ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState,
+    SqlActivityTestClient, SqlActivityTestState, StatelessCounterClient,
+    StatelessDecrementRequest, StatelessGetRequest, StatelessIncrementRequest,
+    StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient, TransferRequest,
+    UpdateRequest, WorkflowExecution, WorkflowTestClient,
 };
 // Import trait client extensions to make trait methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
@@ -262,6 +263,7 @@ async fn kv_set(
         .set(
             &entity_id,
             &SetRequest {
+                entity_id: id,
                 key: body.key,
                 value: body.value,
             },
@@ -278,7 +280,13 @@ async fn kv_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .kv_store_client
-        .get(&entity_id, &GetRequest { key })
+        .get(
+            &entity_id,
+            &GetRequest {
+                entity_id: id,
+                key,
+            },
+        )
         .await?;
     Ok(Json(value))
 }
@@ -291,7 +299,13 @@ async fn kv_delete(
     let entity_id = EntityId::new(&id);
     let deleted = state
         .kv_store_client
-        .delete(&entity_id, &DeleteRequest { key })
+        .delete(
+            &entity_id,
+            &DeleteRequest {
+                entity_id: id,
+                key,
+            },
+        )
         .await?;
     Ok(Json(deleted))
 }
@@ -302,7 +316,15 @@ async fn kv_list_keys(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let keys = state.kv_store_client.list_keys(&entity_id).await?;
+    let keys = state
+        .kv_store_client
+        .list_keys(
+            &entity_id,
+            &ListKeysRequest {
+                entity_id: id,
+            },
+        )
+        .await?;
     Ok(Json(keys))
 }
 
@@ -312,7 +334,15 @@ async fn kv_clear(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    state.kv_store_client.clear(&entity_id).await?;
+    state
+        .kv_store_client
+        .clear(
+            &entity_id,
+            &ClearRequest {
+                entity_id: id,
+            },
+        )
+        .await?;
     Ok(Json(()))
 }
 

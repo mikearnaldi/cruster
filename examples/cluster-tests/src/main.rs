@@ -238,10 +238,12 @@ async fn main() -> Result<()> {
     .expect("failed to register Counter entity");
     tracing::info!("Registered Counter entity");
 
-    let kv_store_client = KVStore
-        .register(sharding.clone())
-        .await
-        .expect("failed to register KVStore entity");
+    let kv_store_client = KVStore {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register KVStore entity");
     tracing::info!("Registered KVStore entity");
 
     let workflow_test_client = WorkflowTest

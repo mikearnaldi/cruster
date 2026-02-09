@@ -35,7 +35,9 @@ pub use cross_entity::{
     ClearMessagesRequest, CrossEntity, CrossEntityClient, Message, PingRequest, ReceiveRequest,
     ResetPingCountRequest,
 };
-pub use kv_store::{DeleteRequest, GetRequest, KVStore, KVStoreClient, SetRequest};
+pub use kv_store::{
+    ClearRequest, DeleteRequest, GetRequest, KVStore, KVStoreClient, ListKeysRequest, SetRequest,
+};
 pub use singleton_test::{SingletonManager, SingletonState};
 pub use sql_activity_test::{
     FailingTransferRequest, GetSqlCountRequest, SqlActivityTest, SqlActivityTestClient,

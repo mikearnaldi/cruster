@@ -1,5 +1,4 @@
 use cruster::{entity, entity_impl};
-use cruster::error::ClusterError;
 
 struct NotSerializable {
     value: std::cell::Cell<i32>,
@@ -12,7 +11,7 @@ struct BadEntity;
 #[entity_impl]
 impl BadEntity {
     #[workflow]
-    async fn bad(&self, value: NotSerializable) -> Result<(), ClusterError> {
+    async fn bad(&self, value: NotSerializable) -> Result<(), cruster::error::ClusterError> {
         let _ = value;
         Ok(())
     }

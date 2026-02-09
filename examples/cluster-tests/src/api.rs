@@ -125,10 +125,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/cross/:id/clear", post(cross_clear_messages))
         .route("/cross/:id/ping-pong", post(cross_ping_pong))
         // StatelessCounter routes (pure-RPC, new API)
-        .route(
-            "/stateless-counter/:id",
-            get(stateless_counter_get),
-        )
+        .route("/stateless-counter/:id", get(stateless_counter_get))
         .route(
             "/stateless-counter/:id/increment",
             post(stateless_counter_increment),
@@ -909,12 +906,7 @@ async fn stateless_counter_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .stateless_counter_client
-        .get(
-            &entity_id,
-            &StatelessGetRequest {
-                entity_id: id,
-            },
-        )
+        .get(&entity_id, &StatelessGetRequest { entity_id: id })
         .await?;
     Ok(Json(value))
 }
@@ -967,12 +959,7 @@ async fn stateless_counter_reset(
     let entity_id = EntityId::new(&id);
     state
         .stateless_counter_client
-        .reset(
-            &entity_id,
-            &StatelessResetRequest {
-                entity_id: id,
-            },
-        )
+        .reset(&entity_id, &StatelessResetRequest { entity_id: id })
         .await?;
     Ok(Json(()))
 }

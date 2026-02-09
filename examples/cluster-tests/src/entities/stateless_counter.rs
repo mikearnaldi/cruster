@@ -68,10 +68,7 @@ impl StatelessCounter {
     ///
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
-    pub async fn increment(
-        &self,
-        request: StatelessIncrementRequest,
-    ) -> Result<i64, ClusterError> {
+    pub async fn increment(&self, request: StatelessIncrementRequest) -> Result<i64, ClusterError> {
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO stateless_counter_values (entity_id, value)
              VALUES ($1, $2)
@@ -94,10 +91,7 @@ impl StatelessCounter {
     ///
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
-    pub async fn decrement(
-        &self,
-        request: StatelessDecrementRequest,
-    ) -> Result<i64, ClusterError> {
+    pub async fn decrement(&self, request: StatelessDecrementRequest) -> Result<i64, ClusterError> {
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO stateless_counter_values (entity_id, value)
              VALUES ($1, -$2)

@@ -38,15 +38,15 @@ pub use sql_activity_test::{
     FailingTransferRequest, GetSqlCountRequest, SqlActivityTest, SqlActivityTestClient,
     SqlActivityTestState, TransferRequest,
 };
+pub use stateless_counter::{
+    StatelessCounter, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
+    StatelessIncrementRequest, StatelessResetRequest,
+};
 pub use timer_test::{
     CancelTimerRequest, ClearFiresRequest, PendingTimer, ScheduleTimerRequest, TimerFire,
     TimerTest, TimerTestClient,
 };
 pub use trait_test::{AuditEntry, Auditable, TraitTest, TraitTestClient, UpdateRequest, Versioned};
-pub use stateless_counter::{
-    StatelessCounter, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
-    StatelessIncrementRequest, StatelessResetRequest,
-};
 pub use workflow_test::{
     GetExecutionRequest, RunFailingWorkflowRequest, RunLongWorkflowRequest,
     RunSimpleWorkflowRequest, WorkflowExecution, WorkflowTest, WorkflowTestClient,

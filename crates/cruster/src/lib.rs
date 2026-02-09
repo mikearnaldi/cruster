@@ -59,6 +59,9 @@ pub mod types;
 /// Re-export proc macros for entity definition.
 pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
 
+/// Re-export proc macros for standalone workflow definition.
+pub use cruster_macros::{standalone_workflow, standalone_workflow_impl};
+
 /// Prelude module for convenient glob imports.
 ///
 /// This module re-exports all commonly used items including proc-macro attributes.
@@ -96,11 +99,15 @@ pub mod prelude {
     // Main macros
     pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
 
+    // Standalone workflow macros
+    pub use cruster_macros::{standalone_workflow, standalone_workflow_impl};
+
     // Helper attribute macros (for IDE autocomplete and documentation)
     pub use cruster_macros::{activity, private, protected, public, rpc, state, workflow};
 
     // Common types
     pub use crate::entity::{Entity, EntityContext, EntityHandler};
+    pub use crate::entity_client::WorkflowClientFactory;
     pub use crate::error::ClusterError;
 }
 mod durable;

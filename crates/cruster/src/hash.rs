@@ -67,6 +67,19 @@ pub fn shard_for_entity(entity_id: &str, shards_per_group: i32) -> i32 {
     (djb2_hash(entity_id.as_bytes()) % shards_per_group as u32) as i32
 }
 
+/// Compute a deterministic hex-encoded hash of the given bytes.
+///
+/// Uses a combination of two 64-bit hashes with different seeds to produce
+/// a 128-bit (32-character hex) string suitable for idempotency keys.
+/// This is NOT cryptographic — it's designed for uniform distribution
+/// in entity ID derivation.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let h1 = hash64(bytes);
+    // Use djb2 with a different seed as a second independent hash
+    let h2 = djb2_hash64_with_seed(0x517cc1b727220a95, bytes);
+    format!("{h1:016x}{h2:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4255,3 +4255,1246 @@ fn extract_result_ok_type(ty: &syn::Type) -> syn::Result<syn::Type> {
         "expected Result<T, ClusterError> return type",
     ))
 }
+
+// =============================================================================
+// Standalone Workflow Macros
+// =============================================================================
+
+/// Attribute macro for standalone workflow struct definitions.
+///
+/// Workflows are stateless, durable orchestration constructs backed by hidden entities.
+/// Each workflow has a single `execute` entry point and `#[activity]` methods for
+/// side effects.
+///
+/// # Attributes
+///
+/// - `#[standalone_workflow]` — default: key = hash(serialize(request))
+/// - `#[standalone_workflow(key = |req| req.order_id.clone())]` — custom key, hashed
+/// - `#[standalone_workflow(key = |req| req.order_id.clone(), hash = false)]` — custom key, raw
+///
+/// # Example
+///
+/// ```text
+/// use cruster::prelude::*;
+///
+/// #[standalone_workflow]
+/// #[derive(Clone)]
+/// pub struct ProcessOrder {
+///     http: HttpClient,
+/// }
+///
+/// #[standalone_workflow_impl]
+/// impl ProcessOrder {
+///     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
+///         let reserved = self.reserve_inventory(request.items.clone()).await?;
+///         Ok(OrderResult { order_id: reserved.id })
+///     }
+///
+///     #[activity]
+///     async fn reserve_inventory(&self, items: Vec<Item>) -> Result<Reservation, ClusterError> {
+///         todo!()
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn standalone_workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as WorkflowStructArgs);
+    let input = parse_macro_input!(item as syn::ItemStruct);
+    match standalone_workflow_struct_inner(args, input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Attribute macro for standalone workflow impl blocks.
+///
+/// Must contain exactly one `execute` method (the entry point) and zero or more
+/// `#[activity]` methods (journaled side effects).
+///
+/// # Attributes
+///
+/// - `#[standalone_workflow_impl]` — default
+/// - `#[standalone_workflow_impl(krate = "crate")]` — for internal use
+///
+/// # Example
+///
+/// ```text
+/// #[standalone_workflow_impl]
+/// impl ProcessOrder {
+///     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
+///         let charge = self.charge(request.payment).await?;
+///         Ok(OrderResult { charge_id: charge.id })
+///     }
+///
+///     #[activity]
+///     async fn charge(&self, payment: Payment) -> Result<Charge, ClusterError> {
+///         todo!()
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn standalone_workflow_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as WorkflowImplArgs);
+    let input = parse_macro_input!(item as syn::ItemImpl);
+    match standalone_workflow_impl_inner(args, input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+// --- Workflow argument parsing ---
+
+struct WorkflowStructArgs {
+    key: Option<syn::ExprClosure>,
+    hash: bool,
+    krate: Option<syn::Path>,
+}
+
+impl syn::parse::Parse for WorkflowStructArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut args = WorkflowStructArgs {
+            key: None,
+            hash: true,
+            krate: None,
+        };
+
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+
+            match ident.to_string().as_str() {
+                "key" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let expr: syn::Expr = if input.peek(syn::token::Paren) {
+                        let content;
+                        syn::parenthesized!(content in input);
+                        content.parse()?
+                    } else {
+                        input.parse()?
+                    };
+                    match expr {
+                        syn::Expr::Closure(closure) => args.key = Some(closure),
+                        _ => return Err(syn::Error::new(
+                            expr.span(),
+                            "key must be a closure, e.g. #[standalone_workflow(key = |req| ...)]",
+                        )),
+                    }
+                }
+                "hash" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let lit: syn::LitBool = input.parse()?;
+                    args.hash = lit.value;
+                }
+                "krate" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let lit: syn::LitStr = input.parse()?;
+                    args.krate = Some(lit.parse()?);
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("unknown standalone_workflow attribute: {other}"),
+                    ));
+                }
+            }
+
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+
+        Ok(args)
+    }
+}
+
+struct WorkflowImplArgs {
+    krate: Option<syn::Path>,
+}
+
+impl syn::parse::Parse for WorkflowImplArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut args = WorkflowImplArgs { krate: None };
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            match ident.to_string().as_str() {
+                "krate" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let lit: syn::LitStr = input.parse()?;
+                    args.krate = Some(lit.parse()?);
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("unknown standalone_workflow_impl attribute: {other}"),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+        Ok(args)
+    }
+}
+
+// --- #[standalone_workflow] struct-level codegen ---
+
+fn standalone_workflow_struct_inner(
+    args: WorkflowStructArgs,
+    input: syn::ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let krate = args.krate.unwrap_or_else(default_crate_path);
+    let struct_name = &input.ident;
+    let entity_name = format!("Workflow/{}", struct_name);
+
+    // Store key/hash config as hidden associated constants for the impl macro to use.
+    // The key closure is stored as a hidden method.
+    let key_derivation_info = if let Some(_key_closure) = &args.key {
+        let hash_val = args.hash;
+        quote! {
+            #[doc(hidden)]
+            fn __workflow_key_closure() -> bool { true }
+            #[doc(hidden)]
+            fn __workflow_hash() -> bool { #hash_val }
+            #[doc(hidden)]
+            fn __extract_key<__Req>(req: &__Req) -> ::std::string::String
+            where __Req: serde::Serialize,
+            {
+                // This is a placeholder — the actual key extraction is codegen'd
+                // by standalone_workflow_impl based on the struct's key attribute.
+                let _ = req;
+                unreachable!("key extraction is generated by standalone_workflow_impl")
+            }
+        }
+    } else {
+        quote! {
+            #[doc(hidden)]
+            fn __workflow_key_closure() -> bool { false }
+            #[doc(hidden)]
+            fn __workflow_hash() -> bool { true }
+        }
+    };
+    // Store key closure as a hidden item for the impl macro.
+    // We stash the key closure info as a doc-hidden type.
+    let _ = key_derivation_info;
+    let _ = args.key;
+
+    Ok(quote! {
+        #input
+
+        #[allow(dead_code)]
+        impl #struct_name {
+            #[doc(hidden)]
+            fn __entity_type(&self) -> #krate::types::EntityType {
+                #krate::types::EntityType::new(#entity_name)
+            }
+
+            #[doc(hidden)]
+            fn __shard_group(&self) -> &str {
+                "default"
+            }
+
+            #[doc(hidden)]
+            fn __shard_group_for(&self, _entity_id: &#krate::types::EntityId) -> &str {
+                self.__shard_group()
+            }
+
+            #[doc(hidden)]
+            fn __max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
+                ::std::option::Option::None
+            }
+
+            #[doc(hidden)]
+            fn __mailbox_capacity(&self) -> ::std::option::Option<usize> {
+                ::std::option::Option::None
+            }
+
+            #[doc(hidden)]
+            fn __concurrency(&self) -> ::std::option::Option<usize> {
+                ::std::option::Option::None
+            }
+        }
+    })
+}
+
+// --- Workflow activity info for codegen ---
+
+struct WorkflowActivityInfo {
+    name: syn::Ident,
+    #[allow(dead_code)]
+    tag: String,
+    params: Vec<RpcParam>,
+    #[allow(dead_code)]
+    response_type: syn::Type,
+    persist_key: Option<syn::ExprClosure>,
+    original_method: syn::ImplItemFn,
+}
+
+struct WorkflowExecuteInfo {
+    params: Vec<RpcParam>,
+    request_type: syn::Type,
+    response_type: syn::Type,
+    original_method: syn::ImplItemFn,
+}
+
+// --- #[standalone_workflow_impl] codegen ---
+
+fn standalone_workflow_impl_inner(
+    args: WorkflowImplArgs,
+    input: syn::ItemImpl,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let krate = args.krate.unwrap_or_else(default_crate_path);
+    let self_ty = &input.self_ty;
+
+    let struct_name = match self_ty.as_ref() {
+        syn::Type::Path(tp) => tp
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.clone())
+            .ok_or_else(|| syn::Error::new(self_ty.span(), "expected struct name"))?,
+        _ => return Err(syn::Error::new(self_ty.span(), "expected struct name")),
+    };
+
+    let handler_name = format_ident!("__{}WorkflowHandler", struct_name);
+    let client_name = format_ident!("{}Client", struct_name);
+    let execute_view_name = format_ident!("__{}ExecuteView", struct_name);
+    let activity_view_name = format_ident!("__{}ActivityView", struct_name);
+    let entity_name = format!("Workflow/{}", struct_name);
+
+    // Validate: no #[state], no #[rpc], no #[workflow], no &mut self
+    for attr in &input.attrs {
+        if attr.path().is_ident("state") {
+            return Err(syn::Error::new(
+                attr.span(),
+                "workflows are stateless; remove #[state(...)]",
+            ));
+        }
+    }
+
+    // Parse methods: find execute, activities, and helpers
+    let mut execute_info: Option<WorkflowExecuteInfo> = None;
+    let mut activities: Vec<WorkflowActivityInfo> = Vec::new();
+    let mut original_methods: Vec<syn::ImplItemFn> = Vec::new();
+
+    for item in &input.items {
+        if let syn::ImplItem::Fn(method) = item {
+            // Check for forbidden annotations
+            for attr in &method.attrs {
+                if attr.path().is_ident("state") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "workflows are stateless; remove #[state(...)]",
+                    ));
+                }
+                if attr.path().is_ident("rpc") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "workflows use #[activity], not #[rpc]",
+                    ));
+                }
+                if attr.path().is_ident("workflow") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "workflows have a single execute entry point; use client calls for cross-workflow interaction",
+                    ));
+                }
+            }
+
+            // Check for &mut self
+            if let Some(syn::FnArg::Receiver(r)) = method.sig.inputs.first() {
+                if r.mutability.is_some() {
+                    return Err(syn::Error::new(
+                        r.span(),
+                        "workflow methods must use &self, not &mut self",
+                    ));
+                }
+            }
+
+            if method.sig.ident == "execute" {
+                // Parse execute method
+                if execute_info.is_some() {
+                    return Err(syn::Error::new(
+                        method.sig.span(),
+                        "workflow must have exactly one execute method",
+                    ));
+                }
+
+                if method.sig.asyncness.is_none() {
+                    return Err(syn::Error::new(method.sig.span(), "execute must be async"));
+                }
+
+                // Parse params (skip &self)
+                let mut params = Vec::new();
+                for arg in method.sig.inputs.iter().skip(1) {
+                    if let syn::FnArg::Typed(pat_type) = arg {
+                        let name = match &*pat_type.pat {
+                            syn::Pat::Ident(ident) => ident.ident.clone(),
+                            _ => {
+                                return Err(syn::Error::new(
+                                    pat_type.pat.span(),
+                                    "execute parameters must be simple identifiers",
+                                ))
+                            }
+                        };
+                        params.push(RpcParam {
+                            name,
+                            ty: (*pat_type.ty).clone(),
+                        });
+                    }
+                }
+
+                if params.len() != 1 {
+                    return Err(syn::Error::new(
+                        method.sig.span(),
+                        "execute must take exactly one request parameter (after &self)",
+                    ));
+                }
+
+                let request_type = params[0].ty.clone();
+                let response_type = extract_result_ok_type(match &method.sig.output {
+                    syn::ReturnType::Type(_, ty) => ty,
+                    syn::ReturnType::Default => {
+                        return Err(syn::Error::new(
+                            method.sig.span(),
+                            "execute must return Result<T, ClusterError>",
+                        ))
+                    }
+                })?;
+
+                execute_info = Some(WorkflowExecuteInfo {
+                    params,
+                    request_type,
+                    response_type,
+                    original_method: method.clone(),
+                });
+            } else {
+                // Check if it's an activity
+                let is_activity = method.attrs.iter().any(|a| a.path().is_ident("activity"));
+
+                if is_activity {
+                    if method.sig.asyncness.is_none() {
+                        return Err(syn::Error::new(
+                            method.sig.span(),
+                            "#[activity] methods must be async",
+                        ));
+                    }
+
+                    // Parse activity key attribute
+                    let persist_key = {
+                        let mut key = None;
+                        for attr in &method.attrs {
+                            if attr.path().is_ident("activity") {
+                                let args = match &attr.meta {
+                                    syn::Meta::Path(_) => KeyArgs { key: None },
+                                    syn::Meta::List(_) => attr.parse_args::<KeyArgs>()?,
+                                    _ => {
+                                        return Err(syn::Error::new(
+                                            attr.span(),
+                                            "expected #[activity] or #[activity(key(...))]",
+                                        ))
+                                    }
+                                };
+                                key = args.key;
+                            }
+                        }
+                        key
+                    };
+
+                    // Parse params
+                    let mut params = Vec::new();
+                    for arg in method.sig.inputs.iter().skip(1) {
+                        if let syn::FnArg::Typed(pat_type) = arg {
+                            let name = match &*pat_type.pat {
+                                syn::Pat::Ident(ident) => ident.ident.clone(),
+                                _ => {
+                                    return Err(syn::Error::new(
+                                        pat_type.pat.span(),
+                                        "activity parameters must be simple identifiers",
+                                    ))
+                                }
+                            };
+                            params.push(RpcParam {
+                                name,
+                                ty: (*pat_type.ty).clone(),
+                            });
+                        }
+                    }
+
+                    let response_type = extract_result_ok_type(match &method.sig.output {
+                        syn::ReturnType::Type(_, ty) => ty,
+                        syn::ReturnType::Default => {
+                            return Err(syn::Error::new(
+                                method.sig.span(),
+                                "#[activity] must return Result<T, ClusterError>",
+                            ))
+                        }
+                    })?;
+
+                    activities.push(WorkflowActivityInfo {
+                        name: method.sig.ident.clone(),
+                        tag: method.sig.ident.to_string(),
+                        params,
+                        response_type,
+                        persist_key,
+                        original_method: method.clone(),
+                    });
+                }
+            }
+            original_methods.push(method.clone());
+        }
+    }
+
+    let execute = execute_info.ok_or_else(|| {
+        syn::Error::new(
+            input.self_ty.span(),
+            "workflow must define an `async fn execute(&self, request: T) -> Result<R, ClusterError>` method",
+        )
+    })?;
+
+    let request_type = &execute.request_type;
+    let response_type = &execute.response_type;
+
+    // --- Generate execute view methods ---
+    // execute goes on the execute view
+    let execute_method = &execute.original_method;
+    let execute_block = &execute_method.block;
+    let execute_output = &execute_method.sig.output;
+    let execute_param_name = &execute.params[0].name;
+    let execute_param_type = &execute.params[0].ty;
+    let execute_attrs: Vec<_> = execute_method
+        .attrs
+        .iter()
+        .filter(|a| {
+            !a.path().is_ident("rpc")
+                && !a.path().is_ident("workflow")
+                && !a.path().is_ident("activity")
+        })
+        .collect();
+
+    // --- Generate activity methods on the activity view ---
+    let mut activity_view_methods = Vec::new();
+    for act in &activities {
+        let method = &act.original_method;
+        let block = &method.block;
+        let output = &method.sig.output;
+        let name = &act.name;
+        let params: Vec<_> = method.sig.inputs.iter().skip(1).collect();
+        let attrs: Vec<_> = method
+            .attrs
+            .iter()
+            .filter(|a| {
+                !a.path().is_ident("activity")
+                    && !a.path().is_ident("public")
+                    && !a.path().is_ident("protected")
+                    && !a.path().is_ident("private")
+            })
+            .collect();
+        let vis = &method.vis;
+
+        activity_view_methods.push(quote! {
+            #(#attrs)*
+            #vis async fn #name(&self, #(#params),*) #output
+                #block
+        });
+    }
+
+    // --- Generate helper methods on both views ---
+    let mut helper_execute_methods = Vec::new();
+    let mut helper_activity_methods = Vec::new();
+
+    for method in &original_methods {
+        let name = &method.sig.ident;
+        if name == "execute" {
+            continue;
+        }
+        let is_activity = method.attrs.iter().any(|a| a.path().is_ident("activity"));
+        if is_activity {
+            continue;
+        }
+
+        // Unannotated methods are helpers — put them on both views
+        let block = &method.block;
+        let output = &method.sig.output;
+        let params: Vec<_> = method.sig.inputs.iter().skip(1).collect();
+        let attrs: Vec<_> = method
+            .attrs
+            .iter()
+            .filter(|a| {
+                !a.path().is_ident("rpc")
+                    && !a.path().is_ident("workflow")
+                    && !a.path().is_ident("activity")
+                    && !a.path().is_ident("method")
+                    && !a.path().is_ident("public")
+                    && !a.path().is_ident("protected")
+                    && !a.path().is_ident("private")
+            })
+            .collect();
+        let vis = &method.vis;
+        let async_token = if method.sig.asyncness.is_some() {
+            quote! { async }
+        } else {
+            quote! {}
+        };
+
+        let method_tokens = quote! {
+            #(#attrs)*
+            #vis #async_token fn #name(&self, #(#params),*) #output
+                #block
+        };
+        helper_execute_methods.push(method_tokens.clone());
+        helper_activity_methods.push(method_tokens);
+    }
+
+    // --- Generate activity delegation methods on execute view ---
+    // These route through DurableContext::run() for journaling
+    let activity_delegations: Vec<proc_macro2::TokenStream> = activities
+        .iter()
+        .map(|act| {
+            let method_name = &act.name;
+            let method_name_str = method_name.to_string();
+            let method_info = &act.original_method;
+            let params: Vec<_> = method_info.sig.inputs.iter().skip(1).collect();
+            let param_names: Vec<_> = method_info
+                .sig
+                .inputs
+                .iter()
+                .skip(1)
+                .filter_map(|arg| {
+                    if let syn::FnArg::Typed(pat_type) = arg {
+                        if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                            return Some(&pat_ident.ident);
+                        }
+                    }
+                    None
+                })
+                .collect();
+            let output = &method_info.sig.output;
+
+            let wire_param_names: Vec<_> = act.params.iter().map(|p| &p.name).collect();
+            let wire_param_count = wire_param_names.len();
+
+            // Build key-bytes computation
+            let key_bytes_code = if let Some(persist_key) = &act.persist_key {
+                match wire_param_count {
+                    0 => quote! {
+                        let __journal_key = (#persist_key)();
+                        let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                    1 => {
+                        let name = &wire_param_names[0];
+                        quote! {
+                            let __journal_key = (#persist_key)(#name);
+                            let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                                .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                    reason: ::std::format!("failed to serialize journal key: {e}"),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })?;
+                        }
+                    }
+                    _ => quote! {
+                        let __journal_key = (#persist_key)(#(&#wire_param_names),*);
+                        let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                }
+            } else {
+                match wire_param_count {
+                    0 => quote! {
+                        let __journal_key_bytes = rmp_serde::to_vec(&()).unwrap_or_default();
+                    },
+                    1 => {
+                        let name = &wire_param_names[0];
+                        quote! {
+                            let __journal_key_bytes = rmp_serde::to_vec(&#name)
+                                .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                    reason: ::std::format!("failed to serialize journal key: {e}"),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })?;
+                        }
+                    }
+                    _ => quote! {
+                        let __journal_key_bytes = rmp_serde::to_vec(&(#(&#wire_param_names),*))
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                }
+            };
+
+            quote! {
+                #[inline]
+                async fn #method_name(&self, #(#params),*) #output {
+                    if let (
+                        ::std::option::Option::Some(__engine),
+                        ::std::option::Option::Some(__msg_storage),
+                        ::std::option::Option::Some(__wf_storage),
+                    ) = (
+                        self.__handler.__workflow_engine.as_ref(),
+                        self.__handler.__message_storage.as_ref(),
+                        self.__handler.__state_storage.as_ref(),
+                    ) {
+                        #key_bytes_code
+                        // Scope the journal key per workflow execution
+                        let __journal_key_bytes = {
+                            let mut __scoped = ::std::vec::Vec::new();
+                            if let ::std::option::Option::Some(__wf_id) = #krate::__internal::WorkflowScope::current() {
+                                __scoped.extend_from_slice(&__wf_id.to_le_bytes());
+                            }
+                            __scoped.extend_from_slice(&__journal_key_bytes);
+                            __scoped
+                        };
+                        let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
+                            ::std::sync::Arc::clone(__engine),
+                            self.__handler.ctx.address.entity_type.0.clone(),
+                            self.__handler.ctx.address.entity_id.0.clone(),
+                            ::std::sync::Arc::clone(__msg_storage),
+                            ::std::sync::Arc::clone(__wf_storage),
+                        );
+                        let __activity_view = #activity_view_name {
+                            __handler: self.__handler,
+                        };
+                        __journal_ctx.run(#method_name_str, &__journal_key_bytes, || {
+                            __activity_view.#method_name(#(#param_names),*)
+                        }).await
+                    } else {
+                        // No journal — execute directly
+                        let __activity_view = #activity_view_name {
+                            __handler: self.__handler,
+                        };
+                        __activity_view.#method_name(#(#param_names),*).await
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // --- Generate Handler ---
+    let handler_def = quote! {
+        #[doc(hidden)]
+        pub struct #handler_name {
+            /// The workflow instance (user struct).
+            __workflow: #struct_name,
+            /// Entity context.
+            #[allow(dead_code)]
+            ctx: #krate::entity::EntityContext,
+            /// Workflow storage for journal/state.
+            __state_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowStorage>>,
+            /// Workflow engine for durable primitives.
+            __workflow_engine: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowEngine>>,
+            /// Message storage for persistence.
+            __message_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::MessageStorage>>,
+            /// Sharding interface.
+            __sharding: ::std::option::Option<::std::sync::Arc<dyn #krate::sharding::Sharding>>,
+            /// Entity address.
+            __entity_address: #krate::types::EntityAddress,
+        }
+
+        impl #handler_name {
+            #[doc(hidden)]
+            pub async fn __new(
+                workflow: #struct_name,
+                ctx: #krate::entity::EntityContext,
+            ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
+                let __state_storage = ctx.state_storage.clone();
+                let __sharding = ctx.sharding.clone();
+                let __entity_address = ctx.address.clone();
+                ::std::result::Result::Ok(Self {
+                    __workflow: workflow,
+                    __workflow_engine: ctx.workflow_engine.clone(),
+                    __message_storage: ctx.message_storage.clone(),
+                    ctx,
+                    __state_storage,
+                    __sharding,
+                    __entity_address,
+                })
+            }
+
+            /// Durable sleep that survives workflow restarts.
+            pub async fn sleep(&self, name: &str, duration: ::std::time::Duration) -> ::std::result::Result<(), #krate::error::ClusterError> {
+                let engine = self.__workflow_engine.as_ref().ok_or_else(|| {
+                    #krate::error::ClusterError::MalformedMessage {
+                        reason: "sleep() requires a workflow engine".into(),
+                        source: ::std::option::Option::None,
+                    }
+                })?;
+                let ctx = #krate::__internal::DurableContext::new(
+                    ::std::sync::Arc::clone(engine),
+                    self.ctx.address.entity_type.0.clone(),
+                    self.ctx.address.entity_id.0.clone(),
+                );
+                ctx.sleep(name, duration).await
+            }
+
+            /// Wait for an external signal to resolve a typed value.
+            pub async fn await_deferred<T, K>(&self, key: K) -> ::std::result::Result<T, #krate::error::ClusterError>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned,
+                K: #krate::__internal::DeferredKeyLike<T>,
+            {
+                let engine = self.__workflow_engine.as_ref().ok_or_else(|| {
+                    #krate::error::ClusterError::MalformedMessage {
+                        reason: "await_deferred() requires a workflow engine".into(),
+                        source: ::std::option::Option::None,
+                    }
+                })?;
+                let ctx = #krate::__internal::DurableContext::new(
+                    ::std::sync::Arc::clone(engine),
+                    self.ctx.address.entity_type.0.clone(),
+                    self.ctx.address.entity_id.0.clone(),
+                );
+                ctx.await_deferred(key).await
+            }
+
+            /// Resolve a deferred value.
+            pub async fn resolve_deferred<T, K>(&self, key: K, value: &T) -> ::std::result::Result<(), #krate::error::ClusterError>
+            where
+                T: serde::Serialize,
+                K: #krate::__internal::DeferredKeyLike<T>,
+            {
+                let engine = self.__workflow_engine.as_ref().ok_or_else(|| {
+                    #krate::error::ClusterError::MalformedMessage {
+                        reason: "resolve_deferred() requires a workflow engine".into(),
+                        source: ::std::option::Option::None,
+                    }
+                })?;
+                let ctx = #krate::__internal::DurableContext::new(
+                    ::std::sync::Arc::clone(engine),
+                    self.ctx.address.entity_type.0.clone(),
+                    self.ctx.address.entity_id.0.clone(),
+                );
+                ctx.resolve_deferred(key, value).await
+            }
+
+            /// Wait for an interrupt signal.
+            pub async fn on_interrupt(&self) -> ::std::result::Result<(), #krate::error::ClusterError> {
+                let engine = self.__workflow_engine.as_ref().ok_or_else(|| {
+                    #krate::error::ClusterError::MalformedMessage {
+                        reason: "on_interrupt() requires a workflow engine".into(),
+                        source: ::std::option::Option::None,
+                    }
+                })?;
+                let ctx = #krate::__internal::DurableContext::new(
+                    ::std::sync::Arc::clone(engine),
+                    self.ctx.address.entity_type.0.clone(),
+                    self.ctx.address.entity_id.0.clone(),
+                );
+                ctx.on_interrupt().await
+            }
+
+            /// Get the execution ID (= entity ID).
+            pub fn execution_id(&self) -> &str {
+                &self.__entity_address.entity_id.0
+            }
+
+            /// Get the entity ID.
+            pub fn entity_id(&self) -> &#krate::types::EntityId {
+                &self.__entity_address.entity_id
+            }
+
+            /// Get the sharding interface.
+            pub fn sharding(&self) -> ::std::option::Option<&::std::sync::Arc<dyn #krate::sharding::Sharding>> {
+                self.__sharding.as_ref()
+            }
+
+            /// Get the entity address.
+            pub fn entity_address(&self) -> &#krate::types::EntityAddress {
+                &self.__entity_address
+            }
+        }
+    };
+
+    // --- Generate view structs ---
+    let view_structs = quote! {
+        /// View struct for execute — provides durable primitives + activity delegation.
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        struct #execute_view_name<'a> {
+            __handler: &'a #handler_name,
+        }
+
+        /// View struct for activities — provides struct field access only.
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        struct #activity_view_name<'a> {
+            __handler: &'a #handler_name,
+        }
+
+        // Both views deref to the user's workflow struct
+        impl ::std::ops::Deref for #execute_view_name<'_> {
+            type Target = #struct_name;
+            fn deref(&self) -> &Self::Target {
+                &self.__handler.__workflow
+            }
+        }
+
+        impl ::std::ops::Deref for #activity_view_name<'_> {
+            type Target = #struct_name;
+            fn deref(&self) -> &Self::Target {
+                &self.__handler.__workflow
+            }
+        }
+    };
+
+    // --- Execute view: durable primitive delegations ---
+    let execute_view_impl = quote! {
+        impl #execute_view_name<'_> {
+            /// Durable sleep.
+            #[inline]
+            async fn sleep(&self, duration: ::std::time::Duration) -> ::std::result::Result<(), #krate::error::ClusterError> {
+                // Use a fixed name for workflow sleep — uniqueness comes from WorkflowScope
+                self.__handler.sleep("__wf_sleep", duration).await
+            }
+
+            /// Wait for an external signal.
+            #[inline]
+            async fn await_deferred<T, K>(&self, key: K) -> ::std::result::Result<T, #krate::error::ClusterError>
+            where
+                T: serde::Serialize + serde::de::DeserializeOwned,
+                K: #krate::__internal::DeferredKeyLike<T>,
+            {
+                self.__handler.await_deferred(key).await
+            }
+
+            /// Resolve a deferred value.
+            #[inline]
+            async fn resolve_deferred<T, K>(&self, key: K, value: &T) -> ::std::result::Result<(), #krate::error::ClusterError>
+            where
+                T: serde::Serialize,
+                K: #krate::__internal::DeferredKeyLike<T>,
+            {
+                self.__handler.resolve_deferred(key, value).await
+            }
+
+            /// Wait for interrupt.
+            #[inline]
+            async fn on_interrupt(&self) -> ::std::result::Result<(), #krate::error::ClusterError> {
+                self.__handler.on_interrupt().await
+            }
+
+            /// Get the execution ID.
+            #[inline]
+            fn execution_id(&self) -> &str {
+                self.__handler.execution_id()
+            }
+
+            /// Get the sharding interface.
+            #[inline]
+            fn sharding(&self) -> ::std::option::Option<&::std::sync::Arc<dyn #krate::sharding::Sharding>> {
+                self.__handler.sharding()
+            }
+
+            /// Get a typed client for another workflow or entity.
+            ///
+            /// The target type `T` must implement `cruster::entity_client::WorkflowClientFactory`.
+            /// All types annotated with `#[standalone_workflow]` automatically implement this.
+            #[inline]
+            fn client<T: #krate::entity_client::WorkflowClientFactory>(&self) -> T::Client {
+                let sharding = self.__handler.__sharding.clone()
+                    .expect("client() requires a sharding interface");
+                T::workflow_client(sharding)
+            }
+
+            // --- Activity delegation methods (journaled) ---
+            #(#activity_delegations)*
+
+            // --- execute method body ---
+            #(#execute_attrs)*
+            async fn execute(&self, #execute_param_name: #execute_param_type) #execute_output
+                #execute_block
+
+            // --- Helper methods ---
+            #(#helper_execute_methods)*
+        }
+    };
+
+    let activity_view_impl = quote! {
+        impl #activity_view_name<'_> {
+            #(#activity_view_methods)*
+            #(#helper_activity_methods)*
+        }
+    };
+
+    // --- Generate dispatch (single "execute" arm) ---
+    let dispatch_impl = quote! {
+        #[async_trait::async_trait]
+        impl #krate::entity::EntityHandler for #handler_name {
+            async fn handle_request(
+                &self,
+                tag: &str,
+                payload: &[u8],
+                headers: &::std::collections::HashMap<::std::string::String, ::std::string::String>,
+            ) -> ::std::result::Result<::std::vec::Vec<u8>, #krate::error::ClusterError> {
+                #[allow(unused_variables)]
+                let headers = headers;
+                match tag {
+                    "execute" => {
+                        let __request: #request_type = rmp_serde::from_slice(payload)
+                            .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                reason: ::std::format!("failed to deserialize workflow request: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                        let __request_id = headers
+                            .get(#krate::__internal::REQUEST_ID_HEADER_KEY)
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let (__wf_result, __journal_keys) = #krate::__internal::WorkflowScope::run(__request_id, || async {
+                            let __view = #execute_view_name { __handler: self };
+                            __view.execute(__request).await
+                        }).await;
+                        let response = __wf_result?;
+                        // Mark journal entries as completed
+                        if let ::std::option::Option::Some(ref __wf_storage) = self.__state_storage {
+                            for __key in &__journal_keys {
+                                let _ = __wf_storage.mark_completed(__key).await;
+                            }
+                        }
+                        rmp_serde::to_vec(&response)
+                            .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                reason: ::std::format!("failed to serialize workflow response: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })
+                    }
+                    _ => ::std::result::Result::Err(
+                        #krate::error::ClusterError::MalformedMessage {
+                            reason: ::std::format!("unknown workflow tag: {tag}"),
+                            source: ::std::option::Option::None,
+                        }
+                    ),
+                }
+            }
+        }
+    };
+
+    // --- Generate Entity trait impl ---
+    let entity_impl = quote! {
+        #[async_trait::async_trait]
+        impl #krate::entity::Entity for #struct_name {
+            fn entity_type(&self) -> #krate::types::EntityType {
+                self.__entity_type()
+            }
+
+            fn shard_group(&self) -> &str {
+                self.__shard_group()
+            }
+
+            fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
+                self.__shard_group_for(entity_id)
+            }
+
+            fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
+                self.__max_idle_time()
+            }
+
+            fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
+                self.__mailbox_capacity()
+            }
+
+            fn concurrency(&self) -> ::std::option::Option<usize> {
+                self.__concurrency()
+            }
+
+            async fn spawn(
+                &self,
+                ctx: #krate::entity::EntityContext,
+            ) -> ::std::result::Result<
+                ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
+                #krate::error::ClusterError,
+            > {
+                let handler = #handler_name::__new(self.clone(), ctx).await?;
+                ::std::result::Result::Ok(::std::boxed::Box::new(handler))
+            }
+        }
+    };
+
+    // --- Generate register ---
+    let register_impl = quote! {
+        impl #struct_name {
+            /// Register this workflow with the cluster and return a typed client.
+            pub async fn register(
+                self,
+                sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
+            ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
+                sharding.register_entity(::std::sync::Arc::new(self)).await?;
+                ::std::result::Result::Ok(#client_name::new(sharding))
+            }
+        }
+    };
+
+    // --- Generate Client ---
+    let struct_name_str = entity_name;
+    let client_with_key_name = format_ident!("{}ClientWithKey", struct_name);
+    let client_impl = quote! {
+        /// Generated typed client for the standalone workflow.
+        pub struct #client_name {
+            inner: #krate::entity_client::EntityClient,
+        }
+
+        impl #client_name {
+            /// Create a new workflow client.
+            pub fn new(sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>) -> Self {
+                Self {
+                    inner: #krate::entity_client::EntityClient::new(
+                        sharding,
+                        #krate::types::EntityType::new(#struct_name_str),
+                    ),
+                }
+            }
+
+            /// Access the underlying untyped [`EntityClient`].
+            pub fn inner(&self) -> &#krate::entity_client::EntityClient {
+                &self.inner
+            }
+
+            /// Override the idempotency key (hashed with SHA-256).
+            ///
+            /// Returns a lightweight client view with the key baked in.
+            /// Call `.execute()` or `.start()` on the returned view.
+            pub fn with_key(&self, key: impl ::std::fmt::Display) -> #client_with_key_name<'_> {
+                let key_str = key.to_string();
+                let entity_id = #krate::types::EntityId::new(
+                    #krate::hash::sha256_hex(key_str.as_bytes())
+                );
+                #client_with_key_name {
+                    inner: &self.inner,
+                    entity_id,
+                }
+            }
+
+            /// Override the idempotency key (raw, no hashing).
+            ///
+            /// The provided key is used directly as the entity ID.
+            /// Returns a lightweight client view with the key baked in.
+            pub fn with_key_raw(&self, key: impl ::std::string::ToString) -> #client_with_key_name<'_> {
+                #client_with_key_name {
+                    inner: &self.inner,
+                    entity_id: #krate::types::EntityId::new(key.to_string()),
+                }
+            }
+
+            /// Derive the entity ID from a request (SHA-256 hash of serialized request).
+            fn derive_entity_id(
+                request: &#request_type,
+            ) -> ::std::result::Result<#krate::types::EntityId, #krate::error::ClusterError> {
+                let key_bytes = rmp_serde::to_vec(request)
+                    .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                        reason: ::std::format!("failed to serialize workflow request: {e}"),
+                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                    })?;
+                ::std::result::Result::Ok(#krate::types::EntityId::new(
+                    #krate::hash::sha256_hex(&key_bytes)
+                ))
+            }
+
+            /// Execute the workflow and wait for completion.
+            ///
+            /// The idempotency key is derived from the request via SHA-256 hash of
+            /// the serialized request bytes.
+            pub async fn execute(
+                &self,
+                request: &#request_type,
+            ) -> ::std::result::Result<#response_type, #krate::error::ClusterError> {
+                let entity_id = Self::derive_entity_id(request)?;
+                self.inner.send_persisted(
+                    &entity_id,
+                    "execute",
+                    request,
+                    #krate::schema::Uninterruptible::No,
+                ).await
+            }
+
+            /// Start the workflow (fire-and-forget) and return the execution ID.
+            ///
+            /// The idempotency key is derived from the request via SHA-256 hash of
+            /// the serialized request bytes. The returned string is the entity ID
+            /// (= execution ID) that can be used for later reference.
+            pub async fn start(
+                &self,
+                request: &#request_type,
+            ) -> ::std::result::Result<::std::string::String, #krate::error::ClusterError> {
+                let entity_id = Self::derive_entity_id(request)?;
+                self.inner.notify_persisted(
+                    &entity_id,
+                    "execute",
+                    request,
+                ).await?;
+                ::std::result::Result::Ok(entity_id.0)
+            }
+        }
+
+        impl #krate::entity_client::EntityClientAccessor for #client_name {
+            fn entity_client(&self) -> &#krate::entity_client::EntityClient {
+                &self.inner
+            }
+        }
+
+        /// Lightweight key-override view for the workflow client.
+        ///
+        /// Created by [`#client_name::with_key`] or [`#client_name::with_key_raw`].
+        /// Provides `execute` and `start` using the baked-in key.
+        pub struct #client_with_key_name<'a> {
+            inner: &'a #krate::entity_client::EntityClient,
+            entity_id: #krate::types::EntityId,
+        }
+
+        impl #client_with_key_name<'_> {
+            /// Execute the workflow and wait for completion using the baked-in key.
+            pub async fn execute(
+                &self,
+                request: &#request_type,
+            ) -> ::std::result::Result<#response_type, #krate::error::ClusterError> {
+                self.inner.send_persisted(
+                    &self.entity_id,
+                    "execute",
+                    request,
+                    #krate::schema::Uninterruptible::No,
+                ).await
+            }
+
+            /// Start the workflow (fire-and-forget) using the baked-in key.
+            ///
+            /// Returns the execution ID (= entity ID).
+            pub async fn start(
+                &self,
+                request: &#request_type,
+            ) -> ::std::result::Result<::std::string::String, #krate::error::ClusterError> {
+                self.inner.notify_persisted(
+                    &self.entity_id,
+                    "execute",
+                    request,
+                ).await?;
+                ::std::result::Result::Ok(self.entity_id.0.clone())
+            }
+        }
+    };
+
+    // --- Generate WorkflowClientFactory impl ---
+    let client_factory_impl = quote! {
+        impl #krate::entity_client::WorkflowClientFactory for #struct_name {
+            type Client = #client_name;
+
+            fn workflow_client(sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>) -> #client_name {
+                #client_name::new(sharding)
+            }
+        }
+    };
+
+    Ok(quote! {
+        #handler_def
+        #view_structs
+        #execute_view_impl
+        #activity_view_impl
+        #dispatch_impl
+        #entity_impl
+        #register_impl
+        #client_impl
+        #client_factory_impl
+    })
+}

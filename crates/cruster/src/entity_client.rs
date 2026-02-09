@@ -37,6 +37,19 @@ impl EntityClientAccessor for EntityClient {
     }
 }
 
+/// Factory trait for creating typed workflow/entity clients.
+///
+/// Automatically implemented by `#[standalone_workflow]` macros.
+/// Used by the `self.client::<T>()` method inside workflow execute bodies
+/// to get a typed client for another workflow or entity.
+pub trait WorkflowClientFactory {
+    /// The typed client type produced by this factory.
+    type Client;
+
+    /// Create a new typed client from a sharding interface.
+    fn workflow_client(sharding: Arc<dyn Sharding>) -> Self::Client;
+}
+
 pub(crate) fn persisted_request_id(
     entity_type: &EntityType,
     entity_id: &EntityId,

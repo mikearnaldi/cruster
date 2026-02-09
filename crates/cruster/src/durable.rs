@@ -59,8 +59,8 @@ impl WorkflowScope {
                 request_id,
                 WORKFLOW_JOURNAL_KEYS.scope(std::cell::RefCell::new(Vec::new()), async {
                     let result = f().await;
-                    let keys = WORKFLOW_JOURNAL_KEYS
-                        .with(|keys| keys.borrow_mut().drain(..).collect());
+                    let keys =
+                        WORKFLOW_JOURNAL_KEYS.with(|keys| keys.borrow_mut().drain(..).collect());
                     (result, keys)
                 }),
             )

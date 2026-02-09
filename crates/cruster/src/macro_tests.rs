@@ -2990,7 +2990,11 @@ mod tests {
         };
 
         // execute via with_key_raw — should use key as-is
-        let _: String = client.with_key_raw("raw-id-42").execute(&req).await.unwrap();
+        let _: String = client
+            .with_key_raw("raw-id-42")
+            .execute(&req)
+            .await
+            .unwrap();
 
         let captured_msgs = captured.lock().unwrap();
         assert_eq!(captured_msgs.len(), 1);

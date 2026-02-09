@@ -626,6 +626,95 @@ pub fn method(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// Attribute macro for activity group struct definitions.
+///
+/// Activity groups bundle reusable `#[activity]` methods that can be composed
+/// into multiple workflows via `#[workflow_impl(activity_groups(...))]`.
+///
+/// Activity groups are stateless — no `#[state(...)]` is allowed.
+///
+/// # Example
+///
+/// ```text
+/// use cruster::prelude::*;
+///
+/// #[activity_group]
+/// #[derive(Clone)]
+/// pub struct Payments {
+///     stripe: StripeClient,
+/// }
+///
+/// #[activity_group_impl]
+/// impl Payments {
+///     #[activity(retries = 3)]
+///     async fn charge(&self, info: PaymentInfo, amount: u64) -> Result<Charge, ClusterError> {
+///         self.stripe.charge(info, amount).await
+///     }
+///
+///     #[activity]
+///     async fn refund(&self, transaction_id: String) -> Result<(), ClusterError> {
+///         self.stripe.refund(transaction_id).await
+///     }
+/// }
+/// ```
+///
+/// Then compose into a workflow:
+///
+/// ```text
+/// #[workflow_impl(activity_groups(Payments))]
+/// impl ProcessOrder {
+///     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
+///         let charge = self.charge(request.payment, request.total).await?;
+///         Ok(OrderResult { charge_id: charge.id })
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn activity_group(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let _args = parse_macro_input!(attr as TraitArgs);
+    let input = parse_macro_input!(item as syn::ItemStruct);
+    // Pass-through — marker only, like #[entity_trait]
+    quote! { #input }.into()
+}
+
+/// Attribute macro for activity group impl blocks.
+///
+/// Parses `#[activity]` methods and generates access/delegation traits so the
+/// group's activities can be composed into workflows.
+///
+/// # Allowed method annotations
+///
+/// - `#[activity]` — durable activity (journaled side effect)
+/// - Unannotated methods — helpers
+///
+/// # Forbidden annotations
+///
+/// - `#[rpc]` — activities groups don't have RPCs
+/// - `#[workflow]` — activity groups are not workflows
+/// - `#[state(...)]` — activity groups are stateless
+/// - `&mut self` — all methods must use `&self`
+///
+/// # Example
+///
+/// ```text
+/// #[activity_group_impl]
+/// impl Payments {
+///     #[activity]
+///     async fn charge(&self, info: PaymentInfo, amount: u64) -> Result<Charge, ClusterError> {
+///         todo!()
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn activity_group_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as ActivityGroupImplArgs);
+    let input = parse_macro_input!(item as syn::ItemImpl);
+    match activity_group_impl_inner(args, input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 // --- Argument parsing ---
 
 struct EntityArgs {
@@ -4293,6 +4382,505 @@ fn extract_result_ok_type(ty: &syn::Type) -> syn::Result<syn::Type> {
 }
 
 // =============================================================================
+// Activity Group Macros — argument parsing and codegen
+// =============================================================================
+
+struct ActivityGroupImplArgs {
+    krate: Option<syn::Path>,
+}
+
+impl syn::parse::Parse for ActivityGroupImplArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut args = ActivityGroupImplArgs { krate: None };
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            match ident.to_string().as_str() {
+                "krate" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let lit: syn::LitStr = input.parse()?;
+                    args.krate = Some(lit.parse()?);
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("unknown activity_group_impl attribute: {other}"),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+        Ok(args)
+    }
+}
+
+/// Info about a parsed activity within an activity group.
+struct ActivityGroupActivityInfo {
+    name: syn::Ident,
+    params: Vec<RpcParam>,
+    #[allow(dead_code)]
+    response_type: syn::Type,
+    persist_key: Option<syn::ExprClosure>,
+    original_method: syn::ImplItemFn,
+}
+
+/// Generates the codegen for `#[activity_group_impl]`.
+///
+/// For an activity group `Payments`, this generates:
+/// - `__PaymentsActivityGroupWrapper` — owns group + DurableContext refs, has delegation methods
+/// - `__PaymentsActivityGroupView` — `Deref<Target = Payments>` for activity body execution
+/// - `__PaymentsActivityGroupAccess` trait — `fn __payments_wrapper(&self) -> &Wrapper`
+/// - `__PaymentsActivityGroupMethods` trait — blanket impl that delegates to wrapper
+fn activity_group_impl_inner(
+    args: ActivityGroupImplArgs,
+    input: syn::ItemImpl,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let krate = args.krate.unwrap_or_else(default_crate_path);
+    let self_ty = &input.self_ty;
+
+    let struct_name = match self_ty.as_ref() {
+        syn::Type::Path(tp) => tp
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.clone())
+            .ok_or_else(|| syn::Error::new(self_ty.span(), "expected struct name"))?,
+        _ => return Err(syn::Error::new(self_ty.span(), "expected struct name")),
+    };
+
+    let wrapper_name = format_ident!("__{}ActivityGroupWrapper", struct_name);
+    let access_trait_name = format_ident!("__{}ActivityGroupAccess", struct_name);
+    let methods_trait_name = format_ident!("__{}ActivityGroupMethods", struct_name);
+    let activity_view_name = format_ident!("__{}ActivityGroupView", struct_name);
+
+    // Validate: no #[state] on the impl
+    for attr in &input.attrs {
+        if attr.path().is_ident("state") {
+            return Err(syn::Error::new(
+                attr.span(),
+                "activity groups are stateless; remove #[state(...)]",
+            ));
+        }
+    }
+
+    // Parse methods: find activities and helpers
+    let mut activities: Vec<ActivityGroupActivityInfo> = Vec::new();
+    let mut all_methods: Vec<syn::ImplItemFn> = Vec::new();
+
+    for item in &input.items {
+        if let syn::ImplItem::Fn(method) = item {
+            // Validate: no forbidden annotations
+            for attr in &method.attrs {
+                if attr.path().is_ident("state") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "activity groups are stateless; remove #[state(...)]",
+                    ));
+                }
+                if attr.path().is_ident("rpc") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "activity groups use #[activity], not #[rpc]",
+                    ));
+                }
+                if attr.path().is_ident("workflow") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "activity groups use #[activity], not #[workflow]",
+                    ));
+                }
+            }
+
+            // Validate: no &mut self
+            if let Some(syn::FnArg::Receiver(r)) = method.sig.inputs.first() {
+                if r.mutability.is_some() {
+                    return Err(syn::Error::new(
+                        r.span(),
+                        "activity group methods must use &self, not &mut self",
+                    ));
+                }
+            }
+
+            let is_activity = method.attrs.iter().any(|a| a.path().is_ident("activity"));
+
+            if is_activity {
+                if method.sig.asyncness.is_none() {
+                    return Err(syn::Error::new(
+                        method.sig.span(),
+                        "#[activity] methods must be async",
+                    ));
+                }
+
+                // Parse activity key attribute
+                let persist_key = {
+                    let mut key = None;
+                    for attr in &method.attrs {
+                        if attr.path().is_ident("activity") {
+                            let args = match &attr.meta {
+                                syn::Meta::Path(_) => KeyArgs { key: None },
+                                syn::Meta::List(_) => attr.parse_args::<KeyArgs>()?,
+                                _ => {
+                                    return Err(syn::Error::new(
+                                        attr.span(),
+                                        "expected #[activity] or #[activity(key(...))]",
+                                    ))
+                                }
+                            };
+                            key = args.key;
+                        }
+                    }
+                    key
+                };
+
+                // Parse params (skip &self)
+                let mut params = Vec::new();
+                for arg in method.sig.inputs.iter().skip(1) {
+                    if let syn::FnArg::Typed(pat_type) = arg {
+                        let name = match &*pat_type.pat {
+                            syn::Pat::Ident(ident) => ident.ident.clone(),
+                            _ => {
+                                return Err(syn::Error::new(
+                                    pat_type.pat.span(),
+                                    "activity parameters must be simple identifiers",
+                                ))
+                            }
+                        };
+                        params.push(RpcParam {
+                            name,
+                            ty: (*pat_type.ty).clone(),
+                        });
+                    }
+                }
+
+                let response_type = extract_result_ok_type(match &method.sig.output {
+                    syn::ReturnType::Type(_, ty) => ty,
+                    syn::ReturnType::Default => {
+                        return Err(syn::Error::new(
+                            method.sig.span(),
+                            "#[activity] must return Result<T, ClusterError>",
+                        ))
+                    }
+                })?;
+
+                activities.push(ActivityGroupActivityInfo {
+                    name: method.sig.ident.clone(),
+                    params,
+                    response_type,
+                    persist_key,
+                    original_method: method.clone(),
+                });
+            }
+
+            all_methods.push(method.clone());
+        }
+    }
+
+    // --- Generate activity view struct ---
+    // This view is used when executing the actual activity body.
+    // It Derefs to the group struct so `self.stripe`, etc. work.
+    let mut activity_view_methods = Vec::new();
+    let mut helper_view_methods = Vec::new();
+
+    for method in &all_methods {
+        let is_activity = method.attrs.iter().any(|a| a.path().is_ident("activity"));
+        let block = &method.block;
+        let output = &method.sig.output;
+        let name = &method.sig.ident;
+        let params: Vec<_> = method.sig.inputs.iter().skip(1).collect();
+        let attrs: Vec<_> = method
+            .attrs
+            .iter()
+            .filter(|a| {
+                !a.path().is_ident("activity")
+                    && !a.path().is_ident("public")
+                    && !a.path().is_ident("protected")
+                    && !a.path().is_ident("private")
+            })
+            .collect();
+        let vis = &method.vis;
+
+        if is_activity {
+            activity_view_methods.push(quote! {
+                #(#attrs)*
+                #vis async fn #name(&self, #(#params),*) #output
+                    #block
+            });
+        } else {
+            let async_token = if method.sig.asyncness.is_some() {
+                quote! { async }
+            } else {
+                quote! {}
+            };
+            helper_view_methods.push(quote! {
+                #(#attrs)*
+                #vis #async_token fn #name(&self, #(#params),*) #output
+                    #block
+            });
+        }
+    }
+
+    let view_struct = quote! {
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub struct #activity_view_name<'a> {
+            __group: &'a #struct_name,
+        }
+
+        impl ::std::ops::Deref for #activity_view_name<'_> {
+            type Target = #struct_name;
+            fn deref(&self) -> &Self::Target {
+                self.__group
+            }
+        }
+
+        impl #activity_view_name<'_> {
+            #(#activity_view_methods)*
+            #(#helper_view_methods)*
+        }
+    };
+
+    // --- Generate wrapper struct ---
+    // The wrapper owns the group instance + DurableContext references.
+    // It provides delegation methods that wrap each activity in DurableContext::run().
+
+    let wrapper_delegation_methods: Vec<proc_macro2::TokenStream> = activities
+        .iter()
+        .map(|act| {
+            let method_name = &act.name;
+            let method_name_str = method_name.to_string();
+            let method_info = &act.original_method;
+            let params: Vec<_> = method_info.sig.inputs.iter().skip(1).collect();
+            let param_names: Vec<_> = method_info
+                .sig
+                .inputs
+                .iter()
+                .skip(1)
+                .filter_map(|arg| {
+                    if let syn::FnArg::Typed(pat_type) = arg {
+                        if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                            return Some(&pat_ident.ident);
+                        }
+                    }
+                    None
+                })
+                .collect();
+            let output = &method_info.sig.output;
+
+            let wire_param_names: Vec<_> = act.params.iter().map(|p| &p.name).collect();
+            let wire_param_count = wire_param_names.len();
+
+            // Build key-bytes computation (same as inline activities)
+            let key_bytes_code = if let Some(persist_key) = &act.persist_key {
+                match wire_param_count {
+                    0 => quote! {
+                        let __journal_key = (#persist_key)();
+                        let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                    1 => {
+                        let name = &wire_param_names[0];
+                        quote! {
+                            let __journal_key = (#persist_key)(#name);
+                            let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                                .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                    reason: ::std::format!("failed to serialize journal key: {e}"),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })?;
+                        }
+                    }
+                    _ => quote! {
+                        let __journal_key = (#persist_key)(#(&#wire_param_names),*);
+                        let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                }
+            } else {
+                match wire_param_count {
+                    0 => quote! {
+                        let __journal_key_bytes = rmp_serde::to_vec(&()).unwrap_or_default();
+                    },
+                    1 => {
+                        let name = &wire_param_names[0];
+                        quote! {
+                            let __journal_key_bytes = rmp_serde::to_vec(&#name)
+                                .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                    reason: ::std::format!("failed to serialize journal key: {e}"),
+                                    source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                                })?;
+                        }
+                    }
+                    _ => quote! {
+                        let __journal_key_bytes = rmp_serde::to_vec(&(#(&#wire_param_names),*))
+                            .map_err(|e| #krate::error::ClusterError::PersistenceError {
+                                reason: ::std::format!("failed to serialize journal key: {e}"),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    },
+                }
+            };
+
+            quote! {
+                pub async fn #method_name(&self, #(#params),*) #output {
+                    if let (
+                        ::std::option::Option::Some(__engine),
+                        ::std::option::Option::Some(__msg_storage),
+                        ::std::option::Option::Some(__wf_storage),
+                    ) = (
+                        self.__workflow_engine.as_ref(),
+                        self.__message_storage.as_ref(),
+                        self.__workflow_storage.as_ref(),
+                    ) {
+                        #key_bytes_code
+                        // Scope the journal key per workflow execution
+                        let __journal_key_bytes = {
+                            let mut __scoped = ::std::vec::Vec::new();
+                            if let ::std::option::Option::Some(__wf_id) = #krate::__internal::WorkflowScope::current() {
+                                __scoped.extend_from_slice(&__wf_id.to_le_bytes());
+                            }
+                            __scoped.extend_from_slice(&__journal_key_bytes);
+                            __scoped
+                        };
+                        let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
+                            ::std::sync::Arc::clone(__engine),
+                            self.__entity_type.clone(),
+                            self.__entity_id.clone(),
+                            ::std::sync::Arc::clone(__msg_storage),
+                            ::std::sync::Arc::clone(__wf_storage),
+                        );
+                        let __activity_view = #activity_view_name {
+                            __group: &self.__group,
+                        };
+                        __journal_ctx.run(#method_name_str, &__journal_key_bytes, || {
+                            __activity_view.#method_name(#(#param_names),*)
+                        }).await
+                    } else {
+                        // No journal — execute directly
+                        let __activity_view = #activity_view_name {
+                            __group: &self.__group,
+                        };
+                        __activity_view.#method_name(#(#param_names),*).await
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let wrapper_struct = quote! {
+        /// Generated wrapper for the activity group.
+        ///
+        /// Owns the group instance and DurableContext references.
+        /// Provides delegation methods that wrap each activity in journal tracking.
+        #[doc(hidden)]
+        pub struct #wrapper_name {
+            __group: #struct_name,
+            __workflow_engine: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowEngine>>,
+            __message_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::MessageStorage>>,
+            __workflow_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowStorage>>,
+            __entity_type: ::std::string::String,
+            __entity_id: ::std::string::String,
+        }
+
+        impl #wrapper_name {
+            /// Create a new wrapper with DurableContext references.
+            pub fn new(
+                group: #struct_name,
+                workflow_engine: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowEngine>>,
+                message_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::MessageStorage>>,
+                workflow_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::WorkflowStorage>>,
+                entity_type: ::std::string::String,
+                entity_id: ::std::string::String,
+            ) -> Self {
+                Self {
+                    __group: group,
+                    __workflow_engine: workflow_engine,
+                    __message_storage: message_storage,
+                    __workflow_storage: workflow_storage,
+                    __entity_type: entity_type,
+                    __entity_id: entity_id,
+                }
+            }
+
+            /// Get a reference to the group instance.
+            pub fn group(&self) -> &#struct_name {
+                &self.__group
+            }
+
+            // --- Activity delegation methods (journaled) ---
+            #(#wrapper_delegation_methods)*
+        }
+    };
+
+    // --- Generate access trait ---
+    let access_trait = quote! {
+        #[doc(hidden)]
+        pub trait #access_trait_name {
+            fn __activity_group_wrapper(&self) -> &#wrapper_name;
+        }
+    };
+
+    // --- Generate methods trait with blanket impl ---
+    // Blanket impl for any type that implements the access trait.
+    // Each method delegates to the wrapper's corresponding method.
+    let blanket_methods: Vec<proc_macro2::TokenStream> = activities
+        .iter()
+        .map(|act| {
+            let method_name = &act.name;
+            let method_info = &act.original_method;
+            let params: Vec<_> = method_info.sig.inputs.iter().skip(1).collect();
+            let param_names: Vec<_> = method_info
+                .sig
+                .inputs
+                .iter()
+                .skip(1)
+                .filter_map(|arg| {
+                    if let syn::FnArg::Typed(pat_type) = arg {
+                        if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+                            return Some(&pat_ident.ident);
+                        }
+                    }
+                    None
+                })
+                .collect();
+            let output = &method_info.sig.output;
+
+            quote! {
+                async fn #method_name(&self, #(#params),*) #output {
+                    self.__activity_group_wrapper().#method_name(#(#param_names),*).await
+                }
+            }
+        })
+        .collect();
+
+    let methods_trait = quote! {
+        /// Trait providing activity group methods via blanket implementation.
+        ///
+        /// Automatically implemented for any type that implements the access trait.
+        #[doc(hidden)]
+        #[allow(async_fn_in_trait)]
+        pub trait #methods_trait_name: #access_trait_name {
+            #(#blanket_methods)*
+        }
+
+        // Blanket impl: any type that provides the access trait gets the methods.
+        impl<T: #access_trait_name> #methods_trait_name for T {}
+    };
+
+    Ok(quote! {
+        #view_struct
+        #wrapper_struct
+        #access_trait
+        #methods_trait
+    })
+}
+
+// =============================================================================
 // Workflow Macros — argument parsing and codegen
 // =============================================================================
 
@@ -4362,11 +4950,15 @@ impl syn::parse::Parse for WorkflowStructArgs {
 
 struct WorkflowImplArgs {
     krate: Option<syn::Path>,
+    activity_groups: Vec<syn::Path>,
 }
 
 impl syn::parse::Parse for WorkflowImplArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let mut args = WorkflowImplArgs { krate: None };
+        let mut args = WorkflowImplArgs {
+            krate: None,
+            activity_groups: Vec::new(),
+        };
         while !input.is_empty() {
             let ident: syn::Ident = input.parse()?;
             match ident.to_string().as_str() {
@@ -4374,6 +4966,17 @@ impl syn::parse::Parse for WorkflowImplArgs {
                     input.parse::<syn::Token![=]>()?;
                     let lit: syn::LitStr = input.parse()?;
                     args.krate = Some(lit.parse()?);
+                }
+                "activity_groups" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    while !content.is_empty() {
+                        let path: syn::Path = content.parse()?;
+                        args.activity_groups.push(path);
+                        if !content.is_empty() {
+                            content.parse::<syn::Token![,]>()?;
+                        }
+                    }
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -4514,6 +5117,8 @@ fn workflow_impl_inner(
     let execute_view_name = format_ident!("__{}ExecuteView", struct_name);
     let activity_view_name = format_ident!("__{}ActivityView", struct_name);
     let entity_name = format!("Workflow/{}", struct_name);
+    let has_activity_groups = !args.activity_groups.is_empty();
+    let with_groups_name = format_ident!("__{}WithGroups", struct_name);
 
     // Validate: no #[state], no #[rpc], no #[workflow], no &mut self
     for attr in &input.attrs {
@@ -4707,6 +5312,51 @@ fn workflow_impl_inner(
 
     let request_type = &execute.request_type;
     let response_type = &execute.response_type;
+
+    // --- Process activity groups ---
+    #[allow(dead_code)]
+    struct ActivityGroupInfo {
+        path: syn::Path,
+        ident: syn::Ident,
+        field: syn::Ident,
+        wrapper_ident: syn::Ident,
+        wrapper_path: syn::Path,
+        access_trait_ident: syn::Ident,
+        access_trait_path: syn::Path,
+        methods_trait_ident: syn::Ident,
+        methods_trait_path: syn::Path,
+    }
+
+    let group_infos: Vec<ActivityGroupInfo> = args
+        .activity_groups
+        .iter()
+        .map(|path| {
+            let ident = path
+                .segments
+                .last()
+                .map(|s| s.ident.clone())
+                .expect("activity group path must have an ident");
+            let snake = to_snake(&ident.to_string());
+            let field = format_ident!("__group_{}", snake);
+            let wrapper_ident = format_ident!("__{}ActivityGroupWrapper", ident);
+            let wrapper_path = replace_last_segment(path, wrapper_ident.clone());
+            let access_trait_ident = format_ident!("__{}ActivityGroupAccess", ident);
+            let access_trait_path = replace_last_segment(path, access_trait_ident.clone());
+            let methods_trait_ident = format_ident!("__{}ActivityGroupMethods", ident);
+            let methods_trait_path = replace_last_segment(path, methods_trait_ident.clone());
+            ActivityGroupInfo {
+                path: path.clone(),
+                ident,
+                field,
+                wrapper_ident,
+                wrapper_path,
+                access_trait_ident,
+                access_trait_path,
+                methods_trait_ident,
+                methods_trait_path,
+            }
+        })
+        .collect();
 
     // --- Generate execute view methods ---
     // execute goes on the execute view
@@ -4930,6 +5580,47 @@ fn workflow_impl_inner(
         })
         .collect();
 
+    // --- Activity group fields and initialization ---
+    let group_handler_fields: Vec<proc_macro2::TokenStream> = group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let wrapper_path = &info.wrapper_path;
+            quote! {
+                #field: #wrapper_path,
+            }
+        })
+        .collect();
+
+    let group_new_params: Vec<proc_macro2::TokenStream> = group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let path = &info.path;
+            quote! {
+                #field: #path,
+            }
+        })
+        .collect();
+
+    let group_field_inits: Vec<proc_macro2::TokenStream> = group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let wrapper_path = &info.wrapper_path;
+            quote! {
+                #field: #wrapper_path::new(
+                    #field,
+                    ctx.workflow_engine.clone(),
+                    ctx.message_storage.clone(),
+                    ctx.state_storage.clone(),
+                    ctx.address.entity_type.0.clone(),
+                    ctx.address.entity_id.0.clone(),
+                ),
+            }
+        })
+        .collect();
+
     // --- Generate Handler ---
     let handler_def = quote! {
         #[doc(hidden)]
@@ -4949,12 +5640,14 @@ fn workflow_impl_inner(
             __sharding: ::std::option::Option<::std::sync::Arc<dyn #krate::sharding::Sharding>>,
             /// Entity address.
             __entity_address: #krate::types::EntityAddress,
+            #(#group_handler_fields)*
         }
 
         impl #handler_name {
             #[doc(hidden)]
             pub async fn __new(
                 workflow: #struct_name,
+                #(#group_new_params)*
                 ctx: #krate::entity::EntityContext,
             ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
                 let __state_storage = ctx.state_storage.clone();
@@ -4964,6 +5657,7 @@ fn workflow_impl_inner(
                     __workflow: workflow,
                     __workflow_engine: ctx.workflow_engine.clone(),
                     __message_storage: ctx.message_storage.clone(),
+                    #(#group_field_inits)*
                     ctx,
                     __state_storage,
                     __sharding,
@@ -5097,8 +5791,38 @@ fn workflow_impl_inner(
         }
     };
 
+    // --- Activity group: access trait impls on execute view ---
+    let group_access_impls: Vec<proc_macro2::TokenStream> = group_infos
+        .iter()
+        .map(|info| {
+            let access_trait_path = &info.access_trait_path;
+            let wrapper_path = &info.wrapper_path;
+            let field = &info.field;
+            quote! {
+                impl #access_trait_path for #execute_view_name<'_> {
+                    fn __activity_group_wrapper(&self) -> &#wrapper_path {
+                        &self.__handler.#field
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // --- Activity group: use methods traits ---
+    let group_use_methods: Vec<proc_macro2::TokenStream> = group_infos
+        .iter()
+        .map(|info| {
+            let methods_trait_path = &info.methods_trait_path;
+            quote! {
+                #[allow(unused_imports)]
+                use #methods_trait_path as _;
+            }
+        })
+        .collect();
+
     // --- Execute view: durable primitive delegations ---
     let execute_view_impl = quote! {
+        #(#group_use_methods)*
         impl #execute_view_name<'_> {
             /// Durable sleep.
             #[inline]
@@ -5227,59 +5951,172 @@ fn workflow_impl_inner(
         }
     };
 
-    // --- Generate Entity trait impl ---
-    let entity_impl = quote! {
-        #[async_trait::async_trait]
-        impl #krate::entity::Entity for #struct_name {
-            fn entity_type(&self) -> #krate::types::EntityType {
-                self.__entity_type()
+    // --- Generate Entity trait impl + register ---
+    // When activity_groups are present, Entity is implemented on a WithGroups wrapper.
+    // When no groups, Entity is on the bare struct (current behavior).
+    let (entity_impl, register_impl) = if has_activity_groups {
+        let group_struct_fields: Vec<proc_macro2::TokenStream> = group_infos
+            .iter()
+            .map(|info| {
+                let field = &info.field;
+                let path = &info.path;
+                quote! { #field: #path, }
+            })
+            .collect();
+
+        let group_spawn_args: Vec<proc_macro2::TokenStream> = group_infos
+            .iter()
+            .map(|info| {
+                let field = &info.field;
+                quote! { self.#field.clone(), }
+            })
+            .collect();
+
+        let group_register_params: Vec<proc_macro2::TokenStream> = group_infos
+            .iter()
+            .map(|info| {
+                let field = &info.field;
+                let path = &info.path;
+                quote! { #field: #path, }
+            })
+            .collect();
+
+        let group_register_field_inits: Vec<proc_macro2::TokenStream> = group_infos
+            .iter()
+            .map(|info| {
+                let field = &info.field;
+                quote! { #field, }
+            })
+            .collect();
+
+        let entity_impl_tokens = quote! {
+            /// Generated wrapper that bundles the workflow with its activity groups.
+            #[doc(hidden)]
+            #[derive(Clone)]
+            pub struct #with_groups_name {
+                __workflow: #struct_name,
+                #(#group_struct_fields)*
             }
 
-            fn shard_group(&self) -> &str {
-                self.__shard_group()
-            }
+            #[async_trait::async_trait]
+            impl #krate::entity::Entity for #with_groups_name {
+                fn entity_type(&self) -> #krate::types::EntityType {
+                    self.__workflow.__entity_type()
+                }
 
-            fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
-                self.__shard_group_for(entity_id)
-            }
+                fn shard_group(&self) -> &str {
+                    self.__workflow.__shard_group()
+                }
 
-            fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
-                self.__max_idle_time()
-            }
+                fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
+                    self.__workflow.__shard_group_for(entity_id)
+                }
 
-            fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
-                self.__mailbox_capacity()
-            }
+                fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
+                    self.__workflow.__max_idle_time()
+                }
 
-            fn concurrency(&self) -> ::std::option::Option<usize> {
-                self.__concurrency()
-            }
+                fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
+                    self.__workflow.__mailbox_capacity()
+                }
 
-            async fn spawn(
-                &self,
-                ctx: #krate::entity::EntityContext,
-            ) -> ::std::result::Result<
-                ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
-                #krate::error::ClusterError,
-            > {
-                let handler = #handler_name::__new(self.clone(), ctx).await?;
-                ::std::result::Result::Ok(::std::boxed::Box::new(handler))
-            }
-        }
-    };
+                fn concurrency(&self) -> ::std::option::Option<usize> {
+                    self.__workflow.__concurrency()
+                }
 
-    // --- Generate register ---
-    let register_impl = quote! {
-        impl #struct_name {
-            /// Register this workflow with the cluster and return a typed client.
-            pub async fn register(
-                self,
-                sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
-            ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
-                sharding.register_entity(::std::sync::Arc::new(self)).await?;
-                ::std::result::Result::Ok(#client_name::new(sharding))
+                async fn spawn(
+                    &self,
+                    ctx: #krate::entity::EntityContext,
+                ) -> ::std::result::Result<
+                    ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
+                    #krate::error::ClusterError,
+                > {
+                    let handler = #handler_name::__new(
+                        self.__workflow.clone(),
+                        #(#group_spawn_args)*
+                        ctx,
+                    ).await?;
+                    ::std::result::Result::Ok(::std::boxed::Box::new(handler))
+                }
             }
-        }
+        };
+
+        let register_impl_tokens = quote! {
+            impl #struct_name {
+                /// Register this workflow with the cluster and return a typed client.
+                ///
+                /// Each activity group must be provided as a separate parameter.
+                pub async fn register(
+                    self,
+                    sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
+                    #(#group_register_params)*
+                ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
+                    let bundle = #with_groups_name {
+                        __workflow: self,
+                        #(#group_register_field_inits)*
+                    };
+                    sharding.register_entity(::std::sync::Arc::new(bundle)).await?;
+                    ::std::result::Result::Ok(#client_name::new(sharding))
+                }
+            }
+        };
+
+        (entity_impl_tokens, register_impl_tokens)
+    } else {
+        let entity_impl_tokens = quote! {
+            #[async_trait::async_trait]
+            impl #krate::entity::Entity for #struct_name {
+                fn entity_type(&self) -> #krate::types::EntityType {
+                    self.__entity_type()
+                }
+
+                fn shard_group(&self) -> &str {
+                    self.__shard_group()
+                }
+
+                fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
+                    self.__shard_group_for(entity_id)
+                }
+
+                fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
+                    self.__max_idle_time()
+                }
+
+                fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
+                    self.__mailbox_capacity()
+                }
+
+                fn concurrency(&self) -> ::std::option::Option<usize> {
+                    self.__concurrency()
+                }
+
+                async fn spawn(
+                    &self,
+                    ctx: #krate::entity::EntityContext,
+                ) -> ::std::result::Result<
+                    ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
+                    #krate::error::ClusterError,
+                > {
+                    let handler = #handler_name::__new(self.clone(), ctx).await?;
+                    ::std::result::Result::Ok(::std::boxed::Box::new(handler))
+                }
+            }
+        };
+
+        let register_impl_tokens = quote! {
+            impl #struct_name {
+                /// Register this workflow with the cluster and return a typed client.
+                pub async fn register(
+                    self,
+                    sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
+                ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
+                    sharding.register_entity(::std::sync::Arc::new(self)).await?;
+                    ::std::result::Result::Ok(#client_name::new(sharding))
+                }
+            }
+        };
+
+        (entity_impl_tokens, register_impl_tokens)
     };
 
     // --- Generate Client ---
@@ -5443,6 +6280,7 @@ fn workflow_impl_inner(
     Ok(quote! {
         #handler_def
         #view_structs
+        #(#group_access_impls)*
         #execute_view_impl
         #activity_view_impl
         #dispatch_impl

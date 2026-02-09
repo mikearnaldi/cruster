@@ -64,6 +64,11 @@ pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
 /// `#[workflow_impl]` is used on the workflow impl block.
 pub use cruster_macros::workflow_impl;
 
+/// Re-export proc macros for activity group definition.
+/// `#[activity_group]` marks a struct as an activity group.
+/// `#[activity_group_impl]` processes the impl block.
+pub use cruster_macros::{activity_group, activity_group_impl};
+
 /// Prelude module for convenient glob imports.
 ///
 /// This module re-exports all commonly used items including proc-macro attributes.
@@ -103,6 +108,9 @@ pub mod prelude {
 
     // Workflow impl macro (workflow is already exported as helper attribute)
     pub use cruster_macros::workflow_impl;
+
+    // Activity group macros
+    pub use cruster_macros::{activity_group, activity_group_impl};
 
     // Helper attribute macros (for IDE autocomplete and documentation)
     pub use cruster_macros::{activity, private, protected, public, rpc, state, workflow};

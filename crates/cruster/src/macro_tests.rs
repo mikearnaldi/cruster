@@ -499,7 +499,7 @@ mod tests {
         assert_eq!(value, 0);
     }
 
-    // --- Persisted method entity ---
+    // --- Persisted RPC entity (uses #[rpc(persisted)] for at-least-once delivery) ---
 
     #[entity(krate = "crate")]
     #[derive(Clone)]
@@ -507,7 +507,7 @@ mod tests {
 
     #[entity_impl(krate = "crate")]
     impl PersistedMethodEntity {
-        #[workflow]
+        #[rpc(persisted)]
         async fn important_action(&self, data: String) -> Result<String, ClusterError> {
             Ok(format!("processed: {data}"))
         }
@@ -524,6 +524,7 @@ mod tests {
         let ctx = test_ctx("PersistedMethodEntity", "pm-1");
         let handler = e.spawn(ctx).await.unwrap();
 
+        // Persisted RPC dispatches the same as non-persisted
         let payload = rmp_serde::to_vec(&"hello".to_string()).unwrap();
         let result = handler
             .handle_request("important_action", &payload, &HashMap::new())
@@ -540,7 +541,7 @@ mod tests {
         assert_eq!(value, "regular");
     }
 
-    // Test that the generated client uses send_persisted for #[workflow] methods
+    // Test that the generated client uses send_persisted for #[rpc(persisted)] methods
     // (This is a compile-time check — the client struct should exist with the right methods)
     #[test]
     fn persisted_method_client_exists() {
@@ -552,7 +553,7 @@ mod tests {
         }
     }
 
-    // --- Mixed entity (persisted + regular) ---
+    // --- Mixed entity (#[rpc(persisted)] + #[rpc]) ---
 
     #[entity(krate = "crate")]
     #[derive(Clone)]
@@ -560,7 +561,7 @@ mod tests {
 
     #[entity_impl(krate = "crate")]
     impl MixedEntity {
-        #[workflow]
+        #[rpc(persisted)]
         async fn persisted_action(&self, value: String) -> Result<String, ClusterError> {
             Ok(format!("persisted:{value}"))
         }
@@ -601,7 +602,7 @@ mod tests {
         sharding.shutdown().await.unwrap();
     }
 
-    // --- Persisted method idempotency replay ---
+    // --- Persisted RPC idempotency replay ---
 
     #[entity(krate = "crate")]
     #[derive(Clone)]
@@ -611,7 +612,7 @@ mod tests {
 
     #[entity_impl(krate = "crate")]
     impl PersistedIdempotentEntity {
-        #[workflow]
+        #[rpc(persisted)]
         async fn process(&self, value: i32) -> Result<i32, ClusterError> {
             let count = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(value + count as i32)

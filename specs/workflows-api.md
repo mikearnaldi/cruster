@@ -553,10 +553,11 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 - **Phase 9 (partial):** ✅ Done — all `standalone_workflow` / `standalone_workflow_impl` tests in `macro_tests.rs` have been ported to new `#[workflow]` / `#[workflow_impl]` API names and old tests removed. Legacy `#[standalone_workflow]` / `#[standalone_workflow_impl]` proc_macro entry points and re-exports deleted. Internal functions renamed from `standalone_workflow_*` to `workflow_*`. All doc comments updated.
 - **Phase 2 (RPC Groups):** ✅ Done — `#[rpc_group]` / `#[rpc_group_impl]` macros implemented. Generates wrapper struct, dispatch, client extension trait, access/methods traits. Composable into entities via `#[entity_impl(rpc_groups(...))]` with type-safe register accepting group instances as parameters. Tests: dispatch, multiple groups, groups with fields, persisted RPCs, multi-param RPCs, client extension, entity type name.
 - **Phase 1 (partial):** ✅ Done — Pure-RPC entity codegen path added. When an entity has no `#[state]`, no `#[workflow]`, no `#[activity]` methods (only `#[rpc]` methods), `generate_pure_rpc_entity()` generates a simplified Handler without `__state`, `__write_lock`, `__state_storage`, `__state_key`, `__workflow_engine`, view structs, or ArcSwap. Methods are called directly on `__entity`. Tests: entity type, dispatch, multi-param, unknown tag, register, persisted RPC. Old stateful codegen path untouched — all existing tests pass.
+- **Phase 9 (test migration, partial):** ✅ Done — `PersistedMethodEntity`, `MixedEntity`, and `PersistedIdempotentEntity` tests migrated from `#[workflow]` to `#[rpc(persisted)]`. These entities previously used `#[workflow]` purely for persisted delivery (no activities, no state); they now correctly use the new API pattern. Entities with `#[workflow(key(...))]` (custom key extraction) left as-is — that functionality belongs to standalone workflows in the new API.
 - **Remaining work:**
   - Phase 1 (remaining): Emit compile errors for #[state], #[workflow], #[activity], &mut self on entities; remove old codegen
   - Phase 8: Integration testing (not yet started)
-  - Phase 9 (remaining): Remove old entity_trait macros, state infrastructure
+  - Phase 9 (remaining): Remove old entity_trait macros, state infrastructure, convert remaining old-pattern tests
 
 ### Phase 1: Simplify Entities
 

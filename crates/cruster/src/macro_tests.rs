@@ -3855,4 +3855,326 @@ mod tests {
             Duration::from_secs(5)
         );
     }
+
+    // =============================================================================
+    // RPC Group tests
+    // =============================================================================
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct HealthCheckGroup;
+
+    #[rpc_group_impl(krate = "crate")]
+    impl HealthCheckGroup {
+        #[rpc]
+        async fn health(&self) -> Result<String, ClusterError> {
+            Ok("ok".to_string())
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct RpcGroupEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(HealthCheckGroup))]
+    impl RpcGroupEntity {
+        #[rpc]
+        async fn ping(&self) -> Result<String, ClusterError> {
+            Ok("pong".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_group_dispatches_via_handler() {
+        let entity_with_groups = RpcGroupEntityWithRpcGroups {
+            entity: RpcGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+        };
+        let ctx = test_ctx("RpcGroupEntity", "rg-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        // Entity's own RPC
+        let result = handler
+            .handle_request("ping", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "pong");
+
+        // RPC from group
+        let result = handler
+            .handle_request("health", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "ok");
+    }
+
+    #[tokio::test]
+    async fn rpc_group_unknown_tag_errors() {
+        let entity_with_groups = RpcGroupEntityWithRpcGroups {
+            entity: RpcGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+        };
+        let ctx = test_ctx("RpcGroupEntity", "rg-2");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        let result = handler
+            .handle_request("nonexistent", &[], &HashMap::new())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_group_register_returns_client() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = RpcGroupEntity::register(
+            RpcGroupEntity,
+            Arc::clone(&sharding),
+            HealthCheckGroup,
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("rg-3");
+        // Client should have entity's own methods
+        let response: String = client.ping(&entity_id).await.unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    #[tokio::test]
+    async fn rpc_group_client_extension_methods_exist() {
+        // Verify that the generated ClientExt trait adds group methods to the entity client
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = RpcGroupEntity::register(
+            RpcGroupEntity,
+            Arc::clone(&sharding),
+            HealthCheckGroup,
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("rg-4");
+        // Group method should be callable via client extension
+        let response: String = client.health(&entity_id).await.unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    // --- RPC group with fields ---
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct MetricsGroup {
+        pub prefix: String,
+    }
+
+    #[rpc_group_impl(krate = "crate")]
+    impl MetricsGroup {
+        #[rpc]
+        async fn get_metrics(&self) -> Result<String, ClusterError> {
+            Ok(format!("{}/metrics", self.prefix))
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct MultiGroupEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(HealthCheckGroup, MetricsGroup))]
+    impl MultiGroupEntity {
+        #[rpc]
+        async fn status(&self) -> Result<String, ClusterError> {
+            Ok("running".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_rpc_group_dispatch() {
+        let entity_with_groups = MultiGroupEntityWithRpcGroups {
+            entity: MultiGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+            __rpc_group_metrics_group: MetricsGroup {
+                prefix: "app".to_string(),
+            },
+        };
+        let ctx = test_ctx("MultiGroupEntity", "mg-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        // Entity's own RPC
+        let result = handler
+            .handle_request("status", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "running");
+
+        // First group RPC
+        let result = handler
+            .handle_request("health", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "ok");
+
+        // Second group RPC
+        let result = handler
+            .handle_request("get_metrics", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "app/metrics");
+    }
+
+    #[tokio::test]
+    async fn multi_rpc_group_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = MultiGroupEntity::register(
+            MultiGroupEntity,
+            Arc::clone(&sharding),
+            HealthCheckGroup,
+            MetricsGroup {
+                prefix: "test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("mg-2");
+        let response: String = client.status(&entity_id).await.unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    // --- RPC group with persisted RPC ---
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct PersistedRpcGroup;
+
+    #[rpc_group_impl(krate = "crate")]
+    impl PersistedRpcGroup {
+        #[rpc(persisted)]
+        async fn save_data(&self, data: String) -> Result<String, ClusterError> {
+            Ok(format!("saved:{data}"))
+        }
+
+        #[rpc]
+        async fn read_data(&self) -> Result<String, ClusterError> {
+            Ok("data".to_string())
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct PersistedGroupEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(PersistedRpcGroup))]
+    impl PersistedGroupEntity {
+        #[rpc]
+        async fn ping(&self) -> Result<String, ClusterError> {
+            Ok("pong".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_rpc_group_dispatches() {
+        let entity_with_groups = PersistedGroupEntityWithRpcGroups {
+            entity: PersistedGroupEntity,
+            __rpc_group_persisted_rpc_group: PersistedRpcGroup,
+        };
+        let ctx = test_ctx("PersistedGroupEntity", "prg-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        // Non-persisted group RPC
+        let result = handler
+            .handle_request("read_data", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "data");
+
+        // Persisted group RPC
+        let payload = rmp_serde::to_vec(&"test".to_string()).unwrap();
+        let result = handler
+            .handle_request("save_data", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "saved:test");
+    }
+
+    // --- RPC group with parameters ---
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct MathGroup;
+
+    #[rpc_group_impl(krate = "crate")]
+    impl MathGroup {
+        #[rpc]
+        async fn add(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
+            Ok(a + b)
+        }
+
+        #[rpc]
+        async fn multiply(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
+            Ok(a * b)
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct MathEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(MathGroup))]
+    impl MathEntity {
+        #[rpc]
+        async fn negate(&self, x: i32) -> Result<i32, ClusterError> {
+            Ok(-x)
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_group_with_params_dispatch() {
+        let entity_with_groups = MathEntityWithRpcGroups {
+            entity: MathEntity,
+            __rpc_group_math_group: MathGroup,
+        };
+        let ctx = test_ctx("MathEntity", "math-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        // Entity's own RPC with param
+        let payload = rmp_serde::to_vec(&5i32).unwrap();
+        let result = handler
+            .handle_request("negate", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, -5);
+
+        // Group RPC with multiple params
+        let payload = rmp_serde::to_vec(&(3i32, 4i32)).unwrap();
+        let result = handler
+            .handle_request("add", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 7);
+
+        let result = handler
+            .handle_request("multiply", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 12);
+    }
+
+    #[tokio::test]
+    async fn rpc_group_entity_type_is_struct_name() {
+        let entity_with_groups = RpcGroupEntityWithRpcGroups {
+            entity: RpcGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+        };
+        // Entity type should be the original struct name
+        assert_eq!(entity_with_groups.entity_type().0, "RpcGroupEntity");
+    }
 }

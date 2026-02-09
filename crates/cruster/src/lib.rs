@@ -69,6 +69,11 @@ pub use cruster_macros::workflow_impl;
 /// `#[activity_group_impl]` processes the impl block.
 pub use cruster_macros::{activity_group, activity_group_impl};
 
+/// Re-export proc macros for RPC group definition.
+/// `#[rpc_group]` marks a struct as an RPC group.
+/// `#[rpc_group_impl]` processes the impl block.
+pub use cruster_macros::{rpc_group, rpc_group_impl};
+
 /// Prelude module for convenient glob imports.
 ///
 /// This module re-exports all commonly used items including proc-macro attributes.
@@ -111,6 +116,9 @@ pub mod prelude {
 
     // Activity group macros
     pub use cruster_macros::{activity_group, activity_group_impl};
+
+    // RPC group macros
+    pub use cruster_macros::{rpc_group, rpc_group_impl};
 
     // Helper attribute macros (for IDE autocomplete and documentation)
     pub use cruster_macros::{activity, private, protected, public, rpc, state, workflow};

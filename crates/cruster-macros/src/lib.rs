@@ -626,6 +626,87 @@ pub fn method(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// Attribute macro for RPC group struct definitions.
+///
+/// RPC groups bundle reusable `#[rpc]` / `#[rpc(persisted)]` methods that can be
+/// composed into multiple entities via `#[entity_impl(rpc_groups(...))]`.
+///
+/// RPC groups are stateless — no `#[state(...)]` is allowed.
+///
+/// # Example
+///
+/// ```text
+/// use cruster::prelude::*;
+///
+/// #[rpc_group]
+/// #[derive(Clone)]
+/// pub struct HealthCheck;
+///
+/// #[rpc_group_impl]
+/// impl HealthCheck {
+///     #[rpc]
+///     async fn health(&self) -> Result<String, ClusterError> {
+///         Ok("ok".to_string())
+///     }
+/// }
+/// ```
+///
+/// Then compose into an entity:
+///
+/// ```text
+/// #[entity_impl(rpc_groups(HealthCheck))]
+/// impl MyEntity {
+///     // ... own RPCs
+///     // health() is also callable on this entity's client
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn rpc_group(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let _args = parse_macro_input!(attr as TraitArgs);
+    let input = parse_macro_input!(item as syn::ItemStruct);
+    // Pass-through — marker only, like #[entity_trait] and #[activity_group]
+    quote! { #input }.into()
+}
+
+/// Attribute macro for RPC group impl blocks.
+///
+/// Parses `#[rpc]` / `#[rpc(persisted)]` methods and generates dispatch, client extension,
+/// and delegation traits so the group's RPCs can be composed into entities.
+///
+/// # Allowed method annotations
+///
+/// - `#[rpc]` — best-effort RPC handler
+/// - `#[rpc(persisted)]` — at-least-once RPC handler
+/// - Unannotated methods — helpers
+///
+/// # Forbidden annotations
+///
+/// - `#[activity]` — RPC groups don't have activities
+/// - `#[workflow]` — RPC groups are not workflows
+/// - `#[state(...)]` — RPC groups are stateless
+/// - `&mut self` — all methods must use `&self`
+///
+/// # Example
+///
+/// ```text
+/// #[rpc_group_impl]
+/// impl HealthCheck {
+///     #[rpc]
+///     async fn health(&self) -> Result<String, ClusterError> {
+///         Ok("ok".to_string())
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn rpc_group_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as RpcGroupImplArgs);
+    let input = parse_macro_input!(item as syn::ItemImpl);
+    match rpc_group_impl_inner(args, input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
 /// Attribute macro for activity group struct definitions.
 ///
 /// Activity groups bundle reusable `#[activity]` methods that can be composed
@@ -786,6 +867,7 @@ impl syn::parse::Parse for EntityArgs {
 struct ImplArgs {
     krate: Option<syn::Path>,
     traits: Vec<syn::Path>,
+    rpc_groups: Vec<syn::Path>,
     deferred_keys: Vec<DeferredKeyDecl>,
 }
 
@@ -817,6 +899,7 @@ impl syn::parse::Parse for ImplArgs {
         let mut args = ImplArgs {
             krate: None,
             traits: Vec::new(),
+            rpc_groups: Vec::new(),
             deferred_keys: Vec::new(),
         };
         while !input.is_empty() {
@@ -833,6 +916,17 @@ impl syn::parse::Parse for ImplArgs {
                     while !content.is_empty() {
                         let path: syn::Path = content.parse()?;
                         args.traits.push(path);
+                        if !content.is_empty() {
+                            content.parse::<syn::Token![,]>()?;
+                        }
+                    }
+                }
+                "rpc_groups" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    while !content.is_empty() {
+                        let path: syn::Path = content.parse()?;
+                        args.rpc_groups.push(path);
                         if !content.is_empty() {
                             content.parse::<syn::Token![,]>()?;
                         }
@@ -910,6 +1004,46 @@ struct TraitInfo {
     state_info_path: syn::Path,
     state_init_path: syn::Path,
     missing_reason: String,
+}
+
+#[allow(dead_code)]
+struct RpcGroupInfo {
+    path: syn::Path,
+    ident: syn::Ident,
+    field: syn::Ident,
+    wrapper_path: syn::Path,
+    access_trait_path: syn::Path,
+    methods_trait_path: syn::Path,
+}
+
+fn rpc_group_infos_from_paths(paths: &[syn::Path]) -> Vec<RpcGroupInfo> {
+    paths
+        .iter()
+        .map(|path| {
+            let ident = path
+                .segments
+                .last()
+                .expect("rpc group path missing segment")
+                .ident
+                .clone();
+            let snake = to_snake(&ident.to_string());
+            let field = format_ident!("__rpc_group_{}", snake);
+            let wrapper_ident = format_ident!("__{}RpcGroupWrapper", ident);
+            let access_trait_ident = format_ident!("__{}RpcGroupAccess", ident);
+            let methods_trait_ident = format_ident!("__{}RpcGroupMethods", ident);
+            let wrapper_path = replace_last_segment(path, wrapper_ident);
+            let access_trait_path = replace_last_segment(path, access_trait_ident);
+            let methods_trait_path = replace_last_segment(path, methods_trait_ident);
+            RpcGroupInfo {
+                path: path.clone(),
+                ident,
+                field,
+                wrapper_path,
+                access_trait_path,
+                methods_trait_path,
+            }
+        })
+        .collect()
 }
 
 fn trait_infos_from_paths(paths: &[syn::Path]) -> Vec<TraitInfo> {
@@ -1100,6 +1234,7 @@ fn entity_impl_block_inner(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let krate = args.krate.unwrap_or_else(default_crate_path);
     let traits = args.traits;
+    let rpc_groups = args.rpc_groups;
     let deferred_keys = args.deferred_keys;
     let mut input = input;
     let state_info = parse_state_attr(&mut input.attrs)?;
@@ -1184,6 +1319,7 @@ fn entity_impl_block_inner(
         &client_name,
         state_type.as_ref(),
         &traits,
+        &rpc_groups,
         &rpcs,
         &original_methods,
     )?;
@@ -1741,6 +1877,7 @@ fn generate_entity(
     client_name: &syn::Ident,
     state_type: Option<&syn::Type>,
     traits: &[syn::Path],
+    rpc_groups: &[syn::Path],
     rpcs: &[RpcMethod],
     original_methods: &[syn::ImplItemFn],
 ) -> syn::Result<proc_macro2::TokenStream> {
@@ -1750,7 +1887,9 @@ fn generate_entity(
     let state_type: &syn::Type = state_type.unwrap_or(&unit_type);
     let trait_infos = trait_infos_from_paths(traits);
     let has_traits = !trait_infos.is_empty();
-    let entity_impl = if has_traits {
+    let rpc_group_infos = rpc_group_infos_from_paths(rpc_groups);
+    let has_rpc_groups = !rpc_group_infos.is_empty();
+    let entity_impl = if has_traits || has_rpc_groups {
         quote! {}
     } else {
         quote! {
@@ -2356,6 +2495,101 @@ fn generate_entity(
     let struct_name_str = struct_name.to_string();
     let _state_wrapper_name = format_ident!("{}StateWrapper", struct_name);
 
+    // --- RPC Group field definitions and initialization ---
+    let rpc_group_field_defs: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let wrapper_path = &info.wrapper_path;
+            quote! { #field: #wrapper_path, }
+        })
+        .collect();
+
+    let rpc_group_params: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let path = &info.path;
+            let field = &info.field;
+            quote! { #field: #path }
+        })
+        .collect();
+
+    let rpc_group_field_inits: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let wrapper_path = &info.wrapper_path;
+            quote! { #field: #wrapper_path::new(#field), }
+        })
+        .collect();
+
+    // Default init (used when no rpc_groups are passed, e.g., for entities without groups)
+    // This is unused if has_rpc_groups is false because the fields won't exist.
+
+    // Dispatch checks for RPC groups
+    let rpc_group_dispatch_checks: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            quote! {
+                if let ::std::option::Option::Some(response) = self.#field.__dispatch(tag, payload, headers).await? {
+                    return ::std::result::Result::Ok(response);
+                }
+            }
+        })
+        .collect();
+
+    // Access trait impls for the handler (so view structs can access group wrappers)
+    let rpc_group_handler_access_impls: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let wrapper_path = &info.wrapper_path;
+            let access_trait_path = &info.access_trait_path;
+            let field = &info.field;
+            quote! {
+                impl #access_trait_path for #handler_name {
+                    fn __rpc_group_wrapper(&self) -> &#wrapper_path {
+                        &self.#field
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // Access trait impls for view structs (delegate to handler)
+    let rpc_group_view_access_impls: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let wrapper_path = &info.wrapper_path;
+            let access_trait_path = &info.access_trait_path;
+            quote! {
+                impl #access_trait_path for #read_view_name<'_> {
+                    fn __rpc_group_wrapper(&self) -> &#wrapper_path {
+                        #access_trait_path::__rpc_group_wrapper(self.__handler)
+                    }
+                }
+
+                impl #access_trait_path for #mut_view_name<'_> {
+                    fn __rpc_group_wrapper(&self) -> &#wrapper_path {
+                        #access_trait_path::__rpc_group_wrapper(self.__handler)
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // Use statements for RPC group methods traits (bring them into scope)
+    let rpc_group_use_tokens: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let methods_trait_path = &info.methods_trait_path;
+            quote! {
+                #[allow(unused_imports)]
+                use #methods_trait_path as _;
+            }
+        })
+        .collect();
+
     let trait_field_defs: Vec<proc_macro2::TokenStream> = trait_infos
         .iter()
         .map(|info| {
@@ -2797,25 +3031,31 @@ fn generate_entity(
         __entity_address: #krate::types::EntityAddress,
     };
 
-    // Handler construction is always async (may load state from storage)
-    let new_fn = quote! {
-        #[doc(hidden)]
-        pub async fn __new(entity: #struct_name, ctx: #krate::entity::EntityContext) -> ::std::result::Result<Self, #krate::error::ClusterError> {
-            #state_init_code
-            #handler_storage_init
-            let __sharding = ctx.sharding.clone();
-            let __entity_address = ctx.address.clone();
-            ::std::result::Result::Ok(Self {
-                __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
-                __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                __entity: entity,
-                #durable_field_init
-                ctx,
-                #handler_storage_fields_init
-                __sharding,
-                __entity_address,
-                #(#trait_field_init_none)*
-            })
+    // Handler construction is always async (may load state from storage).
+    // Skip __new when has_rpc_groups since the fields are non-Optional and
+    // construction goes through __new_with_rpc_groups instead.
+    let new_fn = if has_rpc_groups {
+        quote! {}
+    } else {
+        quote! {
+            #[doc(hidden)]
+            pub async fn __new(entity: #struct_name, ctx: #krate::entity::EntityContext) -> ::std::result::Result<Self, #krate::error::ClusterError> {
+                #state_init_code
+                #handler_storage_init
+                let __sharding = ctx.sharding.clone();
+                let __entity_address = ctx.address.clone();
+                ::std::result::Result::Ok(Self {
+                    __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
+                    __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    __entity: entity,
+                    #durable_field_init
+                    ctx,
+                    #handler_storage_fields_init
+                    __sharding,
+                    __entity_address,
+                    #(#trait_field_init_none)*
+                })
+            }
         }
     };
 
@@ -2841,6 +3081,36 @@ fn generate_entity(
                     __sharding,
                     __entity_address,
                     #(#trait_field_init_some)*
+                })
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let new_with_rpc_groups_fn = if has_rpc_groups {
+        quote! {
+            #[doc(hidden)]
+            pub async fn __new_with_rpc_groups(
+                entity: #struct_name,
+                #(#rpc_group_params,)*
+                ctx: #krate::entity::EntityContext,
+            ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
+                #state_init_code
+                #handler_storage_init
+                let __sharding = ctx.sharding.clone();
+                let __entity_address = ctx.address.clone();
+                ::std::result::Result::Ok(Self {
+                    __state: ::std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(state)),
+                    __write_lock: ::std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    __entity: entity,
+                    #durable_field_init
+                    ctx,
+                    #handler_storage_fields_init
+                    __sharding,
+                    __entity_address,
+                    #(#trait_field_init_none)*
+                    #(#rpc_group_field_inits)*
                 })
             }
         }
@@ -2916,8 +3186,9 @@ fn generate_entity(
         })
         .collect();
 
-    let trait_dispatch_fallback = if has_traits {
+    let trait_dispatch_fallback = if has_traits || has_rpc_groups {
         quote! {{
+            #(#rpc_group_dispatch_checks)*
             #(#trait_dispatch_checks)*
             ::std::result::Result::Err(
                 #krate::error::ClusterError::MalformedMessage {
@@ -2937,9 +3208,20 @@ fn generate_entity(
         }}
     };
 
-    // Generate register method - different signatures depending on whether traits are used
+    // Generate register method - different signatures depending on whether traits/rpc_groups are used
+    let register_rpc_group_params: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let path = &info.path;
+            quote! { #field: #path }
+        })
+        .collect();
+    let register_rpc_group_fields: Vec<_> =
+        rpc_group_infos.iter().map(|info| &info.field).collect();
+
     let register_impl = if has_traits {
-        // With traits: register takes trait dependencies as parameters
+        // With traits: register takes trait dependencies as parameters (rpc_groups not yet combined with traits)
         let register_trait_params: Vec<proc_macro2::TokenStream> = trait_infos
             .iter()
             .map(|info| {
@@ -2972,8 +3254,31 @@ fn generate_entity(
                 }
             }
         }
+    } else if has_rpc_groups {
+        // With RPC groups: register takes group instances as parameters
+        let with_groups_name_reg = format_ident!("{}WithRpcGroups", struct_name);
+        quote! {
+            impl #struct_name {
+                /// Register this entity with RPC groups and return a typed client.
+                ///
+                /// Each RPC group parameter provides additional RPC methods that are
+                /// callable on this entity. Forget a group — compile error.
+                pub async fn register(
+                    self,
+                    sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
+                    #(#register_rpc_group_params),*
+                ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
+                    let entity_with_groups = #with_groups_name_reg {
+                        entity: self,
+                        #(#register_rpc_group_fields,)*
+                    };
+                    sharding.register_entity(::std::sync::Arc::new(entity_with_groups)).await?;
+                    ::std::result::Result::Ok(#client_name::new(sharding))
+                }
+            }
+        }
     } else {
-        // Without traits: simple register
+        // Without traits or groups: simple register
         quote! {
             impl #struct_name {
                 /// Register this entity with the cluster and return a typed client.
@@ -3169,8 +3474,78 @@ fn generate_entity(
         quote! {}
     };
 
+    let with_rpc_groups_impl = if has_rpc_groups && !has_traits {
+        let with_groups_name_impl = format_ident!("{}WithRpcGroups", struct_name);
+        let rpc_group_option_fields: Vec<proc_macro2::TokenStream> = rpc_group_infos
+            .iter()
+            .map(|info| {
+                let field = &info.field;
+                let path = &info.path;
+                quote! { #field: #path, }
+            })
+            .collect();
+        let rpc_group_field_idents: Vec<_> =
+            rpc_group_infos.iter().map(|info| &info.field).collect();
+        quote! {
+            #[doc(hidden)]
+            pub struct #with_groups_name_impl {
+                entity: #struct_name,
+                #(#rpc_group_option_fields)*
+            }
+
+            #[async_trait::async_trait]
+            impl #krate::entity::Entity for #with_groups_name_impl
+            where
+                #struct_name: ::std::clone::Clone,
+            {
+                fn entity_type(&self) -> #krate::types::EntityType {
+                    self.entity.__entity_type()
+                }
+
+                fn shard_group(&self) -> &str {
+                    self.entity.__shard_group()
+                }
+
+                fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
+                    self.entity.__shard_group_for(entity_id)
+                }
+
+                fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
+                    self.entity.__max_idle_time()
+                }
+
+                fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
+                    self.entity.__mailbox_capacity()
+                }
+
+                fn concurrency(&self) -> ::std::option::Option<usize> {
+                    self.entity.__concurrency()
+                }
+
+                async fn spawn(
+                    &self,
+                    ctx: #krate::entity::EntityContext,
+                ) -> ::std::result::Result<
+                    ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
+                    #krate::error::ClusterError,
+                > {
+                    let handler = #handler_name::__new_with_rpc_groups(
+                        self.entity.clone(),
+                        #(self.#rpc_group_field_idents.clone(),)*
+                        ctx,
+                    )
+                    .await?;
+                    ::std::result::Result::Ok(::std::boxed::Box::new(handler))
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         #(#trait_use_tokens)*
+        #(#rpc_group_use_tokens)*
 
         // Emit `init` on the entity struct (stateful entities only).
         impl #struct_name {
@@ -3180,6 +3555,7 @@ fn generate_entity(
         #composite_state_defs
 
         #with_traits_impl
+        #with_rpc_groups_impl
         #entity_impl
 
         // View structs for state access pattern
@@ -3205,11 +3581,13 @@ fn generate_entity(
             #durable_field
             #sharding_handler_field
             #(#trait_field_defs)*
+            #(#rpc_group_field_defs)*
         }
 
         impl #handler_name {
             #new_fn
             #new_with_traits_fn
+            #new_with_rpc_groups_fn
 
             #save_composite_state_method
 
@@ -3270,6 +3648,8 @@ fn generate_entity(
         }
 
         #(#trait_access_impls)*
+        #(#rpc_group_handler_access_impls)*
+        #(#rpc_group_view_access_impls)*
     })
 }
 
@@ -5122,6 +5502,495 @@ fn activity_group_impl_inner(
         #wrapper_struct
         #access_trait
         #methods_trait
+    })
+}
+
+// =============================================================================
+// RPC Group Macros — argument parsing and codegen
+// =============================================================================
+
+struct RpcGroupImplArgs {
+    krate: Option<syn::Path>,
+}
+
+impl syn::parse::Parse for RpcGroupImplArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut args = RpcGroupImplArgs { krate: None };
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            match ident.to_string().as_str() {
+                "krate" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let lit: syn::LitStr = input.parse()?;
+                    args.krate = Some(lit.parse()?);
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        format!("unknown rpc_group_impl attribute: {other}"),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+        Ok(args)
+    }
+}
+
+/// Generates the codegen for `#[rpc_group_impl]`.
+///
+/// For an RPC group `HealthCheck`, this generates:
+/// - `__HealthCheckRpcGroupWrapper` — owns group instance, has delegation methods
+/// - `__HealthCheckRpcGroupView` — `Deref<Target = HealthCheck>` for RPC body execution
+/// - `__HealthCheckRpcGroupAccess` trait — `fn __rpc_group_wrapper(&self) -> &Wrapper`
+/// - `__HealthCheckRpcGroupMethods` trait — blanket impl that delegates to wrapper
+/// - `HealthCheckClientExt` trait — adds group RPC methods to the parent entity's client
+/// - `__dispatch` method on wrapper — handles RPC dispatch
+fn rpc_group_impl_inner(
+    args: RpcGroupImplArgs,
+    input: syn::ItemImpl,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let krate = args.krate.unwrap_or_else(default_crate_path);
+    let self_ty = &input.self_ty;
+
+    let struct_name = match self_ty.as_ref() {
+        syn::Type::Path(tp) => tp
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.clone())
+            .ok_or_else(|| syn::Error::new(self_ty.span(), "expected struct name"))?,
+        _ => return Err(syn::Error::new(self_ty.span(), "expected struct name")),
+    };
+
+    let wrapper_name = format_ident!("__{}RpcGroupWrapper", struct_name);
+    let access_trait_name = format_ident!("__{}RpcGroupAccess", struct_name);
+    let methods_trait_name = format_ident!("__{}RpcGroupMethods", struct_name);
+    let rpc_view_name = format_ident!("__{}RpcGroupView", struct_name);
+    let client_ext_name = format_ident!("{}ClientExt", struct_name);
+
+    // Validate: no #[state] on the impl
+    for attr in &input.attrs {
+        if attr.path().is_ident("state") {
+            return Err(syn::Error::new(
+                attr.span(),
+                "RPC groups are stateless; remove #[state(...)]",
+            ));
+        }
+    }
+
+    // Parse methods: find RPCs and helpers
+    let mut rpcs: Vec<RpcMethod> = Vec::new();
+    let mut all_methods: Vec<syn::ImplItemFn> = Vec::new();
+
+    for item in &input.items {
+        if let syn::ImplItem::Fn(method) = item {
+            // Validate: no forbidden annotations
+            for attr in &method.attrs {
+                if attr.path().is_ident("state") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "RPC groups are stateless; remove #[state(...)]",
+                    ));
+                }
+                if attr.path().is_ident("activity") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "RPC groups use #[rpc], not #[activity]",
+                    ));
+                }
+                if attr.path().is_ident("workflow") {
+                    return Err(syn::Error::new(
+                        attr.span(),
+                        "RPC groups use #[rpc], not #[workflow]",
+                    ));
+                }
+            }
+
+            // Validate: no &mut self
+            if let Some(syn::FnArg::Receiver(r)) = method.sig.inputs.first() {
+                if r.mutability.is_some() {
+                    return Err(syn::Error::new(
+                        r.span(),
+                        "RPC group methods must use &self, not &mut self",
+                    ));
+                }
+            }
+
+            let is_rpc = method.attrs.iter().any(|a| a.path().is_ident("rpc"));
+
+            if is_rpc {
+                if method.sig.asyncness.is_none() {
+                    return Err(syn::Error::new(
+                        method.sig.span(),
+                        "#[rpc] methods must be async",
+                    ));
+                }
+
+                // Parse the RPC method to get full info
+                if let Some(rpc) = parse_rpc_method(method)? {
+                    rpcs.push(rpc);
+                }
+            }
+
+            all_methods.push(method.clone());
+        }
+    }
+
+    // --- Generate RPC view struct ---
+    // This view is used when executing the actual RPC body.
+    // It Derefs to the group struct so `self.field` works.
+    let mut rpc_view_methods = Vec::new();
+    let mut helper_view_methods = Vec::new();
+
+    for method in &all_methods {
+        let is_rpc = method.attrs.iter().any(|a| a.path().is_ident("rpc"));
+        let block = &method.block;
+        let output = &method.sig.output;
+        let name = &method.sig.ident;
+        let params: Vec<_> = method.sig.inputs.iter().skip(1).collect();
+        let attrs: Vec<_> = method
+            .attrs
+            .iter()
+            .filter(|a| {
+                !a.path().is_ident("rpc")
+                    && !a.path().is_ident("public")
+                    && !a.path().is_ident("protected")
+                    && !a.path().is_ident("private")
+            })
+            .collect();
+        let vis = &method.vis;
+
+        if is_rpc {
+            rpc_view_methods.push(quote! {
+                #(#attrs)*
+                #vis async fn #name(&self, #(#params),*) #output
+                    #block
+            });
+        } else {
+            let async_token = if method.sig.asyncness.is_some() {
+                quote! { async }
+            } else {
+                quote! {}
+            };
+            helper_view_methods.push(quote! {
+                #(#attrs)*
+                #vis #async_token fn #name(&self, #(#params),*) #output
+                    #block
+            });
+        }
+    }
+
+    let view_struct = quote! {
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub struct #rpc_view_name<'a> {
+            __group: &'a #struct_name,
+        }
+
+        impl ::std::ops::Deref for #rpc_view_name<'_> {
+            type Target = #struct_name;
+            fn deref(&self) -> &Self::Target {
+                self.__group
+            }
+        }
+
+        impl #rpc_view_name<'_> {
+            #(#rpc_view_methods)*
+            #(#helper_view_methods)*
+        }
+    };
+
+    // --- Generate wrapper struct ---
+    // The wrapper owns the group instance and delegates dispatch to view methods.
+    let wrapper_delegation_methods: Vec<proc_macro2::TokenStream> = rpcs
+        .iter()
+        .filter(|rpc| rpc.is_trait_visible())
+        .map(|rpc| {
+            let method_name = &rpc.name;
+            let resp_type = &rpc.response_type;
+            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
+            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
+            let param_defs: Vec<_> = param_names
+                .iter()
+                .zip(param_types.iter())
+                .map(|(name, ty)| quote! { #name: #ty })
+                .collect();
+            quote! {
+                pub async fn #method_name(
+                    &self,
+                    #(#param_defs),*
+                ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                    let __view = #rpc_view_name { __group: &self.__group };
+                    __view.#method_name(#(#param_names),*).await
+                }
+            }
+        })
+        .collect();
+
+    // --- Generate __dispatch ---
+    let dispatch_arms: Vec<proc_macro2::TokenStream> = rpcs
+        .iter()
+        .filter(|rpc| rpc.is_dispatchable())
+        .map(|rpc| {
+            let tag = &rpc.tag;
+            let method_name = &rpc.name;
+            let param_count = rpc.params.len();
+            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
+            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
+
+            let deserialize_request = match param_count {
+                0 => quote! {},
+                1 => {
+                    let name = &param_names[0];
+                    let ty = &param_types[0];
+                    quote! {
+                        let #name: #ty = rmp_serde::from_slice(payload)
+                            .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                reason: ::std::format!("failed to deserialize request for '{}': {e}", #tag),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    }
+                }
+                _ => quote! {
+                    let (#(#param_names),*): (#(#param_types),*) = rmp_serde::from_slice(payload)
+                        .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                            reason: ::std::format!("failed to deserialize request for '{}': {e}", #tag),
+                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                        })?;
+                },
+            };
+
+            let mut call_args = Vec::new();
+            match param_count {
+                0 => {}
+                1 => {
+                    let name = &param_names[0];
+                    call_args.push(quote! { #name });
+                }
+                _ => {
+                    for name in &param_names {
+                        call_args.push(quote! { #name });
+                    }
+                }
+            }
+            let call_args = quote! { #(#call_args),* };
+
+            quote! {
+                #tag => {
+                    #deserialize_request
+                    let response = self.#method_name(#call_args).await?;
+                    let bytes = rmp_serde::to_vec(&response)
+                        .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                            reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
+                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                        })?;
+                    ::std::result::Result::Ok(::std::option::Option::Some(bytes))
+                }
+            }
+        })
+        .collect();
+
+    let wrapper_struct = quote! {
+        /// Generated wrapper for the RPC group.
+        ///
+        /// Owns the group instance and provides dispatch and delegation methods.
+        #[doc(hidden)]
+        pub struct #wrapper_name {
+            __group: #struct_name,
+        }
+
+        impl #wrapper_name {
+            /// Create a new wrapper with the group instance.
+            pub fn new(group: #struct_name) -> Self {
+                Self { __group: group }
+            }
+
+            /// Get a reference to the group instance.
+            pub fn group(&self) -> &#struct_name {
+                &self.__group
+            }
+
+            /// Dispatch an RPC to this group. Returns `None` if the tag is unknown.
+            #[doc(hidden)]
+            pub async fn __dispatch(
+                &self,
+                tag: &str,
+                payload: &[u8],
+                headers: &::std::collections::HashMap<::std::string::String, ::std::string::String>,
+            ) -> ::std::result::Result<::std::option::Option<::std::vec::Vec<u8>>, #krate::error::ClusterError> {
+                let _ = headers;
+                match tag {
+                    #(#dispatch_arms,)*
+                    _ => ::std::result::Result::Ok(::std::option::Option::None),
+                }
+            }
+
+            // --- RPC delegation methods ---
+            #(#wrapper_delegation_methods)*
+        }
+    };
+
+    // --- Generate access trait ---
+    let access_trait = quote! {
+        #[doc(hidden)]
+        pub trait #access_trait_name {
+            fn __rpc_group_wrapper(&self) -> &#wrapper_name;
+        }
+    };
+
+    // --- Generate methods trait with blanket impl ---
+    let blanket_methods: Vec<proc_macro2::TokenStream> = rpcs
+        .iter()
+        .filter(|rpc| rpc.is_trait_visible())
+        .map(|rpc| {
+            let method_name = &rpc.name;
+            let resp_type = &rpc.response_type;
+            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
+            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
+            let param_defs: Vec<_> = param_names
+                .iter()
+                .zip(param_types.iter())
+                .map(|(name, ty)| quote! { #name: #ty })
+                .collect();
+            quote! {
+                async fn #method_name(
+                    &self,
+                    #(#param_defs),*
+                ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                    self.__rpc_group_wrapper().#method_name(#(#param_names),*).await
+                }
+            }
+        })
+        .collect();
+
+    let methods_trait = quote! {
+        /// Trait providing RPC group methods via blanket implementation.
+        ///
+        /// Automatically implemented for any type that implements the access trait.
+        #[doc(hidden)]
+        #[allow(async_fn_in_trait)]
+        pub trait #methods_trait_name: #access_trait_name {
+            #(#blanket_methods)*
+        }
+
+        // Blanket impl: any type that provides the access trait gets the methods.
+        impl<T: #access_trait_name> #methods_trait_name for T {}
+    };
+
+    // --- Generate client extension trait ---
+    // This is like entity trait's ClientExt — adds group RPC methods to the parent entity's client.
+    let client_ext_methods: Vec<proc_macro2::TokenStream> = rpcs
+        .iter()
+        .filter(|rpc| rpc.is_client_visible())
+        .map(|rpc| {
+            let method_name = &rpc.name;
+            let tag = &rpc.tag;
+            let resp_type = &rpc.response_type;
+            let param_count = rpc.params.len();
+            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
+            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
+            let param_defs: Vec<_> = param_names
+                .iter()
+                .zip(param_types.iter())
+                .map(|(name, ty)| quote! { #name: &#ty })
+                .collect();
+
+            if rpc.uses_persisted_delivery() {
+                match param_count {
+                    0 => quote! {
+                        async fn #method_name(
+                            &self,
+                            entity_id: &#krate::types::EntityId,
+                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                            self.entity_client()
+                                .send_persisted(entity_id, #tag, &(), #krate::schema::Uninterruptible::No)
+                                .await
+                        }
+                    },
+                    1 => {
+                        let def = &param_defs[0];
+                        let name = &param_names[0];
+                        quote! {
+                            async fn #method_name(
+                                &self,
+                                entity_id: &#krate::types::EntityId,
+                                #def,
+                            ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                                self.entity_client()
+                                    .send_persisted(entity_id, #tag, #name, #krate::schema::Uninterruptible::No)
+                                    .await
+                            }
+                        }
+                    }
+                    _ => quote! {
+                        async fn #method_name(
+                            &self,
+                            entity_id: &#krate::types::EntityId,
+                            #(#param_defs),*
+                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                            let request = (#(#param_names),*);
+                            self.entity_client()
+                                .send_persisted(entity_id, #tag, &request, #krate::schema::Uninterruptible::No)
+                                .await
+                        }
+                    },
+                }
+            } else {
+                match param_count {
+                    0 => quote! {
+                        async fn #method_name(
+                            &self,
+                            entity_id: &#krate::types::EntityId,
+                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                            self.entity_client().send(entity_id, #tag, &()).await
+                        }
+                    },
+                    1 => {
+                        let def = &param_defs[0];
+                        let name = &param_names[0];
+                        quote! {
+                            async fn #method_name(
+                                &self,
+                                entity_id: &#krate::types::EntityId,
+                                #def,
+                            ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                                self.entity_client().send(entity_id, #tag, #name).await
+                            }
+                        }
+                    }
+                    _ => quote! {
+                        async fn #method_name(
+                            &self,
+                            entity_id: &#krate::types::EntityId,
+                            #(#param_defs),*
+                        ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
+                            let request = (#(#param_names),*);
+                            self.entity_client().send(entity_id, #tag, &request).await
+                        }
+                    },
+                }
+            }
+        })
+        .collect();
+
+    let client_ext = quote! {
+        #[async_trait::async_trait]
+        pub trait #client_ext_name: #krate::entity_client::EntityClientAccessor {
+            #(#client_ext_methods)*
+        }
+
+        impl<T> #client_ext_name for T where T: #krate::entity_client::EntityClientAccessor {}
+    };
+
+    Ok(quote! {
+        #view_struct
+        #wrapper_struct
+        #access_trait
+        #methods_trait
+        #client_ext
     })
 }
 

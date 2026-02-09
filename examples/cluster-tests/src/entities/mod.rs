@@ -6,6 +6,7 @@
 //! - `KVStore` - Key-value operations
 //! - `WorkflowTest` - Durable workflow testing
 //! - `ActivityTest` - Activity journaling
+//! - `ActivityGroupTest` - Activity group composition in workflows
 //! - `TraitTest` - Entity trait composition
 //! - `TimerTest` - Timer/scheduling
 //! - `CrossEntity` - Entity-to-entity calls
@@ -13,6 +14,7 @@
 //! - `SqlActivityTest` - SQL execution within activity transactions
 //! - `StatelessCounter` - Pure-RPC stateless entity (new API)
 
+pub mod activity_group_test;
 pub mod activity_test;
 pub mod counter;
 pub mod cross_entity;
@@ -24,6 +26,10 @@ pub mod timer_test;
 pub mod trait_test;
 pub mod workflow_test;
 
+pub use activity_group_test::{
+    ActivityGroupTest, ActivityGroupTestClient, GetOrderStepsRequest, Inventory, OrderResult,
+    OrderStep, OrderWorkflow, OrderWorkflowClient, Payments, ProcessOrderRequest,
+};
 pub use activity_test::{
     ActivityRecord, ActivityTest, ActivityTestClient, ActivityWorkflow, ActivityWorkflowClient,
     GetActivityLogRequest, RunWithActivitiesRequest,

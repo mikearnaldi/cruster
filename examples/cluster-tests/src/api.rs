@@ -13,21 +13,23 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::entities::{
-    ActivityRecord, ActivityTestClient, ActivityWorkflowClient, AuditEntry, CancelTimerRequest,
-    ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient,
-    DecrementRequest, DeleteRequest, FailingTransferRequest, FailingWorkflowClient,
-    GetActivityLogRequest, GetAuditLogRequest, GetCounterRequest, GetExecutionRequest,
-    GetMessagesRequest, GetPendingTimersRequest, GetRequest, GetSqlCountRequest, GetStateRequest,
-    GetTimerFiresRequest, GetTraitDataRequest, GetVersionRequest, IncrementRequest, KVStoreClient,
-    ListExecutionsRequest, ListKeysRequest, LongWorkflowClient, Message, PendingTimer, PingRequest,
-    ReceiveRequest, ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
-    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
-    ScheduleTimerRequest, ScheduleTimerWorkflowClient, SetRequest, SimpleWorkflowClient,
-    SingletonManager, SingletonState, SqlActivityTestClient, SqlActivityTestState,
-    SqlCountWorkflowClient, SqlFailingTransferWorkflowClient, SqlTransferWorkflowClient,
-    StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
-    StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
-    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
+    ActivityGroupTestClient, ActivityRecord, ActivityTestClient, ActivityWorkflowClient, AuditEntry,
+    CancelTimerRequest, ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient,
+    CrossEntityClient, DecrementRequest, DeleteRequest, FailingTransferRequest,
+    FailingWorkflowClient, GetActivityLogRequest, GetAuditLogRequest, GetCounterRequest,
+    GetExecutionRequest, GetMessagesRequest, GetOrderStepsRequest, GetPendingTimersRequest,
+    GetRequest, GetSqlCountRequest, GetStateRequest, GetTimerFiresRequest, GetTraitDataRequest,
+    GetVersionRequest, IncrementRequest, KVStoreClient, ListExecutionsRequest, ListKeysRequest,
+    LongWorkflowClient, Message, OrderResult, OrderStep, OrderWorkflowClient, PendingTimer,
+    PingRequest, ProcessOrderRequest, ReceiveRequest, ResetCounterRequest, ResetPingCountRequest,
+    RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
+    RunWithActivitiesRequest, ScheduleTimerRequest, ScheduleTimerWorkflowClient, SetRequest,
+    SimpleWorkflowClient, SingletonManager, SingletonState, SqlActivityTestClient,
+    SqlActivityTestState, SqlCountWorkflowClient, SqlFailingTransferWorkflowClient,
+    SqlTransferWorkflowClient, StatelessCounterClient, StatelessDecrementRequest,
+    StatelessGetRequest, StatelessIncrementRequest, StatelessResetRequest, TimerFire,
+    TimerTestClient, TraitTestClient, TransferRequest, UpdateRequest, WorkflowExecution,
+    WorkflowTestClient,
 };
 // Import RPC group client extensions to make group methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
@@ -68,6 +70,10 @@ pub struct AppState {
     pub sql_count_workflow_client: SqlCountWorkflowClient,
     /// StatelessCounter entity client (pure-RPC, new API).
     pub stateless_counter_client: StatelessCounterClient,
+    /// ActivityGroupTest entity client (for reading order steps).
+    pub activity_group_test_client: ActivityGroupTestClient,
+    /// OrderWorkflow client (standalone workflow with activity groups).
+    pub order_workflow_client: OrderWorkflowClient,
     /// Singleton manager (uses cluster's register_singleton feature).
     pub singleton_manager: Arc<SingletonManager>,
     /// Reference to the sharding implementation for debug endpoints.
@@ -158,6 +164,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/stateless-counter/:id/reset",
             post(stateless_counter_reset),
+        )
+        // ActivityGroupTest routes (activity group composition)
+        .route(
+            "/activity-group/:id/process-order",
+            post(activity_group_process_order),
+        )
+        .route(
+            "/activity-group/:id/order-steps",
+            get(activity_group_get_order_steps),
         )
         // SingletonTest routes (uses cluster's register_singleton feature)
         .route("/singleton/state", get(singleton_state))
@@ -984,6 +999,54 @@ async fn singleton_current_runner(
 async fn singleton_reset(State(state): State<Arc<AppState>>) -> Result<Json<()>, AppError> {
     state.singleton_manager.reset().await?;
     Ok(Json(()))
+}
+
+// ============================================================================
+// ActivityGroupTest handlers (activity group composition)
+// ============================================================================
+
+/// Request body for processing an order via the activity-group workflow.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActivityGroupProcessOrderBody {
+    /// Number of items in the order.
+    pub item_count: i32,
+    /// Payment amount in cents.
+    pub amount: i64,
+}
+
+/// Process an order using the workflow with composed activity groups.
+async fn activity_group_process_order(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ActivityGroupProcessOrderBody>,
+) -> Result<Json<OrderResult>, AppError> {
+    let result = state
+        .order_workflow_client
+        .execute(&ProcessOrderRequest {
+            order_id: id,
+            item_count: body.item_count,
+            amount: body.amount,
+        })
+        .await?;
+    Ok(Json(result))
+}
+
+/// Get the recorded order processing steps.
+async fn activity_group_get_order_steps(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<OrderStep>>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let steps = state
+        .activity_group_test_client
+        .get_order_steps(
+            &entity_id,
+            &GetOrderStepsRequest {
+                order_id: id,
+            },
+        )
+        .await?;
+    Ok(Json(steps))
 }
 
 // ============================================================================

@@ -34,10 +34,11 @@ mod entities;
 
 use api::{create_router, AppState};
 use entities::{
-    ActivityTest, ActivityWorkflow, Auditable, Counter, CrossEntity, FailingWorkflow, KVStore,
-    LongWorkflow, ScheduleTimerWorkflow, SimpleWorkflow, SingletonManager, SqlActivityTest,
-    SqlCountWorkflow, SqlFailingTransferWorkflow, SqlTransferWorkflow, StatelessCounter, TimerTest,
-    TraitTest, Versioned, WorkflowTest,
+    ActivityGroupTest, ActivityTest, ActivityWorkflow, Auditable, Counter, CrossEntity,
+    FailingWorkflow, Inventory, KVStore, LongWorkflow, OrderWorkflow, Payments,
+    ScheduleTimerWorkflow, SimpleWorkflow, SingletonManager, SqlActivityTest, SqlCountWorkflow,
+    SqlFailingTransferWorkflow, SqlTransferWorkflow, StatelessCounter, TimerTest, TraitTest,
+    Versioned, WorkflowTest,
 };
 
 /// Parse a "host:port" string into a RunnerAddress.
@@ -370,6 +371,30 @@ async fn main() -> Result<()> {
     .expect("failed to register StatelessCounter entity");
     tracing::info!("Registered StatelessCounter entity");
 
+    let activity_group_test_client = ActivityGroupTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register ActivityGroupTest entity");
+    tracing::info!("Registered ActivityGroupTest entity");
+
+    let order_workflow_client = OrderWorkflow {
+        pool: cluster.pool(),
+    }
+    .register(
+        sharding.clone(),
+        Inventory {
+            pool: cluster.pool(),
+        },
+        Payments {
+            pool: cluster.pool(),
+        },
+    )
+    .await
+    .expect("failed to register OrderWorkflow");
+    tracing::info!("Registered OrderWorkflow");
+
     // Register the singleton using cluster's register_singleton feature
     let singleton_manager = Arc::new(SingletonManager::new(cluster.pool()));
     singleton_manager
@@ -406,6 +431,8 @@ async fn main() -> Result<()> {
         sql_failing_transfer_workflow_client,
         sql_count_workflow_client,
         stateless_counter_client,
+        activity_group_test_client,
+        order_workflow_client,
         singleton_manager,
         sharding,
         shard_groups,
@@ -428,6 +455,8 @@ async fn main() -> Result<()> {
             "Workflow/SqlFailingTransferWorkflow".to_string(),
             "Workflow/SqlCountWorkflow".to_string(),
             "StatelessCounter".to_string(),
+            "ActivityGroupTest".to_string(),
+            "Workflow/OrderWorkflow".to_string(),
             "SingletonTest (singleton)".to_string(),
         ],
         pool: cluster.pool(),

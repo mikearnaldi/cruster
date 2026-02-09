@@ -3086,4 +3086,228 @@ mod tests {
         let value: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(value, "HELLO");
     }
+
+    // ==========================================================================
+    // #[activity_group] / #[activity_group_impl] Macro Tests
+    // ==========================================================================
+
+    use crate::activity_group_impl;
+
+    // --- Basic activity group ---
+
+    #[activity_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct TestPayments {
+        pub rate: f64,
+    }
+
+    #[activity_group_impl(krate = "crate")]
+    impl TestPayments {
+        #[activity]
+        async fn charge(
+            &self,
+            amount: i32,
+        ) -> Result<String, ClusterError> {
+            let total = (amount as f64 * self.rate) as i32;
+            Ok(format!("charged:{total}"))
+        }
+
+        #[activity]
+        async fn refund(&self, tx_id: String) -> Result<String, ClusterError> {
+            Ok(format!("refunded:{tx_id}"))
+        }
+
+        /// Helper (not an activity)
+        fn format_amount(&self, amount: i32) -> String {
+            format!("${amount}")
+        }
+    }
+
+    // --- Activity group composed into a workflow ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct PaymentWorkflow;
+
+    #[workflow_impl(krate = "crate", activity_groups(TestPayments))]
+    impl PaymentWorkflow {
+        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
+            let charge_result = self.charge(request.amount).await?;
+            let refund_result = self.refund(request.order_id.clone()).await?;
+            Ok(format!("{charge_result}|{refund_result}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_group_workflow_dispatch() {
+        let payments = TestPayments { rate: 1.5 };
+        let workflow = PaymentWorkflow;
+        let ctx = test_ctx("Workflow/PaymentWorkflow", "exec-1");
+        // To test dispatch, we need to create the WithGroups wrapper and spawn
+        let bundle = __PaymentWorkflowWithGroups {
+            __workflow: workflow,
+            __group_test_payments: payments,
+        };
+        let handler = bundle.spawn(ctx).await.unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-1".to_string(),
+            amount: 100,
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "charged:150|refunded:order-1");
+    }
+
+    #[tokio::test]
+    async fn activity_group_workflow_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = PaymentWorkflow
+            .register(
+                Arc::clone(&sharding),
+                TestPayments { rate: 2.0 },
+            )
+            .await
+            .unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-2".to_string(),
+            amount: 50,
+        };
+        let _: String = client.execute(&req).await.unwrap();
+    }
+
+    #[test]
+    fn activity_group_workflow_entity_type() {
+        // When activity_groups are present, Entity is on the WithGroups wrapper
+        let bundle = __PaymentWorkflowWithGroups {
+            __workflow: PaymentWorkflow,
+            __group_test_payments: TestPayments { rate: 1.0 },
+        };
+        assert_eq!(bundle.entity_type().0, "Workflow/PaymentWorkflow");
+    }
+
+    // --- Multiple activity groups ---
+
+    #[activity_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct TestInventory;
+
+    #[activity_group_impl(krate = "crate")]
+    impl TestInventory {
+        #[activity]
+        async fn reserve(&self, item_count: i32) -> Result<String, ClusterError> {
+            Ok(format!("reserved:{item_count}"))
+        }
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct MultiGroupWorkflow;
+
+    #[workflow_impl(krate = "crate", activity_groups(TestPayments, TestInventory))]
+    impl MultiGroupWorkflow {
+        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
+            let reserved = self.reserve(request.amount).await?;
+            let charged = self.charge(request.amount).await?;
+            Ok(format!("{reserved}|{charged}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_activity_group_workflow_dispatch() {
+        let payments = TestPayments { rate: 1.0 };
+        let inventory = TestInventory;
+        let workflow = MultiGroupWorkflow;
+        let ctx = test_ctx("Workflow/MultiGroupWorkflow", "exec-1");
+        let bundle = __MultiGroupWorkflowWithGroups {
+            __workflow: workflow,
+            __group_test_payments: payments,
+            __group_test_inventory: inventory,
+        };
+        let handler = bundle.spawn(ctx).await.unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-3".to_string(),
+            amount: 10,
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "reserved:10|charged:10");
+    }
+
+    #[tokio::test]
+    async fn multi_activity_group_workflow_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = MultiGroupWorkflow
+            .register(
+                Arc::clone(&sharding),
+                TestPayments { rate: 1.0 },
+                TestInventory,
+            )
+            .await
+            .unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-4".to_string(),
+            amount: 20,
+        };
+        let _: String = client.execute(&req).await.unwrap();
+    }
+
+    // --- Workflow with both local activities and activity groups ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct MixedActivitiesWorkflow {
+        prefix: String,
+    }
+
+    #[workflow_impl(krate = "crate", activity_groups(TestPayments))]
+    impl MixedActivitiesWorkflow {
+        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
+            let validated = self.validate(request.order_id.clone()).await?;
+            let charged = self.charge(request.amount).await?;
+            Ok(format!("{validated}|{charged}"))
+        }
+
+        #[activity]
+        async fn validate(&self, order_id: String) -> Result<String, ClusterError> {
+            Ok(format!("{}:valid:{order_id}", self.prefix))
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_activities_workflow_dispatch() {
+        let payments = TestPayments { rate: 3.0 };
+        let workflow = MixedActivitiesWorkflow {
+            prefix: "test".to_string(),
+        };
+        let ctx = test_ctx("Workflow/MixedActivitiesWorkflow", "exec-1");
+        let bundle = __MixedActivitiesWorkflowWithGroups {
+            __workflow: workflow,
+            __group_test_payments: payments,
+        };
+        let handler = bundle.spawn(ctx).await.unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-5".to_string(),
+            amount: 10,
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "test:valid:order-5|charged:30");
+    }
 }

@@ -673,23 +673,23 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 
 3. **Generate `T::client(&self)` on workflow view structs** ✅ — workflows can get clients for other workflows/entities via `WorkflowClientFactory`
 
-### Phase 5: Activity Groups
+### Phase 5: Activity Groups ✅
 
 **Goal:** `#[activity_group]` / `#[activity_group_impl]` for composable activity bundles.
 
-1. **Add `#[activity_group]` struct-level macro**
+1. **Add `#[activity_group]` struct-level macro** ✅
    - Marker, no state
 
-2. **Add `#[activity_group_impl]` impl-level macro**
+2. **Add `#[activity_group_impl]` impl-level macro** ✅
    - Only `#[activity]` and helpers allowed
    - Validate: no `&mut self`, no `#[rpc]`, no `#[workflow]`, no `#[state]`
    - Generate: view struct, wrapper methods, access/methods traits
 
-3. **Wire into `#[workflow_impl(activity_groups(...))]`**
+3. **Wire into `#[workflow_impl(activity_groups(...))]`** ✅
    - Generate group instance fields on Handler
    - Implement access/methods traits on `__ExecuteView`
    - Route through `DurableContext::run()` for journaling
-   - Validate no name collisions
+   - Tests added: single group, multiple groups, mixed local + group activities
 
 ### Phase 6: Activity Retry Support
 

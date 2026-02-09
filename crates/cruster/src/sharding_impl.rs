@@ -2590,6 +2590,13 @@ impl Sharding for ShardingImpl {
         )
     }
 
+    async fn replies_for(&self, request_id: Snowflake) -> Result<Vec<Reply>, ClusterError> {
+        match &self.message_storage {
+            Some(storage) => storage.replies_for(request_id).await,
+            None => Ok(vec![]),
+        }
+    }
+
     #[instrument(skip(self))]
     async fn shutdown(&self) -> Result<(), ClusterError> {
         self.shutdown.store(true, Ordering::Release);

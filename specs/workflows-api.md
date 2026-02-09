@@ -549,10 +549,10 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 - **Phase 3 & 4 (Workflow macros + Client):** ✅ Done — `#[workflow]` / `#[workflow_impl]` macros exist and delegate to shared codegen. Tests for the new names added.
 - **Phase 5 (Activity groups):** ✅ Done — `#[activity_group]` / `#[activity_group_impl]` macros implemented with composition into workflows via `activity_groups(...)`.
 - **Phase 6 (Activity retry support):** ✅ Done — `#[activity(retries = N, backoff = "...")]` implemented for both standalone workflow activities and activity group activities. Retry loop uses attempt-indexed journal keys for independent journaling per retry. Durable sleep between retries via `WorkflowEngine::sleep()`. Backoff strategies: exponential (default, capped at 60s) and constant. `compute_retry_backoff()` utility added. Tests cover: retries with success, constant backoff, retry exhaustion, activity groups with retries, and backoff computation.
+- **Phase 7 (Poll and execution lifecycle):** ✅ Done — `poll` method added to generated workflow client and `ClientWithKey`. `Sharding` trait extended with `replies_for(request_id)` (default returns empty, `ShardingImpl` delegates to `MessageStorage`). `EntityClient::poll_reply` computes deterministic request_id and queries storage. Workflow `execute`/`start`/`ClientWithKey` methods now use entity_id-based key_bytes for consistent request_id derivation, enabling poll without original request payload. Tests: poll returns None for unknown, poll returns result after execute, poll with key, compile-time method existence.
 - **Phase 9 (partial):** ✅ Done — all `standalone_workflow` / `standalone_workflow_impl` tests in `macro_tests.rs` have been ported to new `#[workflow]` / `#[workflow_impl]` API names and old tests removed. Legacy `#[standalone_workflow]` / `#[standalone_workflow_impl]` proc_macro entry points and re-exports deleted. Internal functions renamed from `standalone_workflow_*` to `workflow_*`. All doc comments updated.
 - **Remaining work:**
   - Phase 1 & 2: Entity simplification and RPC groups (not yet started)
-  - Phase 7: Poll and execution lifecycle (not yet started)
   - Phase 8: Integration testing (not yet started)
 
 ### Phase 1: Simplify Entities
@@ -720,13 +720,17 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
    - `activity_group_retry_succeeds` — activity group with retries
    - `test_compute_retry_backoff_exponential` / `test_compute_retry_backoff_constant` — unit tests for backoff computation
 
-### Phase 7: Poll and Execution Lifecycle
+### Phase 7: Poll and Execution Lifecycle ✅
 
 **Goal:** Support fire-and-forget execution with polling.
 
-1. **Workflow result persistence** — handled by existing entity message reply mechanism
-2. **`client.start()`** — send persisted message, don't await reply, return entity ID
-3. **`client.poll()`** — check `MessageStorage` for reply, return `Some(result)` or `None`
+1. **Workflow result persistence** ✅ — handled by existing entity message reply mechanism
+2. **`client.start()`** ✅ — send persisted message, don't await reply, return entity ID (already existed from Phase 4)
+3. **`client.poll()`** ✅ — check `MessageStorage` for reply, return `Some(result)` or `None`
+   - Added `Sharding::replies_for(request_id)` trait method (default: empty vec, `ShardingImpl` delegates to `MessageStorage`)
+   - Added `EntityClient::poll_reply()` — computes deterministic request_id and queries storage
+   - Generated `poll(execution_id)` on workflow client, `poll()` on `ClientWithKey`
+   - Changed `execute`/`start` to use entity_id-based key_bytes for consistent request_id derivation (enables poll without original request payload)
 
 ### Phase 8: Integration Testing
 

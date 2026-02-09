@@ -6524,10 +6524,12 @@ fn workflow_impl_inner(
                 request: &#request_type,
             ) -> ::std::result::Result<#response_type, #krate::error::ClusterError> {
                 let entity_id = Self::derive_entity_id(request)?;
-                self.inner.send_persisted(
+                let key_bytes = entity_id.0.as_bytes().to_vec();
+                self.inner.send_persisted_with_key(
                     &entity_id,
                     "execute",
                     request,
+                    ::std::option::Option::Some(key_bytes),
                     #krate::schema::Uninterruptible::No,
                 ).await
             }
@@ -6542,12 +6544,32 @@ fn workflow_impl_inner(
                 request: &#request_type,
             ) -> ::std::result::Result<::std::string::String, #krate::error::ClusterError> {
                 let entity_id = Self::derive_entity_id(request)?;
-                self.inner.notify_persisted(
+                let key_bytes = entity_id.0.as_bytes().to_vec();
+                self.inner.notify_persisted_with_key(
                     &entity_id,
                     "execute",
                     request,
+                    ::std::option::Option::Some(key_bytes),
                 ).await?;
                 ::std::result::Result::Ok(entity_id.0)
+            }
+
+            /// Poll for the result of a previously-started workflow execution.
+            ///
+            /// Returns `Ok(Some(result))` if the workflow has completed,
+            /// `Ok(None)` if it is still running or no result is available yet.
+            /// Returns `Err(...)` if the workflow failed.
+            pub async fn poll(
+                &self,
+                execution_id: &str,
+            ) -> ::std::result::Result<::std::option::Option<#response_type>, #krate::error::ClusterError> {
+                let entity_id = #krate::types::EntityId::new(execution_id);
+                let key_bytes = entity_id.0.as_bytes();
+                self.inner.poll_reply::<#response_type>(
+                    &entity_id,
+                    "execute",
+                    key_bytes,
+                ).await
             }
         }
 
@@ -6572,10 +6594,12 @@ fn workflow_impl_inner(
                 &self,
                 request: &#request_type,
             ) -> ::std::result::Result<#response_type, #krate::error::ClusterError> {
-                self.inner.send_persisted(
+                let key_bytes = self.entity_id.0.as_bytes().to_vec();
+                self.inner.send_persisted_with_key(
                     &self.entity_id,
                     "execute",
                     request,
+                    ::std::option::Option::Some(key_bytes),
                     #krate::schema::Uninterruptible::No,
                 ).await
             }
@@ -6587,12 +6611,30 @@ fn workflow_impl_inner(
                 &self,
                 request: &#request_type,
             ) -> ::std::result::Result<::std::string::String, #krate::error::ClusterError> {
-                self.inner.notify_persisted(
+                let key_bytes = self.entity_id.0.as_bytes().to_vec();
+                self.inner.notify_persisted_with_key(
                     &self.entity_id,
                     "execute",
                     request,
+                    ::std::option::Option::Some(key_bytes),
                 ).await?;
                 ::std::result::Result::Ok(self.entity_id.0.clone())
+            }
+
+            /// Poll for the result of the workflow execution using the baked-in key.
+            ///
+            /// Returns `Ok(Some(result))` if the workflow has completed,
+            /// `Ok(None)` if it is still running or no result is available yet.
+            /// Returns `Err(...)` if the workflow failed.
+            pub async fn poll(
+                &self,
+            ) -> ::std::result::Result<::std::option::Option<#response_type>, #krate::error::ClusterError> {
+                let key_bytes = self.entity_id.0.as_bytes();
+                self.inner.poll_reply::<#response_type>(
+                    &self.entity_id,
+                    "execute",
+                    key_bytes,
+                ).await
             }
         }
     };

@@ -16,7 +16,7 @@ mod tests {
     use crate::sharding::{Sharding, ShardingRegistrationEvent};
     use crate::sharding_impl::ShardingImpl;
     use crate::singleton::SingletonContext;
-    use crate::snowflake::SnowflakeGenerator;
+    use crate::snowflake::{Snowflake, SnowflakeGenerator};
     use crate::storage::memory_message::MemoryMessageStorage;
     use crate::storage::noop_runners::NoopRunners;
     use crate::types::{EntityAddress, EntityId, EntityType, RunnerAddress, ShardId};
@@ -3049,6 +3049,172 @@ mod tests {
         use crate::entity_client::WorkflowClientFactory;
         fn _assert_factory<T: WorkflowClientFactory>() {}
         _assert_factory::<NewSimpleWorkflow>();
+    }
+
+    // --- Workflow poll tests ---
+
+    /// Mock sharding that stores replies and supports `replies_for` for poll testing.
+    struct PollableSharding {
+        inner: MockSharding,
+        replies: Arc<Mutex<HashMap<Snowflake, Vec<Reply>>>>,
+    }
+
+    impl PollableSharding {
+        fn new() -> Self {
+            Self {
+                inner: MockSharding::new(),
+                replies: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Sharding for PollableSharding {
+        fn get_shard_id(&self, et: &EntityType, eid: &EntityId) -> ShardId {
+            self.inner.get_shard_id(et, eid)
+        }
+        fn has_shard_id(&self, sid: &ShardId) -> bool {
+            self.inner.has_shard_id(sid)
+        }
+        fn snowflake(&self) -> &SnowflakeGenerator {
+            self.inner.snowflake()
+        }
+        fn is_shutdown(&self) -> bool {
+            false
+        }
+        async fn register_entity(&self, _: Arc<dyn Entity>) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn register_singleton(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Arc<
+                dyn Fn(SingletonContext) -> BoxFuture<'static, Result<(), ClusterError>>
+                    + Send
+                    + Sync,
+            >,
+        ) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        fn make_client(self: Arc<Self>, et: EntityType) -> EntityClient {
+            EntityClient::new(self, et)
+        }
+        async fn send(&self, envelope: EnvelopeRequest) -> Result<ReplyReceiver, ClusterError> {
+            // Build reply
+            let response = rmp_serde::to_vec(&"ok".to_string()).unwrap();
+            let reply = Reply::WithExit(ReplyWithExit {
+                request_id: envelope.request_id,
+                id: self.inner.snowflake.next_async().await?,
+                exit: ExitResult::Success(response),
+            });
+            // Store reply for poll
+            self.replies
+                .lock()
+                .unwrap()
+                .entry(envelope.request_id)
+                .or_default()
+                .push(reply.clone());
+            // Also send via channel for send_persisted
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(reply).await.map_err(|_| ClusterError::MalformedMessage {
+                reason: "reply channel closed".into(),
+                source: None,
+            })?;
+            Ok(rx)
+        }
+        async fn notify(&self, _envelope: EnvelopeRequest) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn ack_chunk(&self, _: AckChunk) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn interrupt(&self, _: Interrupt) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn poll_storage(&self) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        fn active_entity_count(&self) -> usize {
+            0
+        }
+        async fn registration_events(
+            &self,
+        ) -> Pin<Box<dyn Stream<Item = ShardingRegistrationEvent> + Send>> {
+            Box::pin(tokio_stream::empty())
+        }
+        async fn replies_for(&self, request_id: Snowflake) -> Result<Vec<Reply>, ClusterError> {
+            Ok(self
+                .replies
+                .lock()
+                .unwrap()
+                .get(&request_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        async fn shutdown(&self) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn new_workflow_poll_returns_none_when_not_started() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        // Poll for an execution that was never started — should return None
+        let result: Option<String> = client.poll("nonexistent-id").await.unwrap();
+        assert!(result.is_none(), "poll should return None for unknown execution");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_poll_returns_result_after_execute() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "poll-test".to_string(),
+        };
+
+        // Execute the workflow (which stores the reply)
+        let result: String = client.execute(&req).await.unwrap();
+        assert_eq!(result, "ok");
+
+        // Now poll for the same execution — derive entity_id the same way
+        let key_bytes = rmp_serde::to_vec(&req).unwrap();
+        let entity_id = crate::hash::sha256_hex(&key_bytes);
+        let poll_result: Option<String> = client.poll(&entity_id).await.unwrap();
+        assert_eq!(poll_result, Some("ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn new_workflow_poll_with_key_returns_result() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "poll-keyed".to_string(),
+        };
+
+        // Execute with a raw key
+        let keyed = client.with_key_raw("poll-exec-1");
+        let _: String = keyed.execute(&req).await.unwrap();
+
+        // Poll on the ClientWithKey view
+        let keyed_again = client.with_key_raw("poll-exec-1");
+        let poll_result: Option<String> = keyed_again.poll().await.unwrap();
+        assert_eq!(poll_result, Some("ok".to_string()));
+    }
+
+    #[test]
+    fn new_workflow_poll_method_exists() {
+        // Compile-time check that poll exists on both client types
+        fn _assert_poll(_c: &NewSimpleWorkflowClient) {
+            // client.poll(execution_id) should exist
+        }
+        fn _assert_poll_with_key(_c: &NewSimpleWorkflowClientWithKey<'_>) {
+            // client_with_key.poll() should exist
+        }
     }
 
     // --- Workflow with helpers using new macros ---

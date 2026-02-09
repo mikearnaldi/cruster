@@ -1,14 +1,15 @@
-//! MatchmakingService entity - stateless service for pairing players into games.
+//! MatchmakingService entity - pure-RPC service for pairing players into games.
 //!
-//! This is a stateless entity that maintains an ephemeral queue of players waiting
-//! for matches. When two compatible players are found, it creates a ChessGame entity
-//! and notifies both PlayerSessions.
+//! This entity maintains an ephemeral in-memory queue of players waiting for matches.
+//! When two compatible players are found, it returns a match result. The queue is not
+//! persisted — on restart, players need to re-queue.
 //!
-//! Note: In a production system, the queue state would be distributed across nodes.
-//! For this demo, we use a simple in-memory queue per entity instance.
+//! Uses the new pure-RPC entity pattern: no framework-managed state, no workflows,
+//! no activities. State is held directly via `Arc<Mutex<MatchmakingState>>`.
+
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -107,17 +108,39 @@ pub struct MatchmakingState {
 
 /// MatchmakingService pairs players into games.
 ///
-/// ## Stateless Design
-/// This entity maintains ephemeral queue state that is not persisted.
-/// On restart, players need to re-enter the queue via their PlayerSession.
+/// ## Pure-RPC Design
+/// This entity maintains ephemeral queue state via `Arc<Mutex<MatchmakingState>>`.
+/// State is not persisted by the framework — on restart, players need to re-enter
+/// the queue via their PlayerSession.
 ///
 /// ## RPCs
-/// - `find_match(player_id, preferences)` - Add to queue, try to find match
-/// - `cancel_search(player_id)` - Remove from queue
-/// - `get_queue_status()` - Return queue statistics
+/// - `find_match(request)` — Add to queue, try to find match (persisted for at-least-once)
+/// - `cancel_search(request)` — Remove from queue (persisted for at-least-once)
+/// - `get_queue_status()` — Return queue statistics
+/// - `is_in_queue(player_id)` — Check if player is queued
+/// - `get_queue_position(player_id)` — Get player's queue position
 #[entity(max_idle_time_secs = 60)]
 #[derive(Clone)]
-pub struct MatchmakingService;
+pub struct MatchmakingService {
+    /// In-memory ephemeral state, shared across all RPC calls for this entity instance.
+    state: Arc<Mutex<MatchmakingState>>,
+}
+
+impl MatchmakingService {
+    /// Create a new MatchmakingService with empty state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MatchmakingState::default())),
+        }
+    }
+}
+
+impl Default for MatchmakingService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Request to find a match.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,106 +225,76 @@ impl From<MatchmakingError> for ClusterError {
 }
 
 #[entity_impl]
-#[state(MatchmakingState)]
 impl MatchmakingService {
-    fn init(&self, _ctx: &EntityContext) -> Result<MatchmakingState, ClusterError> {
-        Ok(MatchmakingState::default())
-    }
-
     /// Find a match for a player.
-    #[workflow]
+    ///
+    /// If a compatible opponent is already in the queue, returns a match immediately.
+    /// Otherwise, adds the player to the queue and returns a queued status.
+    #[rpc(persisted)]
     pub async fn find_match(
         &self,
         request: FindMatchRequest,
     ) -> Result<FindMatchResponse, ClusterError> {
-        // Validation (deterministic)
-        if self
-            .state
-            .queue
-            .iter()
-            .any(|p| p.player_id == request.player_id)
-        {
+        let mut state = self.state.lock().unwrap();
+
+        // Validation: check if player is already in queue
+        if state.queue.iter().any(|p| p.player_id == request.player_id) {
             return Err(MatchmakingError::AlreadyInQueue.into());
         }
 
         let new_player = QueuedPlayer::new(request.player_id, request.preferences, request.rating);
 
-        // Check for compatible opponent (deterministic read)
-        let opponent_idx = find_compatible_opponent(&self.state.queue, &new_player);
+        // Check for compatible opponent
+        let opponent_idx = find_compatible_opponent(&state.queue, &new_player);
 
-        // State mutation via activity
         if let Some(idx) = opponent_idx {
-            self.do_match_players(new_player, idx).await
+            // Match found — remove opponent from queue and return match result
+            let opponent = state.queue.remove(idx);
+            let game_id = GameId::new();
+            let new_player_is_white = new_player.queued_at > opponent.queued_at;
+            state.matches_made += 1;
+
+            Ok(FindMatchResponse::Matched {
+                game_id,
+                opponent_id: opponent.player_id,
+                is_white: new_player_is_white,
+            })
         } else {
-            self.do_queue_player(new_player).await
+            // No match — add to queue
+            let position = state.queue.len() as u32 + 1;
+            state.queue.push(new_player);
+            let estimated_wait_secs = Some(position * 30);
+
+            Ok(FindMatchResponse::Queued {
+                position,
+                estimated_wait_secs,
+            })
         }
     }
 
-    #[activity]
-    async fn do_match_players(
-        &mut self,
-        new_player: QueuedPlayer,
-        opponent_idx: usize,
-    ) -> Result<FindMatchResponse, ClusterError> {
-        let opponent = self.state.queue.remove(opponent_idx);
-        let game_id = GameId::new();
-        let new_player_is_white = new_player.queued_at > opponent.queued_at;
-        self.state.matches_made += 1;
-
-        Ok(FindMatchResponse::Matched {
-            game_id,
-            opponent_id: opponent.player_id,
-            is_white: new_player_is_white,
-        })
-    }
-
-    #[activity]
-    async fn do_queue_player(
-        &mut self,
-        new_player: QueuedPlayer,
-    ) -> Result<FindMatchResponse, ClusterError> {
-        let position = self.state.queue.len() as u32 + 1;
-        self.state.queue.push(new_player);
-        let estimated_wait_secs = Some(position * 30);
-
-        Ok(FindMatchResponse::Queued {
-            position,
-            estimated_wait_secs,
-        })
-    }
-
     /// Cancel a matchmaking search.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn cancel_search(&self, request: CancelSearchRequest) -> Result<(), ClusterError> {
-        // Validation (deterministic)
-        let in_queue = self
-            .state
-            .queue
-            .iter()
-            .any(|p| p.player_id == request.player_id);
+        let mut state = self.state.lock().unwrap();
 
+        let in_queue = state.queue.iter().any(|p| p.player_id == request.player_id);
         if !in_queue {
             return Err(MatchmakingError::NotInQueue.into());
         }
 
-        // State mutation via activity
-        self.do_cancel_search(request.player_id).await
-    }
-
-    #[activity]
-    async fn do_cancel_search(&mut self, player_id: PlayerId) -> Result<(), ClusterError> {
-        self.state.queue.retain(|p| p.player_id != player_id);
+        state.queue.retain(|p| p.player_id != request.player_id);
         Ok(())
     }
 
     /// Get the current queue status.
     #[rpc]
     pub async fn get_queue_status(&self) -> Result<QueueStatus, ClusterError> {
+        let state = self.state.lock().unwrap();
+
         // Count players by time control
         let mut by_time_control: Vec<TimeControlQueueInfo> = Vec::new();
 
-        // Group by time control
-        for player in &self.state.queue {
+        for player in &state.queue {
             if let Some(info) = by_time_control
                 .iter_mut()
                 .find(|i| i.time_control == player.preferences.time_control)
@@ -316,8 +309,8 @@ impl MatchmakingService {
         }
 
         Ok(QueueStatus {
-            players_in_queue: self.state.queue.len() as u32,
-            total_matches_made: self.state.matches_made,
+            players_in_queue: state.queue.len() as u32,
+            total_matches_made: state.matches_made,
             by_time_control,
         })
     }
@@ -325,7 +318,8 @@ impl MatchmakingService {
     /// Check if a player is currently in the queue.
     #[rpc]
     pub async fn is_in_queue(&self, player_id: PlayerId) -> Result<bool, ClusterError> {
-        Ok(self.state.queue.iter().any(|p| p.player_id == player_id))
+        let state = self.state.lock().unwrap();
+        Ok(state.queue.iter().any(|p| p.player_id == player_id))
     }
 
     /// Get a player's position in the queue.
@@ -334,8 +328,8 @@ impl MatchmakingService {
         &self,
         player_id: PlayerId,
     ) -> Result<Option<u32>, ClusterError> {
-        Ok(self
-            .state
+        let state = self.state.lock().unwrap();
+        Ok(state
             .queue
             .iter()
             .position(|p| p.player_id == player_id)

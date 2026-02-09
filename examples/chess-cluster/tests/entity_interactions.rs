@@ -28,7 +28,7 @@ use chess_cluster::types::{
 #[tokio::test]
 async fn test_matchmaking_queue_and_match() {
     let cluster = TestCluster::with_workflow_support().await;
-    let mm_client = MatchmakingService
+    let mm_client = MatchmakingService::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -105,7 +105,7 @@ async fn test_matchmaking_queue_and_match() {
 #[tokio::test]
 async fn test_matchmaking_cancel_search() {
     let cluster = TestCluster::with_workflow_support().await;
-    let mm_client = MatchmakingService
+    let mm_client = MatchmakingService::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -142,7 +142,7 @@ async fn test_matchmaking_cancel_search() {
 #[tokio::test]
 async fn test_matchmaking_different_time_controls_dont_match() {
     let cluster = TestCluster::with_workflow_support().await;
-    let mm_client = MatchmakingService
+    let mm_client = MatchmakingService::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -403,7 +403,7 @@ async fn test_full_matchmaking_to_game_flow() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
     let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
-    let mm_client = MatchmakingService
+    let mm_client = MatchmakingService::new()
         .register(Arc::clone(&sharding))
         .await
         .unwrap();

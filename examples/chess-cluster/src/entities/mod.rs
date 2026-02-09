@@ -18,9 +18,9 @@ pub mod player_session;
 pub mod traits;
 
 pub use chess_game::{
-    ChessGame, ChessGameClient, ChessGameError, ChessGameState, CreateGameRequest,
-    CreateGameResponse, DrawAcceptRequest, DrawOfferRequest, MakeMoveRequest, MakeMoveResponse,
-    ResignRequest,
+    AbortRequest, ChessGame, ChessGameClient, ChessGameError, ChessGameState, CreateGameRequest,
+    CreateGameResponse, DrawAcceptRequest, DrawOfferRequest, GetLegalMovesRequest,
+    HandleTimeoutRequest, MakeMoveRequest, MakeMoveResponse, ResignRequest,
 };
 pub use leaderboard::{
     GetRankingsAroundRequest, GetRankingsAroundResponse, GetTopPlayersRequest,

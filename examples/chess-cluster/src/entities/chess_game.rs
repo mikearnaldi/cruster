@@ -1,13 +1,15 @@
-//! ChessGame entity - persisted game state with durable workflows.
+//! ChessGame entity - manages chess games with ephemeral in-memory state.
 //!
-//! This entity manages a chess game between two players, with persisted state
-//! that survives server restarts. Move validation is done via shakmaty.
+//! This entity manages a chess game between two players. Move validation is done
+//! via shakmaty.
 //!
-//! The entity uses the `Auditable` trait for comprehensive audit logging of all
-//! game actions.
+//! Uses the pure-RPC entity pattern: no framework-managed state, no workflows,
+//! no activities. State is held directly via `Arc<Mutex<HashMap<...>>>`.
 
-use chrono::{Duration as ChronoDuration, Utc};
-use cruster::entity::EntityContext;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use chrono::Utc;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -22,7 +24,7 @@ use crate::types::player::PlayerId;
 
 /// State for a chess game entity.
 ///
-/// This is persisted to storage so games survive server restarts.
+/// This is ephemeral in-memory state. On restart, games need to be recreated.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChessGameState {
     /// The full game state.
@@ -71,33 +73,62 @@ impl ChessGameState {
 
 /// ChessGame entity manages a game between two players.
 ///
-/// ## State (Persisted)
-/// - game_id, white_player, black_player, board_fen
-/// - moves (list of MoveRecord)
-/// - status (InProgress/WhiteWins/BlackWins/Draw/Aborted)
-/// - result_reason
-/// - time_control, white_time_remaining, black_time_remaining
-/// - last_move_at, created_at, draw_offer
+/// ## Pure-RPC Design
+/// This entity maintains ephemeral game state via `Arc<Mutex<HashMap<String, ChessGameState>>>`.
+/// Each game is keyed by its game_id string. All RPCs include the `game_id` in their
+/// request to identify which game to operate on. State is not persisted by the framework
+/// — on restart, games need to be recreated.
 ///
-/// ## Workflows (durable, at-least-once)
-/// - `create(request)` - Initialize game with players
-/// - `make_move(request)` - Validate and apply a move
-/// - `offer_draw(request)` - Record draw offer
-/// - `accept_draw(request)` - Accept draw if offer exists
-/// - `resign(request)` - End game with resignation
-/// - `abort(player_id)` - Abort game early
+/// ## RPCs (persisted, at-least-once)
+/// - `create(request)` — Initialize game with players
+/// - `make_move(request)` — Validate and apply a move
+/// - `offer_draw(request)` — Record draw offer
+/// - `accept_draw(request)` — Accept draw if offer exists
+/// - `resign(request)` — End game with resignation
+/// - `handle_timeout(request)` — Handle move timeout
+/// - `abort(request)` — Abort game early
 ///
-/// ## RPCs
-/// - `get_state()` - Return full game state
-/// - `get_legal_moves(player)` - Return legal moves for current position
-/// - `get_move_history()` - Return move list
+/// ## RPCs (non-persisted)
+/// - `get_state(game_id)` — Return full game state
+/// - `get_legal_moves(request)` — Return legal moves for current position
+/// - `get_move_history(game_id)` — Return move list
 #[entity(max_idle_time_secs = 60)]
 #[derive(Clone)]
-pub struct ChessGame;
+pub struct ChessGame {
+    /// In-memory ephemeral state, shared across all entity instances.
+    /// Maps game_id string to game state.
+    games: Arc<Mutex<HashMap<String, ChessGameState>>>,
+}
+
+impl ChessGame {
+    /// Create a new ChessGame entity with empty state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            games: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Get game state by game_id, returning NotInitialized if the game doesn't exist.
+    fn get_game<'a>(
+        games: &'a HashMap<String, ChessGameState>,
+        game_id: &str,
+    ) -> Result<&'a ChessGameState, ChessGameError> {
+        games.get(game_id).ok_or(ChessGameError::NotInitialized)
+    }
+}
+
+impl Default for ChessGame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Request to create a new game.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateGameRequest {
+    /// The game ID.
+    pub game_id: GameId,
     /// White player ID.
     pub white_player: PlayerId,
     /// Black player ID.
@@ -118,6 +149,8 @@ pub struct CreateGameResponse {
 /// Request to make a move.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MakeMoveRequest {
+    /// The game ID.
+    pub game_id: GameId,
     /// Player making the move.
     pub player_id: PlayerId,
     /// Move in UCI notation (e.g., "e2e4").
@@ -144,6 +177,8 @@ pub struct MakeMoveResponse {
 /// Request to offer a draw.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DrawOfferRequest {
+    /// The game ID.
+    pub game_id: GameId,
     /// Player offering the draw.
     pub player_id: PlayerId,
 }
@@ -151,6 +186,8 @@ pub struct DrawOfferRequest {
 /// Request to accept a draw.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DrawAcceptRequest {
+    /// The game ID.
+    pub game_id: GameId,
     /// Player accepting the draw.
     pub player_id: PlayerId,
 }
@@ -158,7 +195,36 @@ pub struct DrawAcceptRequest {
 /// Request to resign.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResignRequest {
+    /// The game ID.
+    pub game_id: GameId,
     /// Player resigning.
+    pub player_id: PlayerId,
+}
+
+/// Request to handle a timeout.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandleTimeoutRequest {
+    /// The game ID.
+    pub game_id: GameId,
+    /// The color that timed out.
+    pub color: Color,
+}
+
+/// Request to abort a game.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AbortRequest {
+    /// The game ID.
+    pub game_id: GameId,
+    /// Player requesting the abort.
+    pub player_id: PlayerId,
+}
+
+/// Request for legal moves.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetLegalMovesRequest {
+    /// The game ID.
+    pub game_id: GameId,
+    /// Player requesting legal moves.
     pub player_id: PlayerId,
 }
 
@@ -218,72 +284,46 @@ impl From<ChessError> for ChessGameError {
 }
 
 #[entity_impl]
-#[state(ChessGameState)]
 impl ChessGame {
-    fn init(&self, ctx: &EntityContext) -> Result<ChessGameState, ClusterError> {
-        // Parse the entity ID as a game ID
-        let game_id: GameId =
-            ctx.address
-                .entity_id
-                .as_ref()
-                .parse()
-                .map_err(|e| ClusterError::MalformedMessage {
-                    reason: format!("invalid game ID: {e}"),
-                    source: None,
-                })?;
-
-        // Initialize with placeholder players - they will be set by create()
-        Ok(ChessGameState {
-            game: GameState::new(
-                game_id,
-                PlayerId::nil(),
-                PlayerId::nil(),
-                TimeControl::BLITZ,
-            ),
-        })
-    }
-
     /// Create a new game with the specified players and time control.
-    ///
-    /// This must be called before any moves can be made.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn create(
         &self,
         request: CreateGameRequest,
     ) -> Result<CreateGameResponse, ClusterError> {
-        // Validation (deterministic)
-        if !self.state.game.white_player.is_nil() {
-            return Err(ChessGameError::AlreadyCreated.into());
+        let mut games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+
+        if let Some(existing) = games.get(&key) {
+            if !existing.game.white_player.is_nil() {
+                return Err(ChessGameError::AlreadyCreated.into());
+            }
         }
 
-        // State mutation via activity
-        self.do_create(request).await
-    }
-
-    #[activity]
-    async fn do_create(
-        &mut self,
-        request: CreateGameRequest,
-    ) -> Result<CreateGameResponse, ClusterError> {
-        let game_id = self.state.game.game_id;
-        self.state.game = GameState::new(
+        let game_id = request.game_id;
+        let state = ChessGameState::new(
             game_id,
             request.white_player,
             request.black_player,
             request.time_control,
         );
+        let game_state = state.game.clone();
+        games.insert(key, state);
 
         Ok(CreateGameResponse {
             game_id,
-            state: self.state.game.clone(),
+            state: game_state,
         })
     }
 
     /// Get the current game state.
     #[rpc]
-    pub async fn get_state(&self) -> Result<GameState, ClusterError> {
-        self.state.ensure_initialized()?;
-        Ok(self.state.game.clone())
+    pub async fn get_state(&self, game_id: GameId) -> Result<GameState, ClusterError> {
+        let games = self.games.lock().unwrap();
+        let key = game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
+        Ok(state.game.clone())
     }
 
     /// Get legal moves for the current position.
@@ -292,19 +332,22 @@ impl ChessGame {
     #[rpc]
     pub async fn get_legal_moves(
         &self,
-        player_id: PlayerId,
+        request: GetLegalMovesRequest,
     ) -> Result<Vec<LegalMove>, ClusterError> {
-        self.state.ensure_initialized()?;
-        self.state.ensure_game_in_progress()?;
+        let games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
+        state.ensure_game_in_progress()?;
 
-        let color = self.state.player_color(player_id)?;
-        let turn = self.state.game.turn();
+        let color = state.player_color(request.player_id)?;
+        let turn = state.game.turn();
 
         if color != turn {
             return Err(ChessGameError::NotYourTurn { expected: turn }.into());
         }
 
-        let position = ChessPosition::from_fen(&self.state.game.board_fen).map_err(|e| {
+        let position = ChessPosition::from_fen(&state.game.board_fen).map_err(|e| {
             ChessGameError::InvalidMove {
                 reason: format!("invalid position: {e}"),
             }
@@ -315,119 +358,85 @@ impl ChessGame {
 
     /// Get the move history.
     #[rpc]
-    pub async fn get_move_history(&self) -> Result<Vec<MoveRecord>, ClusterError> {
-        self.state.ensure_initialized()?;
-        Ok(self.state.game.moves.clone())
+    pub async fn get_move_history(
+        &self,
+        game_id: GameId,
+    ) -> Result<Vec<MoveRecord>, ClusterError> {
+        let games = self.games.lock().unwrap();
+        let key = game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
+        Ok(state.game.moves.clone())
     }
 
     /// Make a move in the game.
     ///
-    /// This is a durable workflow that validates the move and applies it via activity.
-    #[workflow]
+    /// Validates the move and applies it atomically.
+    #[rpc(persisted)]
     pub async fn make_move(
         &self,
         request: MakeMoveRequest,
     ) -> Result<MakeMoveResponse, ClusterError> {
-        // Validation (deterministic)
-        self.state.ensure_initialized()?;
-        self.state.ensure_game_in_progress()?;
+        let mut games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
+        state.ensure_game_in_progress()?;
 
-        let color = self.state.player_color(request.player_id)?;
-        let turn = self.state.game.turn();
+        let color = state.player_color(request.player_id)?;
+        let turn = state.game.turn();
 
         if color != turn {
             return Err(ChessGameError::NotYourTurn { expected: turn }.into());
         }
 
-        // Parse and validate the move (deterministic)
+        // Parse and validate the move
         let uci_move =
             UciMove::new(&request.uci_move).map_err(|e| ChessGameError::InvalidMove {
                 reason: e.to_string(),
             })?;
 
-        let mut position = ChessPosition::from_fen(&self.state.game.board_fen).map_err(|e| {
+        let mut position = ChessPosition::from_fen(&state.game.board_fen).map_err(|e| {
             ChessGameError::InvalidMove {
                 reason: format!("invalid position: {e}"),
             }
         })?;
 
-        // Apply the move to validate legality (deterministic - no state mutation yet)
+        // Apply the move to validate legality
         let san = position
             .make_move(&uci_move)
             .map_err(ChessGameError::from)?;
         let fen_after = position.to_fen();
         let outcome = position.outcome();
 
-        // Apply via activity (state mutation)
-        let response = self
-            .do_make_move(
-                request.player_id,
-                request.uci_move.clone(),
-                color,
-                san,
-                fen_after,
-                outcome,
-            )
-            .await?;
-
-        // Schedule timeout (external side effect) - fire and forget
-        if !response.game_over {
-            if let Some(client) = self.self_client() {
-                let opp_color = if color == Color::White {
-                    Color::Black
-                } else {
-                    Color::White
-                };
-                let opp_time = self.state.game.time_remaining(opp_color);
-                let timeout_at =
-                    Utc::now() + ChronoDuration::from_std(opp_time).unwrap_or_default();
-                let entity_id = self.entity_id().clone();
-                let _ = client
-                    .notify_at(&entity_id, "handle_timeout", &opp_color, timeout_at)
-                    .await;
-            }
-        }
-
-        Ok(response)
-    }
-
-    #[activity]
-    async fn do_make_move(
-        &mut self,
-        _player_id: PlayerId,
-        uci: String,
-        color: Color,
-        san: String,
-        fen_after: String,
-        outcome: Option<crate::chess::engine::Outcome>,
-    ) -> Result<MakeMoveResponse, ClusterError> {
+        // Apply state mutation
+        let state = games.get_mut(&key).unwrap();
         let now = Utc::now();
-        let time_taken = self
-            .state
+        let time_taken = state
             .game
             .last_move_at
             .map(|last| (now - last).to_std().unwrap_or_default())
             .unwrap_or_default();
 
-        let move_number = self.state.game.current_move_number();
+        let move_number = state.game.current_move_number();
         let move_record = MoveRecord::new(
             move_number,
             color,
             san.clone(),
-            uci.clone(),
+            request.uci_move.clone(),
             fen_after.clone(),
             time_taken,
         );
 
-        self.state.game.moves.push(move_record);
-        self.state.game.board_fen = fen_after.clone();
-        self.state.game.last_move_at = Some(now);
-        self.state.game.draw_offer = None;
+        state.game.moves.push(move_record);
+        state.game.board_fen = fen_after.clone();
+        state.game.last_move_at = Some(now);
+        state.game.draw_offer = None;
 
         let (game_over, status, result_reason) = if let Some(outcome) = outcome {
             let (status, result) = outcome.to_status_and_result();
-            self.state.game.status = status;
-            self.state.game.result_reason = Some(result);
+            state.game.status = status;
+            state.game.result_reason = Some(result);
             (true, status, Some(result))
         } else {
             (false, GameStatus::InProgress, None)
@@ -435,7 +444,7 @@ impl ChessGame {
 
         Ok(MakeMoveResponse {
             san,
-            uci,
+            uci: request.uci_move,
             fen_after,
             game_over,
             status,
@@ -444,34 +453,34 @@ impl ChessGame {
     }
 
     /// Offer a draw to the opponent.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn offer_draw(&self, request: DrawOfferRequest) -> Result<(), ClusterError> {
-        // Validation (deterministic)
-        self.state.ensure_initialized()?;
-        self.state.ensure_game_in_progress()?;
-        let _color = self.state.player_color(request.player_id)?;
+        let mut games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
+        state.ensure_game_in_progress()?;
+        let _color = state.player_color(request.player_id)?;
 
-        // State mutation via activity
-        self.do_offer_draw(request.player_id).await
-    }
-
-    #[activity]
-    async fn do_offer_draw(&mut self, player_id: PlayerId) -> Result<(), ClusterError> {
-        self.state.game.draw_offer = Some(DrawOffer::new(player_id));
-
+        let state = games.get_mut(&key).unwrap();
+        state.game.draw_offer = Some(DrawOffer::new(request.player_id));
         Ok(())
     }
 
     /// Accept a draw offer.
-    #[workflow]
-    pub async fn accept_draw(&self, request: DrawAcceptRequest) -> Result<GameState, ClusterError> {
-        // Validation (deterministic)
-        self.state.ensure_initialized()?;
-        self.state.ensure_game_in_progress()?;
-        let _color = self.state.player_color(request.player_id)?;
+    #[rpc(persisted)]
+    pub async fn accept_draw(
+        &self,
+        request: DrawAcceptRequest,
+    ) -> Result<GameState, ClusterError> {
+        let mut games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
+        state.ensure_game_in_progress()?;
+        let _color = state.player_color(request.player_id)?;
 
-        let offer = self
-            .state
+        let offer = state
             .game
             .draw_offer
             .as_ref()
@@ -481,100 +490,82 @@ impl ChessGame {
             return Err(ChessGameError::CannotAcceptOwnOffer.into());
         }
 
-        // State mutation via activity
-        self.do_accept_draw(request.player_id).await
-    }
+        let state = games.get_mut(&key).unwrap();
+        state.game.status = GameStatus::Draw;
+        state.game.result_reason = Some(GameResult::DrawAgreement);
+        state.game.draw_offer = None;
 
-    #[activity]
-    async fn do_accept_draw(
-        &mut self,
-        _accepting_player: PlayerId,
-    ) -> Result<GameState, ClusterError> {
-        self.state.game.status = GameStatus::Draw;
-        self.state.game.result_reason = Some(GameResult::DrawAgreement);
-        self.state.game.draw_offer = None;
-
-        Ok(self.state.game.clone())
+        Ok(state.game.clone())
     }
 
     /// Resign from the game.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn resign(&self, request: ResignRequest) -> Result<GameState, ClusterError> {
-        // Validation (deterministic)
-        self.state.ensure_initialized()?;
-        self.state.ensure_game_in_progress()?;
-        let color = self.state.player_color(request.player_id)?;
+        let mut games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
+        state.ensure_game_in_progress()?;
+        let color = state.player_color(request.player_id)?;
 
-        // State mutation via activity
-        self.do_resign(color, request.player_id).await
-    }
-
-    #[activity]
-    async fn do_resign(
-        &mut self,
-        color: Color,
-        _player_id: PlayerId,
-    ) -> Result<GameState, ClusterError> {
-        self.state.game.status = match color {
+        let state = games.get_mut(&key).unwrap();
+        state.game.status = match color {
             Color::White => GameStatus::BlackWins,
             Color::Black => GameStatus::WhiteWins,
         };
-        self.state.game.result_reason = Some(GameResult::Resignation);
-        self.state.game.draw_offer = None;
+        state.game.result_reason = Some(GameResult::Resignation);
+        state.game.draw_offer = None;
 
-        Ok(self.state.game.clone())
+        Ok(state.game.clone())
     }
 
-    /// Handle a move timeout (called by scheduled message).
-    #[workflow]
-    pub async fn handle_timeout(&self, color: Color) -> Result<GameState, ClusterError> {
-        // Validation (deterministic)
-        self.state.ensure_initialized()?;
+    /// Handle a move timeout (called externally when time runs out).
+    #[rpc(persisted)]
+    pub async fn handle_timeout(
+        &self,
+        request: HandleTimeoutRequest,
+    ) -> Result<GameState, ClusterError> {
+        let mut games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
 
         // Early return if game already ended or not this player's turn
-        if !self.state.game.status.is_ongoing() || self.state.game.turn() != color {
-            return Ok(self.state.game.clone());
+        if !state.game.status.is_ongoing() || state.game.turn() != request.color {
+            return Ok(state.game.clone());
         }
 
-        // State mutation via activity
-        self.do_timeout(color).await
-    }
-
-    #[activity]
-    async fn do_timeout(&mut self, color: Color) -> Result<GameState, ClusterError> {
-        self.state.game.status = match color {
+        let state = games.get_mut(&key).unwrap();
+        state.game.status = match request.color {
             Color::White => GameStatus::BlackWins,
             Color::Black => GameStatus::WhiteWins,
         };
-        self.state.game.result_reason = Some(GameResult::Timeout);
+        state.game.result_reason = Some(GameResult::Timeout);
 
-        Ok(self.state.game.clone())
+        Ok(state.game.clone())
     }
 
     /// Abort the game (only allowed before enough moves are made).
-    #[workflow]
-    pub async fn abort(&self, player_id: PlayerId) -> Result<GameState, ClusterError> {
-        // Validation (deterministic)
-        self.state.ensure_initialized()?;
+    #[rpc(persisted)]
+    pub async fn abort(&self, request: AbortRequest) -> Result<GameState, ClusterError> {
+        let mut games = self.games.lock().unwrap();
+        let key = request.game_id.to_string();
+        let state = Self::get_game(&games, &key)?;
+        state.ensure_initialized()?;
 
-        if self.state.game.moves.len() >= 2 {
+        if state.game.moves.len() >= 2 {
             return Err(ChessGameError::GameOver {
-                status: self.state.game.status,
+                status: state.game.status,
             }
             .into());
         }
-        let _color = self.state.player_color(player_id)?;
+        let _color = state.player_color(request.player_id)?;
 
-        // State mutation via activity
-        self.do_abort(player_id).await
-    }
+        let state = games.get_mut(&key).unwrap();
+        state.game.status = GameStatus::Aborted;
+        state.game.result_reason = Some(GameResult::Aborted);
 
-    #[activity]
-    async fn do_abort(&mut self, _player_id: PlayerId) -> Result<GameState, ClusterError> {
-        self.state.game.status = GameStatus::Aborted;
-        self.state.game.result_reason = Some(GameResult::Aborted);
-
-        Ok(self.state.game.clone())
+        Ok(state.game.clone())
     }
 }
 
@@ -612,6 +603,7 @@ mod tests {
     #[test]
     fn test_make_move_request_serialization() {
         let req = MakeMoveRequest {
+            game_id: GameId::new(),
             player_id: PlayerId::new(),
             uci_move: "e2e4".to_string(),
         };

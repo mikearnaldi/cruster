@@ -14,8 +14,8 @@ use cruster::testing::TestCluster;
 use cruster::types::EntityId;
 
 use chess_cluster::entities::{
-    ChessGame, ConnectRequest, CreateGameRequest, DrawAcceptRequest, DrawOfferRequest,
-    MakeMoveRequest, MatchFoundNotification, PlayerSession, ResignRequest,
+    AbortRequest, ChessGame, ConnectRequest, CreateGameRequest, DrawAcceptRequest,
+    DrawOfferRequest, MakeMoveRequest, MatchFoundNotification, PlayerSession, ResignRequest,
 };
 use chess_cluster::types::{
     Color, GameId, GameResult, GameStatus, PlayerId, PlayerStatus, TimeControl,
@@ -28,7 +28,7 @@ use chess_cluster::types::{
 #[tokio::test]
 async fn test_create_game() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -41,6 +41,7 @@ async fn test_create_game() {
         .create(
             &EntityId::new(game_id.to_string()),
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -61,7 +62,7 @@ async fn test_create_game() {
 #[tokio::test]
 async fn test_get_game_state() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -76,6 +77,7 @@ async fn test_get_game_state() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -85,7 +87,7 @@ async fn test_get_game_state() {
         .unwrap();
 
     // Get state
-    let state = client.get_state(&entity_id).await.unwrap();
+    let state = client.get_state(&entity_id, &game_id).await.unwrap();
 
     assert_eq!(state.white_player, white);
     assert_eq!(state.black_player, black);
@@ -97,7 +99,7 @@ async fn test_get_game_state() {
 #[tokio::test]
 async fn test_make_move() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -112,6 +114,7 @@ async fn test_make_move() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -125,6 +128,7 @@ async fn test_make_move() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "e2e4".to_string(),
             },
@@ -138,7 +142,7 @@ async fn test_make_move() {
     assert_eq!(response.status, GameStatus::InProgress);
 
     // Verify state updated
-    let state = client.get_state(&entity_id).await.unwrap();
+    let state = client.get_state(&entity_id, &game_id).await.unwrap();
     assert_eq!(state.moves.len(), 1);
     assert_eq!(state.moves[0].san, "e4");
     assert_eq!(state.moves[0].color, Color::White);
@@ -149,7 +153,7 @@ async fn test_make_move() {
 #[tokio::test]
 async fn test_multiple_moves() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -164,6 +168,7 @@ async fn test_multiple_moves() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -177,6 +182,7 @@ async fn test_multiple_moves() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "e2e4".to_string(),
             },
@@ -189,6 +195,7 @@ async fn test_multiple_moves() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: black,
                 uci_move: "e7e5".to_string(),
             },
@@ -204,6 +211,7 @@ async fn test_multiple_moves() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "g1f3".to_string(),
             },
@@ -214,7 +222,7 @@ async fn test_multiple_moves() {
     assert_eq!(response.san, "Nf3");
 
     // Verify state
-    let state = client.get_state(&entity_id).await.unwrap();
+    let state = client.get_state(&entity_id, &game_id).await.unwrap();
     assert_eq!(state.moves.len(), 3);
 
     cluster.shutdown().await.unwrap();
@@ -223,7 +231,7 @@ async fn test_multiple_moves() {
 #[tokio::test]
 async fn test_wrong_turn_rejected() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -238,6 +246,7 @@ async fn test_wrong_turn_rejected() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -251,6 +260,7 @@ async fn test_wrong_turn_rejected() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: black,
                 uci_move: "e7e5".to_string(),
             },
@@ -265,7 +275,7 @@ async fn test_wrong_turn_rejected() {
 #[tokio::test]
 async fn test_illegal_move_rejected() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -280,6 +290,7 @@ async fn test_illegal_move_rejected() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -293,6 +304,7 @@ async fn test_illegal_move_rejected() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "e2e5".to_string(),
             },
@@ -307,7 +319,7 @@ async fn test_illegal_move_rejected() {
 #[tokio::test]
 async fn test_resignation() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -322,6 +334,7 @@ async fn test_resignation() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -335,6 +348,7 @@ async fn test_resignation() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "e2e4".to_string(),
             },
@@ -346,6 +360,7 @@ async fn test_resignation() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: black,
                 uci_move: "e7e5".to_string(),
             },
@@ -355,7 +370,13 @@ async fn test_resignation() {
 
     // White resigns
     let state = client
-        .resign(&entity_id, &ResignRequest { player_id: white })
+        .resign(
+            &entity_id,
+            &ResignRequest {
+                game_id,
+                player_id: white,
+            },
+        )
         .await
         .unwrap();
 
@@ -368,7 +389,7 @@ async fn test_resignation() {
 #[tokio::test]
 async fn test_draw_offer_and_accept() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -383,6 +404,7 @@ async fn test_draw_offer_and_accept() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -396,6 +418,7 @@ async fn test_draw_offer_and_accept() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "e2e4".to_string(),
             },
@@ -405,18 +428,30 @@ async fn test_draw_offer_and_accept() {
 
     // White offers draw
     client
-        .offer_draw(&entity_id, &DrawOfferRequest { player_id: white })
+        .offer_draw(
+            &entity_id,
+            &DrawOfferRequest {
+                game_id,
+                player_id: white,
+            },
+        )
         .await
         .unwrap();
 
     // Verify draw offer is recorded
-    let state = client.get_state(&entity_id).await.unwrap();
+    let state = client.get_state(&entity_id, &game_id).await.unwrap();
     assert!(state.draw_offer.is_some());
     assert_eq!(state.draw_offer.unwrap().offered_by, white);
 
     // Black accepts draw
     let state = client
-        .accept_draw(&entity_id, &DrawAcceptRequest { player_id: black })
+        .accept_draw(
+            &entity_id,
+            &DrawAcceptRequest {
+                game_id,
+                player_id: black,
+            },
+        )
         .await
         .unwrap();
 
@@ -429,7 +464,7 @@ async fn test_draw_offer_and_accept() {
 #[tokio::test]
 async fn test_cannot_accept_own_draw_offer() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -444,6 +479,7 @@ async fn test_cannot_accept_own_draw_offer() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -454,13 +490,25 @@ async fn test_cannot_accept_own_draw_offer() {
 
     // White offers draw
     client
-        .offer_draw(&entity_id, &DrawOfferRequest { player_id: white })
+        .offer_draw(
+            &entity_id,
+            &DrawOfferRequest {
+                game_id,
+                player_id: white,
+            },
+        )
         .await
         .unwrap();
 
     // White tries to accept their own offer (should fail)
     let result = client
-        .accept_draw(&entity_id, &DrawAcceptRequest { player_id: white })
+        .accept_draw(
+            &entity_id,
+            &DrawAcceptRequest {
+                game_id,
+                player_id: white,
+            },
+        )
         .await;
 
     assert!(result.is_err());
@@ -471,7 +519,7 @@ async fn test_cannot_accept_own_draw_offer() {
 #[tokio::test]
 async fn test_move_clears_draw_offer() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -486,6 +534,7 @@ async fn test_move_clears_draw_offer() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -499,6 +548,7 @@ async fn test_move_clears_draw_offer() {
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "e2e4".to_string(),
             },
@@ -508,15 +558,22 @@ async fn test_move_clears_draw_offer() {
 
     // Black offers draw
     client
-        .offer_draw(&entity_id, &DrawOfferRequest { player_id: black })
+        .offer_draw(
+            &entity_id,
+            &DrawOfferRequest {
+                game_id,
+                player_id: black,
+            },
+        )
         .await
         .unwrap();
 
-    // White makes another move instead of accepting
+    // Black makes a move (clears draw offer)
     client
         .make_move(
             &entity_id,
             &MakeMoveRequest {
+                game_id,
                 player_id: black,
                 uci_move: "e7e5".to_string(),
             },
@@ -525,7 +582,7 @@ async fn test_move_clears_draw_offer() {
         .unwrap();
 
     // Draw offer should be cleared
-    let state = client.get_state(&entity_id).await.unwrap();
+    let state = client.get_state(&entity_id, &game_id).await.unwrap();
     assert!(state.draw_offer.is_none());
 
     cluster.shutdown().await.unwrap();
@@ -534,7 +591,7 @@ async fn test_move_clears_draw_offer() {
 #[tokio::test]
 async fn test_game_abort_early() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = ChessGame
+    let client = ChessGame::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -549,6 +606,7 @@ async fn test_game_abort_early() {
         .create(
             &entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -558,7 +616,16 @@ async fn test_game_abort_early() {
         .unwrap();
 
     // Abort before 2 moves (should succeed)
-    let state = client.abort(&entity_id, &white).await.unwrap();
+    let state = client
+        .abort(
+            &entity_id,
+            &AbortRequest {
+                game_id,
+                player_id: white,
+            },
+        )
+        .await
+        .unwrap();
 
     assert_eq!(state.status, GameStatus::Aborted);
     assert_eq!(state.result_reason, Some(GameResult::Aborted));
@@ -608,7 +675,6 @@ async fn test_player_get_status() {
     let player_id = PlayerId::new();
     let entity_id = EntityId::new(player_id.to_string());
 
-    // Connect first
     client
         .connect(
             &entity_id,
@@ -619,7 +685,6 @@ async fn test_player_get_status() {
         .await
         .unwrap();
 
-    // Get status
     let status = client.get_status(&entity_id).await.unwrap();
 
     assert!(status.connected);
@@ -640,7 +705,6 @@ async fn test_player_join_and_leave_queue() {
     let player_id = PlayerId::new();
     let entity_id = EntityId::new(player_id.to_string());
 
-    // Connect
     client
         .connect(
             &entity_id,
@@ -651,19 +715,15 @@ async fn test_player_join_and_leave_queue() {
         .await
         .unwrap();
 
-    // Join queue
     let position = client.join_matchmaking_queue(&entity_id).await.unwrap();
     assert_eq!(position, 1);
 
-    // Check status - should be InQueue
     let status = client.get_status(&entity_id).await.unwrap();
     assert!(status.info.is_some());
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::InQueue);
 
-    // Leave queue
     client.leave_queue(&entity_id).await.unwrap();
 
-    // Check status - should be Online again
     let status = client.get_status(&entity_id).await.unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::Online);
 
@@ -675,7 +735,7 @@ async fn test_player_cannot_join_queue_while_in_game() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
     let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
-    let game_client = ChessGame.register(sharding).await.unwrap();
+    let game_client = ChessGame::new().register(sharding).await.unwrap();
 
     let player_id = PlayerId::new();
     let opponent_id = PlayerId::new();
@@ -683,7 +743,6 @@ async fn test_player_cannot_join_queue_while_in_game() {
     let game_id = GameId::new();
     let game_entity_id = EntityId::new(game_id.to_string());
 
-    // Connect player
     session_client
         .connect(
             &session_entity_id,
@@ -694,11 +753,11 @@ async fn test_player_cannot_join_queue_while_in_game() {
         .await
         .unwrap();
 
-    // Create a game with this player
     game_client
         .create(
             &game_entity_id,
             &CreateGameRequest {
+                game_id,
                 white_player: player_id,
                 black_player: opponent_id,
                 time_control: TimeControl::BLITZ,
@@ -707,7 +766,6 @@ async fn test_player_cannot_join_queue_while_in_game() {
         .await
         .unwrap();
 
-    // Notify player they're in a game
     session_client
         .notify_match_found(
             &session_entity_id,
@@ -720,7 +778,6 @@ async fn test_player_cannot_join_queue_while_in_game() {
         .await
         .unwrap();
 
-    // Try to join queue while in game (should fail)
     let result = session_client
         .join_matchmaking_queue(&session_entity_id)
         .await;
@@ -741,7 +798,6 @@ async fn test_player_disconnect() {
     let player_id = PlayerId::new();
     let entity_id = EntityId::new(player_id.to_string());
 
-    // Connect
     client
         .connect(
             &entity_id,
@@ -752,10 +808,8 @@ async fn test_player_disconnect() {
         .await
         .unwrap();
 
-    // Disconnect
     client.disconnect(&entity_id).await.unwrap();
 
-    // Check status - should be disconnected
     let status = client.get_status(&entity_id).await.unwrap();
     assert!(!status.connected);
 
@@ -773,7 +827,6 @@ async fn test_player_heartbeat() {
     let player_id = PlayerId::new();
     let entity_id = EntityId::new(player_id.to_string());
 
-    // Connect
     client
         .connect(
             &entity_id,
@@ -784,10 +837,8 @@ async fn test_player_heartbeat() {
         .await
         .unwrap();
 
-    // Heartbeat
     client.heartbeat(&entity_id).await.unwrap();
 
-    // Should still be connected
     let status = client.get_status(&entity_id).await.unwrap();
     assert!(status.connected);
 
@@ -803,7 +854,7 @@ async fn test_game_notifies_player_session() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
     let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
-    let game_client = ChessGame.register(sharding).await.unwrap();
+    let game_client = ChessGame::new().register(sharding).await.unwrap();
 
     let white_id = PlayerId::new();
     let black_id = PlayerId::new();
@@ -813,7 +864,6 @@ async fn test_game_notifies_player_session() {
     let black_session = EntityId::new(black_id.to_string());
     let game_entity = EntityId::new(game_id.to_string());
 
-    // Connect both players
     session_client
         .connect(
             &white_session,
@@ -834,11 +884,11 @@ async fn test_game_notifies_player_session() {
         .await
         .unwrap();
 
-    // Create game
     game_client
         .create(
             &game_entity,
             &CreateGameRequest {
+                game_id,
                 white_player: white_id,
                 black_player: black_id,
                 time_control: TimeControl::BLITZ,
@@ -847,7 +897,6 @@ async fn test_game_notifies_player_session() {
         .await
         .unwrap();
 
-    // Notify both players about the game
     use chess_cluster::entities::GameEvent;
 
     session_client
@@ -874,7 +923,6 @@ async fn test_game_notifies_player_session() {
         .await
         .unwrap();
 
-    // Verify players are in game state
     let white_status = session_client.get_status(&white_session).await.unwrap();
     assert_eq!(
         white_status.info.as_ref().unwrap().status,

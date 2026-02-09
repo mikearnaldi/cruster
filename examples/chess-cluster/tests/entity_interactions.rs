@@ -38,7 +38,6 @@ async fn test_matchmaking_queue_and_match() {
     let player1 = PlayerId::new();
     let player2 = PlayerId::new();
 
-    // First player joins queue
     let response = mm_client
         .find_match(
             &mm_entity,
@@ -51,7 +50,6 @@ async fn test_matchmaking_queue_and_match() {
         .await
         .unwrap();
 
-    // First player should be queued (no opponent yet)
     match response {
         FindMatchResponse::Queued { position, .. } => {
             assert_eq!(position, 1);
@@ -61,11 +59,9 @@ async fn test_matchmaking_queue_and_match() {
         }
     }
 
-    // Verify queue status
     let status = mm_client.get_queue_status(&mm_entity).await.unwrap();
     assert_eq!(status.players_in_queue, 1);
 
-    // Second player joins - should immediately match
     let response = mm_client
         .find_match(
             &mm_entity,
@@ -85,8 +81,6 @@ async fn test_matchmaking_queue_and_match() {
             ..
         } => {
             assert_eq!(opponent_id, player1);
-            // Note: Current implementation gives white to the player who joined later
-            // (player2 in this case), so is_white = true
             assert!(is_white);
         }
         FindMatchResponse::Queued { .. } => {
@@ -94,7 +88,6 @@ async fn test_matchmaking_queue_and_match() {
         }
     }
 
-    // Queue should now be empty
     let status = mm_client.get_queue_status(&mm_entity).await.unwrap();
     assert_eq!(status.players_in_queue, 0);
     assert_eq!(status.total_matches_made, 1);
@@ -113,7 +106,6 @@ async fn test_matchmaking_cancel_search() {
     let mm_entity = EntityId::new("matchmaking");
     let player = PlayerId::new();
 
-    // Join queue
     mm_client
         .find_match(
             &mm_entity,
@@ -126,13 +118,11 @@ async fn test_matchmaking_cancel_search() {
         .await
         .unwrap();
 
-    // Cancel search
     mm_client
         .cancel_search(&mm_entity, &CancelSearchRequest { player_id: player })
         .await
         .unwrap();
 
-    // Verify player is no longer in queue
     let in_queue = mm_client.is_in_queue(&mm_entity, &player).await.unwrap();
     assert!(!in_queue);
 
@@ -151,7 +141,6 @@ async fn test_matchmaking_different_time_controls_dont_match() {
     let player1 = PlayerId::new();
     let player2 = PlayerId::new();
 
-    // Player 1 wants blitz
     mm_client
         .find_match(
             &mm_entity,
@@ -168,7 +157,6 @@ async fn test_matchmaking_different_time_controls_dont_match() {
         .await
         .unwrap();
 
-    // Player 2 wants rapid - should not match
     let response = mm_client
         .find_match(
             &mm_entity,
@@ -185,11 +173,8 @@ async fn test_matchmaking_different_time_controls_dont_match() {
         .await
         .unwrap();
 
-    // Should be queued, not matched (different time controls)
     match response {
         FindMatchResponse::Queued { position, .. } => {
-            // Position is 2 because blitz player is also in queue
-            // (but they have different time controls)
             assert!(position >= 1);
         }
         FindMatchResponse::Matched { .. } => {
@@ -197,7 +182,6 @@ async fn test_matchmaking_different_time_controls_dont_match() {
         }
     }
 
-    // Queue should have both players
     let status = mm_client.get_queue_status(&mm_entity).await.unwrap();
     assert_eq!(status.players_in_queue, 2);
 
@@ -221,7 +205,6 @@ async fn test_leaderboard_record_game_result() {
     let black = PlayerId::new();
     let game_id = GameId::new();
 
-    // Record a white win
     let response = lb_client
         .record_game_result(
             &lb_entity,
@@ -239,7 +222,6 @@ async fn test_leaderboard_record_game_result() {
         .await
         .unwrap();
 
-    // White should have gained ELO, black lost ELO
     assert!(response.white_elo_change > 0);
     assert!(response.black_elo_change < 0);
     assert_eq!(response.white_rating.wins, 1);
@@ -247,7 +229,6 @@ async fn test_leaderboard_record_game_result() {
     assert_eq!(response.black_rating.wins, 0);
     assert_eq!(response.black_rating.losses, 1);
 
-    // Verify total games
     let total = lb_client.get_total_games(&lb_entity).await.unwrap();
     assert_eq!(total, 1);
 
@@ -263,13 +244,10 @@ async fn test_leaderboard_rankings() {
         .unwrap();
 
     let lb_entity = EntityId::new("leaderboard");
-
-    // Create some players with varying records
     let player1 = PlayerId::new();
     let player2 = PlayerId::new();
     let player3 = PlayerId::new();
 
-    // Player 1 beats player 2
     lb_client
         .record_game_result(
             &lb_entity,
@@ -287,7 +265,6 @@ async fn test_leaderboard_rankings() {
         .await
         .unwrap();
 
-    // Player 1 beats player 3
     lb_client
         .record_game_result(
             &lb_entity,
@@ -305,7 +282,6 @@ async fn test_leaderboard_rankings() {
         .await
         .unwrap();
 
-    // Get top players - player1 should be #1
     let response = lb_client
         .get_top_players(&lb_entity, &GetTopPlayersRequest { limit: 10 })
         .await
@@ -331,7 +307,6 @@ async fn test_leaderboard_draw_updates_both() {
     let white = PlayerId::new();
     let black = PlayerId::new();
 
-    // Record a draw
     let response = lb_client
         .record_game_result(
             &lb_entity,
@@ -349,13 +324,10 @@ async fn test_leaderboard_draw_updates_both() {
         .await
         .unwrap();
 
-    // Both should have a draw recorded
     assert_eq!(response.white_rating.draws, 1);
     assert_eq!(response.black_rating.draws, 1);
     assert_eq!(response.white_rating.wins, 0);
     assert_eq!(response.black_rating.wins, 0);
-
-    // Equal ELO players drawing should have no change
     assert_eq!(response.white_elo_change, 0);
     assert_eq!(response.black_elo_change, 0);
 
@@ -372,7 +344,6 @@ async fn test_leaderboard_aborted_game_rejected() {
 
     let lb_entity = EntityId::new("leaderboard");
 
-    // Try to record an aborted game - should fail
     let result = lb_client
         .record_game_result(
             &lb_entity,
@@ -407,17 +378,15 @@ async fn test_full_matchmaking_to_game_flow() {
         .register(Arc::clone(&sharding))
         .await
         .unwrap();
-    let game_client = ChessGame.register(sharding).await.unwrap();
+    let game_client = ChessGame::new().register(sharding).await.unwrap();
 
     let mm_entity = EntityId::new("matchmaking");
 
-    // Create two players
     let player1_id = PlayerId::new();
     let player2_id = PlayerId::new();
     let player1_session = EntityId::new(player1_id.to_string());
     let player2_session = EntityId::new(player2_id.to_string());
 
-    // Connect both players
     session_client
         .connect(
             &player1_session,
@@ -438,7 +407,6 @@ async fn test_full_matchmaking_to_game_flow() {
         .await
         .unwrap();
 
-    // Player 1 joins queue
     mm_client
         .find_match(
             &mm_entity,
@@ -451,7 +419,6 @@ async fn test_full_matchmaking_to_game_flow() {
         .await
         .unwrap();
 
-    // Player 2 joins - should match immediately
     let match_response = mm_client
         .find_match(
             &mm_entity,
@@ -464,7 +431,6 @@ async fn test_full_matchmaking_to_game_flow() {
         .await
         .unwrap();
 
-    // Extract game info from match
     let (game_id, white_id, black_id) = match match_response {
         FindMatchResponse::Matched {
             game_id,
@@ -480,12 +446,12 @@ async fn test_full_matchmaking_to_game_flow() {
         FindMatchResponse::Queued { .. } => panic!("expected match"),
     };
 
-    // Create the game entity
     let game_entity = EntityId::new(game_id.to_string());
     game_client
         .create(
             &game_entity,
             &CreateGameRequest {
+                game_id,
                 white_player: white_id,
                 black_player: black_id,
                 time_control: TimeControl::BLITZ,
@@ -494,7 +460,6 @@ async fn test_full_matchmaking_to_game_flow() {
         .await
         .unwrap();
 
-    // Notify both players about the game
     session_client
         .notify_match_found(
             &EntityId::new(white_id.to_string()),
@@ -519,7 +484,6 @@ async fn test_full_matchmaking_to_game_flow() {
         .await
         .unwrap();
 
-    // Verify both players are now InGame
     let white_status = session_client
         .get_status(&EntityId::new(white_id.to_string()))
         .await
@@ -542,11 +506,11 @@ async fn test_full_matchmaking_to_game_flow() {
         PlayerStatus::InGame
     );
 
-    // Play a few moves
     game_client
         .make_move(
             &game_entity,
             &MakeMoveRequest {
+                game_id,
                 player_id: white_id,
                 uci_move: "e2e4".to_string(),
             },
@@ -558,6 +522,7 @@ async fn test_full_matchmaking_to_game_flow() {
         .make_move(
             &game_entity,
             &MakeMoveRequest {
+                game_id,
                 player_id: black_id,
                 uci_move: "e7e5".to_string(),
             },
@@ -565,8 +530,10 @@ async fn test_full_matchmaking_to_game_flow() {
         .await
         .unwrap();
 
-    // Verify game state
-    let state = game_client.get_state(&game_entity).await.unwrap();
+    let state = game_client
+        .get_state(&game_entity, &game_id)
+        .await
+        .unwrap();
     assert_eq!(state.moves.len(), 2);
     assert_eq!(state.status, GameStatus::InProgress);
 
@@ -577,7 +544,10 @@ async fn test_full_matchmaking_to_game_flow() {
 async fn test_game_to_leaderboard_flow() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
-    let game_client = ChessGame.register(Arc::clone(&sharding)).await.unwrap();
+    let game_client = ChessGame::new()
+        .register(Arc::clone(&sharding))
+        .await
+        .unwrap();
     let lb_client = Leaderboard::new().register(sharding).await.unwrap();
 
     let game_id = GameId::new();
@@ -587,11 +557,11 @@ async fn test_game_to_leaderboard_flow() {
     let white = PlayerId::new();
     let black = PlayerId::new();
 
-    // Create game
     game_client
         .create(
             &game_entity,
             &CreateGameRequest {
+                game_id,
                 white_player: white,
                 black_player: black,
                 time_control: TimeControl::BLITZ,
@@ -600,11 +570,11 @@ async fn test_game_to_leaderboard_flow() {
         .await
         .unwrap();
 
-    // Play a couple moves then resign
     game_client
         .make_move(
             &game_entity,
             &MakeMoveRequest {
+                game_id,
                 player_id: white,
                 uci_move: "e2e4".to_string(),
             },
@@ -616,6 +586,7 @@ async fn test_game_to_leaderboard_flow() {
         .make_move(
             &game_entity,
             &MakeMoveRequest {
+                game_id,
                 player_id: black,
                 uci_move: "e7e5".to_string(),
             },
@@ -623,16 +594,20 @@ async fn test_game_to_leaderboard_flow() {
         .await
         .unwrap();
 
-    // Black resigns
     let final_state = game_client
-        .resign(&game_entity, &ResignRequest { player_id: black })
+        .resign(
+            &game_entity,
+            &ResignRequest {
+                game_id,
+                player_id: black,
+            },
+        )
         .await
         .unwrap();
 
     assert_eq!(final_state.status, GameStatus::WhiteWins);
     assert_eq!(final_state.result_reason, Some(GameResult::Resignation));
 
-    // Now update leaderboard with this result
     let lb_response = lb_client
         .record_game_result(
             &lb_entity,
@@ -650,21 +625,16 @@ async fn test_game_to_leaderboard_flow() {
         .await
         .unwrap();
 
-    // White won, should have gained rating
     assert!(lb_response.white_elo_change > 0);
     assert_eq!(lb_response.white_rating.wins, 1);
-
-    // Black lost, should have lost rating
     assert!(lb_response.black_elo_change < 0);
     assert_eq!(lb_response.black_rating.losses, 1);
 
-    // Verify leaderboard reflects this
     let top = lb_client
         .get_top_players(&lb_entity, &GetTopPlayersRequest { limit: 10 })
         .await
         .unwrap();
 
-    // White should be ranked higher
     assert_eq!(top.players.len(), 2);
     assert_eq!(top.players[0].player_id, white);
     assert_eq!(top.players[0].rank, 1);
@@ -676,7 +646,10 @@ async fn test_game_to_leaderboard_flow() {
 async fn test_multiple_games_update_rankings() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
-    let game_client = ChessGame.register(Arc::clone(&sharding)).await.unwrap();
+    let game_client = ChessGame::new()
+        .register(Arc::clone(&sharding))
+        .await
+        .unwrap();
     let lb_client = Leaderboard::new().register(sharding).await.unwrap();
 
     let lb_entity = EntityId::new("leaderboard");
@@ -685,7 +658,6 @@ async fn test_multiple_games_update_rankings() {
     let player_b = PlayerId::new();
     let player_c = PlayerId::new();
 
-    // Helper function to play and record a game
     async fn play_game(
         game_client: &ChessGameClient,
         lb_client: &LeaderboardClient,
@@ -701,6 +673,7 @@ async fn test_multiple_games_update_rankings() {
             .create(
                 &game_entity,
                 &CreateGameRequest {
+                    game_id,
                     white_player: white,
                     black_player: black,
                     time_control: TimeControl::BLITZ,
@@ -709,11 +682,11 @@ async fn test_multiple_games_update_rankings() {
             .await
             .unwrap();
 
-        // Make minimum moves
         game_client
             .make_move(
                 &game_entity,
                 &MakeMoveRequest {
+                    game_id,
                     player_id: white,
                     uci_move: "e2e4".to_string(),
                 },
@@ -725,6 +698,7 @@ async fn test_multiple_games_update_rankings() {
             .make_move(
                 &game_entity,
                 &MakeMoveRequest {
+                    game_id,
                     player_id: black,
                     uci_move: "e7e5".to_string(),
                 },
@@ -732,19 +706,18 @@ async fn test_multiple_games_update_rankings() {
             .await
             .unwrap();
 
-        // Determine winner by resignation
         let resigning = if white_wins { black } else { white };
         let final_state = game_client
             .resign(
                 &game_entity,
                 &ResignRequest {
+                    game_id,
                     player_id: resigning,
                 },
             )
             .await
             .unwrap();
 
-        // Record result
         lb_client
             .record_game_result(
                 lb_entity,
@@ -763,7 +736,6 @@ async fn test_multiple_games_update_rankings() {
             .unwrap();
     }
 
-    // A beats B
     play_game(
         &game_client,
         &lb_client,
@@ -774,7 +746,6 @@ async fn test_multiple_games_update_rankings() {
     )
     .await;
 
-    // A beats C
     play_game(
         &game_client,
         &lb_client,
@@ -785,7 +756,6 @@ async fn test_multiple_games_update_rankings() {
     )
     .await;
 
-    // B beats C
     play_game(
         &game_client,
         &lb_client,
@@ -796,30 +766,22 @@ async fn test_multiple_games_update_rankings() {
     )
     .await;
 
-    // Check final rankings
     let top = lb_client
         .get_top_players(&lb_entity, &GetTopPlayersRequest { limit: 10 })
         .await
         .unwrap();
 
     assert_eq!(top.players.len(), 3);
-
-    // A should be #1 (2 wins, 0 losses)
     assert_eq!(top.players[0].player_id, player_a);
     assert_eq!(top.players[0].rating.wins, 2);
     assert_eq!(top.players[0].rating.losses, 0);
-
-    // B should be #2 (1 win, 1 loss)
     assert_eq!(top.players[1].player_id, player_b);
     assert_eq!(top.players[1].rating.wins, 1);
     assert_eq!(top.players[1].rating.losses, 1);
-
-    // C should be #3 (0 wins, 2 losses)
     assert_eq!(top.players[2].player_id, player_c);
     assert_eq!(top.players[2].rating.wins, 0);
     assert_eq!(top.players[2].rating.losses, 2);
 
-    // Verify total games
     let total = lb_client.get_total_games(&lb_entity).await.unwrap();
     assert_eq!(total, 3);
 
@@ -831,7 +793,7 @@ async fn test_player_session_game_lifecycle() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
     let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
-    let game_client = ChessGame.register(sharding).await.unwrap();
+    let game_client = ChessGame::new().register(sharding).await.unwrap();
 
     let white_id = PlayerId::new();
     let black_id = PlayerId::new();
@@ -841,7 +803,6 @@ async fn test_player_session_game_lifecycle() {
     let black_session = EntityId::new(black_id.to_string());
     let game_entity = EntityId::new(game_id.to_string());
 
-    // Connect both players
     session_client
         .connect(
             &white_session,
@@ -862,15 +823,14 @@ async fn test_player_session_game_lifecycle() {
         .await
         .unwrap();
 
-    // Verify initial status
     let status = session_client.get_status(&white_session).await.unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::Online);
 
-    // Create game
     game_client
         .create(
             &game_entity,
             &CreateGameRequest {
+                game_id,
                 white_player: white_id,
                 black_player: black_id,
                 time_control: TimeControl::BLITZ,
@@ -879,7 +839,6 @@ async fn test_player_session_game_lifecycle() {
         .await
         .unwrap();
 
-    // Notify players of game start
     session_client
         .notify_game_event(
             &white_session,
@@ -904,16 +863,15 @@ async fn test_player_session_game_lifecycle() {
         .await
         .unwrap();
 
-    // Verify both are in game
     let status = session_client.get_status(&white_session).await.unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::InGame);
     assert_eq!(status.info.as_ref().unwrap().current_game_id, Some(game_id));
 
-    // Play the game
     game_client
         .make_move(
             &game_entity,
             &MakeMoveRequest {
+                game_id,
                 player_id: white_id,
                 uci_move: "e2e4".to_string(),
             },
@@ -925,6 +883,7 @@ async fn test_player_session_game_lifecycle() {
         .make_move(
             &game_entity,
             &MakeMoveRequest {
+                game_id,
                 player_id: black_id,
                 uci_move: "e7e5".to_string(),
             },
@@ -932,11 +891,11 @@ async fn test_player_session_game_lifecycle() {
         .await
         .unwrap();
 
-    // Black resigns
     let final_state = game_client
         .resign(
             &game_entity,
             &ResignRequest {
+                game_id,
                 player_id: black_id,
             },
         )
@@ -944,7 +903,6 @@ async fn test_player_session_game_lifecycle() {
         .unwrap();
     assert_eq!(final_state.status, GameStatus::WhiteWins);
 
-    // Notify players of game end
     session_client
         .notify_game_event(
             &white_session,
@@ -969,7 +927,6 @@ async fn test_player_session_game_lifecycle() {
         .await
         .unwrap();
 
-    // Verify both are back online (not in game)
     let status = session_client.get_status(&white_session).await.unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::Online);
     assert_eq!(status.info.as_ref().unwrap().current_game_id, None);

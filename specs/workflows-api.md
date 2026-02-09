@@ -72,6 +72,7 @@ No `init`, no `#[state]`, no `#[workflow]`, no `#[activity]`, no `&mut self`. Ju
 #[entity(mailbox_capacity = 50, concurrency = 4)]      // custom mailbox + concurrency
 #[entity(name = "CustomName")]                         // override entity type name
 #[entity(shard_group = "premium")]                     // custom shard group
+#[entity(rpc_groups(HealthCheck, Metrics))]             // compose RPC groups
 ```
 
 | Attribute | Type | Default | Description |
@@ -81,6 +82,7 @@ No `init`, no `#[state]`, no `#[workflow]`, no `#[activity]`, no `&mut self`. Ju
 | `max_idle_time_secs` | u64 | framework default | Idle timeout before eviction |
 | `mailbox_capacity` | usize | framework default | Max queued messages |
 | `concurrency` | usize | framework default | Max concurrent request processing |
+| `rpc_groups` | list of types | none | RPC groups to compose into this entity (instances provided as struct fields) |
 
 ### RPC Variants
 
@@ -123,36 +125,45 @@ impl Metrics {
 }
 ```
 
-Composed into entities:
+Composed into entities — groups are declared on `#[entity]` and provided as struct fields:
 
 ```rust
-#[entity_impl(rpc_groups(HealthCheck, Metrics))]
+#[entity(rpc_groups(HealthCheck, Metrics))]
+#[derive(Clone)]
+pub struct UserGateway {
+    db: PgPool,
+    http: HttpClient,
+    health_check: HealthCheck,
+    metrics: Metrics,
+}
+
+#[entity_impl]
 impl UserGateway {
     // ... own RPCs
     // health() and get_metrics() are also callable on this entity's client
 }
 ```
 
+The `#[entity]` macro reads the `rpc_groups(...)` list and expects a field for each group type on the struct. Field names are inferred by convention (snake_case of the type name), or can be annotated explicitly. The `#[entity_impl]` macro detects the composed groups and generates dispatch arms, client methods, and delegation.
+
 ### Entity Registration (Type-Safe)
 
-The macro generates a `register` function with explicit typed parameters for every declared RPC group. Forget a group — compile error. Wrong type — compile error.
+The macro generates a `register` method that consumes the entity instance. RPC group instances are struct fields — forget one and the struct literal won't compile. Wrong type — compile error.
 
 ```rust
-// #[entity_impl] — no groups
-// Generated: fn register(cluster: &Cluster, entity: Self) -> Result<Client, ClusterError>
-let client = UserGateway::register(
-    &cluster,
-    UserGateway { db: pool.clone(), http: http_client.clone() },
-).await?;
+// No groups
+let client = UserGateway {
+    db: pool.clone(),
+    http: http_client.clone(),
+}.register(sharding.clone()).await?;
 
-// #[entity_impl(rpc_groups(HealthCheck, Metrics))]
-// Generated: fn register(cluster: &Cluster, entity: Self, g1: HealthCheck, g2: Metrics) -> Result<Client, ClusterError>
-let client = UserGateway::register(
-    &cluster,
-    UserGateway { db: pool.clone(), http: http_client.clone() },
-    HealthCheck,
-    Metrics { collector: collector.clone() },
-).await?;
+// With groups — group instances are named struct fields
+let client = UserGateway {
+    db: pool.clone(),
+    http: http_client.clone(),
+    health_check: HealthCheck,
+    metrics: Metrics { collector: collector.clone() },
+}.register(sharding.clone()).await?;
 ```
 
 `register` returns a typed client for immediate use.
@@ -161,7 +172,8 @@ let client = UserGateway::register(
 
 ```rust
 // From register
-let client = UserGateway::register(&cluster, entity).await?;
+let client = UserGateway { db: pool.clone(), http: http_client.clone() }
+    .register(sharding.clone()).await?;
 
 // Or construct separately
 let client = UserGateway::client(&cluster);
@@ -284,7 +296,7 @@ The `key` and `hash` attributes are specified on `#[workflow_impl]` (where the c
 #[workflow_impl(key = |req: &OrderRequest| req.order_id.clone(), hash = false)]  // custom key, used as-is
 ```
 
-> **Note:** The `key`/`hash` are on `#[workflow_impl]` because proc macros cannot share data between separate attribute macro invocations (`#[workflow]` on the struct and `#[workflow_impl]` on the impl block).
+> **Note:** The `key`/`hash` are on `#[workflow_impl]` because they reference the `execute` method's request type, which is only visible in the impl block. Activity groups, by contrast, are declared on the struct-level `#[workflow]` (see below).
 
 | Attribute | Type | Default | Description |
 |---|---|---|---|
@@ -330,10 +342,18 @@ impl Payments {
 }
 ```
 
-Composed into workflows via `activity_groups(...)`:
+Composed into workflows — groups are declared on `#[workflow]` and provided as struct fields:
 
 ```rust
-#[workflow_impl(activity_groups(Payments, Inventory))]
+#[workflow(activity_groups(Payments, Inventory))]
+#[derive(Clone)]
+pub struct ProcessOrder {
+    http: HttpClient,
+    payments: Payments,
+    inventory: Inventory,
+}
+
+#[workflow_impl(key = |req: &OrderRequest| req.order_id.clone(), hash = false)]
 impl ProcessOrder {
     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
         // Group activities callable on self
@@ -353,7 +373,7 @@ impl ProcessOrder {
 }
 ```
 
-Activity group fields (`self.stripe`) are accessible via `self` inside group activity methods — the macro composes them the same way entity traits do today, minus all state machinery.
+Activity group fields (`self.stripe`) are accessible via `self` inside group activity methods — the macro composes them the same way RPC groups do for entities, minus all state machinery.
 
 ### Methods Available on `self`
 
@@ -385,27 +405,23 @@ Activities do **not** have access to `sleep`, `await_deferred`, or other durable
 
 ### Workflow Registration (Type-Safe)
 
-Same pattern as entities — the macro generates a `register` function with explicit typed parameters for every declared activity group.
+Same pattern as entities — the macro generates a `register` method that consumes the workflow instance. Activity group instances are struct fields — forget one and the struct literal won't compile.
 
 ```rust
-// #[workflow_impl] — no groups
-// Generated: fn register(cluster: &Cluster, workflow: Self) -> Result<Client, ClusterError>
-let client = ProcessOrder::register(
-    &cluster,
-    ProcessOrder { http: http_client.clone() },
-).await?;
+// No groups
+let client = ProcessOrder {
+    http: http_client.clone(),
+}.register(sharding.clone()).await?;
 
-// #[workflow_impl(activity_groups(Payments, Inventory))]
-// Generated: fn register(cluster: &Cluster, workflow: Self, g1: Payments, g2: Inventory) -> Result<Client, ClusterError>
-let client = ProcessOrder::register(
-    &cluster,
-    ProcessOrder { http: http_client.clone() },
-    Payments { stripe: stripe_client.clone() },
-    Inventory { db: db_pool.clone() },
-).await?;
+// With groups — group instances are named struct fields
+let client = ProcessOrder {
+    http: http_client.clone(),
+    payments: Payments { stripe: stripe_client.clone() },
+    inventory: Inventory { db: db_pool.clone() },
+}.register(sharding.clone()).await?;
 ```
 
-`register` returns a typed client. Forget a group — compile error. Wrong type — compile error.
+`register` returns a typed client. Forget a group field — compile error. Wrong type — compile error.
 
 ### Workflow Client API
 
@@ -413,7 +429,8 @@ let client = ProcessOrder::register(
 
 ```rust
 // From register
-let client = ProcessOrder::register(&cluster, workflow, payments, inventory).await?;
+let client = ProcessOrder { http: http_client.clone(), payments, inventory }
+    .register(sharding.clone()).await?;
 
 // Or construct separately
 let client = ProcessOrder::client(&cluster);
@@ -500,7 +517,7 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 | **`&self` only** | Yes | Yes | Yes | Yes |
 | **Composable into** | — | — | Entities | Workflows |
 | **Backed by** | Entity directly | Hidden entity (`Workflow/{Name}`) | Composed into entity | Composed into workflow |
-| **Registration** | `T::register(cluster, instance, ...groups)` | `T::register(cluster, instance, ...groups)` | Passed to entity registration | Passed to workflow registration |
+| **Registration** | `instance.register(sharding)` | `instance.register(sharding)` | Struct field on parent entity | Struct field on parent workflow |
 | **Client** | `T::client(&cluster)` or from `register` | `T::client(&cluster)` or from `register` | Methods on parent entity's client | Called via `self` in workflow body |
 | **DB transactions** | No (use DB directly in RPCs) | Yes, inside `#[activity]` via `self.transaction()` | No | Yes, via `self.transaction()` |
 | **Durable primitives** | No | Yes, in `execute` (`sleep`, `await_deferred`, etc.) | No | No |
@@ -551,11 +568,11 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 ### Current Status
 
 - **Phase 3 & 4 (Workflow macros + Client):** ✅ Done — `#[workflow]` / `#[workflow_impl]` macros exist and delegate to shared codegen. Tests for the new names added. Custom key extraction via `#[workflow_impl(key = |req| ..., hash = false)]` implemented and tested — `derive_entity_id` uses the key closure when provided, with configurable hashing (SHA-256 by default, raw when `hash = false`).
-- **Phase 5 (Activity groups):** ✅ Done — `#[activity_group]` / `#[activity_group_impl]` macros implemented with composition into workflows via `activity_groups(...)`.
+- **Phase 5 (Activity groups):** ✅ Done — `#[activity_group]` / `#[activity_group_impl]` macros implemented with composition into workflows via `#[workflow(activity_groups(...))]` and struct fields.
 - **Phase 6 (Activity retry support):** ✅ Done — `#[activity(retries = N, backoff = "...")]` implemented for both standalone workflow activities and activity group activities. Retry loop uses attempt-indexed journal keys for independent journaling per retry. Durable sleep between retries via `WorkflowEngine::sleep()`. Backoff strategies: exponential (default, capped at 60s) and constant. `compute_retry_backoff()` utility added. Tests cover: retries with success, constant backoff, retry exhaustion, activity groups with retries, and backoff computation.
 - **Phase 7 (Poll and execution lifecycle):** ✅ Done — `poll` method added to generated workflow client and `ClientWithKey`. `Sharding` trait extended with `replies_for(request_id)` (default returns empty, `ShardingImpl` delegates to `MessageStorage`). `EntityClient::poll_reply` computes deterministic request_id and queries storage. Workflow `execute`/`start`/`ClientWithKey` methods now use entity_id-based key_bytes for consistent request_id derivation, enabling poll without original request payload. Tests: poll returns None for unknown, poll returns result after execute, poll with key, compile-time method existence.
 - **Phase 9 (partial):** ✅ Done — all `standalone_workflow` / `standalone_workflow_impl` tests in `macro_tests.rs` have been ported to new `#[workflow]` / `#[workflow_impl]` API names and old tests removed. Legacy `#[standalone_workflow]` / `#[standalone_workflow_impl]` proc_macro entry points and re-exports deleted. Internal functions renamed from `standalone_workflow_*` to `workflow_*`. All doc comments updated.
-- **Phase 2 (RPC Groups):** ✅ Done — `#[rpc_group]` / `#[rpc_group_impl]` macros implemented. Generates wrapper struct, dispatch, client extension trait, access/methods traits. Composable into entities via `#[entity_impl(rpc_groups(...))]` with type-safe register accepting group instances as parameters. Tests: dispatch, multiple groups, groups with fields, persisted RPCs, multi-param RPCs, client extension, entity type name.
+- **Phase 2 (RPC Groups):** ✅ Done — `#[rpc_group]` / `#[rpc_group_impl]` macros implemented. Generates wrapper struct, dispatch, client extension trait, access/methods traits. Composable into entities via `#[entity(rpc_groups(...))]` with group instances as struct fields. Tests: dispatch, multiple groups, groups with fields, persisted RPCs, multi-param RPCs, client extension, entity type name.
 - **Phase 1 (partial):** ✅ Done — Pure-RPC entity codegen path added. When an entity has no `#[state]`, no `#[workflow]`, no `#[activity]` methods (only `#[rpc]` methods), `generate_pure_rpc_entity()` generates a simplified Handler without `__state`, `__write_lock`, `__state_storage`, `__state_key`, `__workflow_engine`, view structs, or ArcSwap. Methods are called directly on `__entity`. Tests: entity type, dispatch, multi-param, unknown tag, register, persisted RPC. Old stateful codegen path untouched — all existing tests pass.
 - **Phase 9 (test migration, partial):** ✅ Done — `PersistedMethodEntity`, `MixedEntity`, and `PersistedIdempotentEntity` tests migrated from `#[workflow]` to `#[rpc(persisted)]`. These entities previously used `#[workflow]` purely for persisted delivery (no activities, no state); they now correctly use the new API pattern.
 - **Phase 9 (test migration, key extraction):** ✅ Done — `PersistedKeyEntity` and `MultiParamPersisted` migrated from entity `#[workflow(key(...))]` to standalone `#[workflow]`/`#[workflow_impl(key = ...)]`. `PersistedKeyEntity` → `UpdateWorkflow` with `key = |req: &UpdateRequest| req.id.clone()`. `MultiParamPersisted` → `SendEmailWorkflow` with `SendEmailRequest` struct and `key = |req: &SendEmailRequest| req.order_id.clone()`. Tests verify same-key-field produces same entity_id and subset-field key extraction.
@@ -567,13 +584,14 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 - **Phase 9 (integration test migration, ActivityTest):** ✅ Done — ActivityTest entity migrated from old stateful API (`#[state(ActivityTestState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC entity (`ActivityTest` with `pool: PgPool` for reads) + standalone workflow (`ActivityWorkflow`) using `#[workflow]`/`#[workflow_impl]` with activities that write to PG `activity_test_logs` table. HTTP routes updated: workflow execution uses standalone workflow client, read queries use entity client. SQL migration 0021 added.
 - **Phase 9 (integration test migration, CrossEntity):** ✅ Done — CrossEntity entity migrated from old stateful API (`#[state(CrossEntityState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC API (`#[rpc]`, `#[rpc(persisted)]`, direct PG via `cross_entity_messages` and `cross_entity_ping_counts` tables). Request structs now include `entity_id`. HTTP API handlers updated, registration in main.rs updated. SQL migration 0022 added.
 - **Phase 9 (integration test migration, TimerTest):** ✅ Done — TimerTest entity migrated from old stateful API (`#[state(TimerTestState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC entity (`TimerTest` with `pool: PgPool` for reads/mutations: `get_timer_fires`, `get_pending_timers` as `#[rpc]`, `cancel_timer`, `clear_fires` as `#[rpc(persisted)]`) + standalone workflow (`ScheduleTimerWorkflow`) using `#[workflow]`/`#[workflow_impl]` with activities that write to PG `timer_test_pending` and `timer_test_fires` tables. Durable `self.sleep()` for timer delay. HTTP routes updated: schedule uses standalone workflow client, reads/cancel/clear use entity client. SQL migration 0023 added.
- - **Phase 9 (integration test migration, TraitTest):** ✅ Done — TraitTest entity migrated from old stateful API (`#[entity_impl(traits(Auditable, Versioned))]`, `#[state(TraitTestState)]`, `#[entity_trait]`/`#[entity_trait_impl]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC entity with RPC groups (`#[entity_impl(rpc_groups(Auditable, Versioned))]`). Auditable and Versioned converted from `#[entity_trait]`/`#[entity_trait_impl]` with framework-managed state to `#[rpc_group]`/`#[rpc_group_impl]` with direct PG via `trait_test_audit_log` and `trait_test_versions` tables. TraitTest entity uses `#[rpc]` and `#[rpc(persisted)]` with direct PG via `trait_test_data` table. SQL migration 0024 added.
+ - **Phase 9 (integration test migration, TraitTest):** ✅ Done — TraitTest entity migrated from old stateful API (`#[entity_impl(traits(Auditable, Versioned))]`, `#[state(TraitTestState)]`, `#[entity_trait]`/`#[entity_trait_impl]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC entity with RPC groups (`#[entity(rpc_groups(Auditable, Versioned))]`). Auditable and Versioned converted from `#[entity_trait]`/`#[entity_trait_impl]` with framework-managed state to `#[rpc_group]`/`#[rpc_group_impl]` with direct PG via `trait_test_audit_log` and `trait_test_versions` tables. TraitTest entity uses `#[rpc]` and `#[rpc(persisted)]` with direct PG via `trait_test_data` table. SQL migration 0024 added.
  - **Phase 9 (integration test migration, SqlActivityTest):** ✅ Done — SqlActivityTest entity migrated from old stateful API (`#[state(SqlActivityTestState)]`, `#[workflow]`, `#[activity]`, `&mut self`, `ActivityScope::sql_transaction()`) to new pure-RPC entity (`SqlActivityTest` with `pool: PgPool` for reading state from `sql_activity_test_state` table) + 3 standalone workflows (`SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, `SqlCountWorkflow`) using `#[workflow]`/`#[workflow_impl]` with activities that use `ActivityScope::sql_transaction()` to atomically write to both `sql_activity_test_state` and `sql_activity_test_transfers` tables. Rollback test verifies both tables are rolled back on activity failure. SQL migration 0025 added.
  - **Phase 9 (chess-cluster migration, MatchmakingService):** ✅ Done — MatchmakingService migrated from old stateful API (`#[state(MatchmakingState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC API (`#[rpc]`, `#[rpc(persisted)]`). Ephemeral queue state held via `Arc<Mutex<MatchmakingState>>` field (no DB persistence needed — state is intentionally ephemeral). `find_match` and `cancel_search` converted from `#[workflow]` + `#[activity]` pattern to `#[rpc(persisted)]` with inline mutex-guarded state mutations. `get_queue_status`, `is_in_queue`, `get_queue_position` remain as `#[rpc]`. `init()` method and `EntityContext` import removed. Test registrations updated from `MatchmakingService.register()` to `MatchmakingService::new().register()`.
+ - **Phase 9 (chess-cluster migration, Leaderboard):** ✅ Done — Leaderboard entity migrated from old stateful API (`#[state(LeaderboardState)]`, `#[workflow]`, `#[activity]`, `&mut self`) to new pure-RPC API (`#[rpc]`, `#[rpc(persisted)]`). Ephemeral state held via `Arc<Mutex<LeaderboardState>>` field (same pattern as MatchmakingService). `record_game_result` and `ensure_player_rating` converted from `#[workflow]` + `#[activity]` pattern to `#[rpc(persisted)]` with inline mutex-guarded state mutations. Read RPCs (`get_player_rating`, `get_top_players`, `get_rankings_around`, `get_total_games`, `get_total_players`) updated to lock mutex for state access. `init()` method and `EntityContext` import removed. Test registrations updated from `Leaderboard.register()` to `Leaderboard::new().register()`.
  - **Remaining work:**
    - Phase 1 (remaining): Emit compile errors for #[state], #[workflow], #[activity], &mut self on entities; remove old codegen
    - Phase 8 (remaining): Add standalone workflow integration test, RPC group integration test, activity group integration test
-   - Phase 9 (remaining): Remove old entity_trait macros, state infrastructure; migrate remaining chess-cluster entities (Leaderboard, ChessGame, PlayerSession, Auditable trait); delete UI compile-fail tests for removed features once old codegen is removed
+   - Phase 9 (remaining): Remove old entity_trait macros, state infrastructure; migrate remaining chess-cluster entities (ChessGame, PlayerSession, Auditable trait); delete UI compile-fail tests for removed features once old codegen is removed
 
 ### Phase 1: Simplify Entities
 
@@ -608,8 +626,8 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
    - Persisted vs non-persisted is a client-side concern (the dispatch is the same)
 
 6. **Update `register` to be type-safe**
-   - Generate `fn register(cluster, entity, ...rpc_groups) -> Result<Client, ClusterError>` on the entity struct
-   - Each RPC group from `rpc_groups(...)` becomes an explicit typed parameter
+   - Generate `fn register(self, sharding) -> Result<Client, ClusterError>` on the entity struct
+   - RPC group instances are struct fields (declared via `#[entity(rpc_groups(...))]`), not separate register parameters
    - Returns typed client
 
 ### Phase 2: Replace Entity Traits with RPC Groups
@@ -630,10 +648,10 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
      - `__{Group}Methods` trait — async delegation methods for each RPC
      - Client extension trait — adds group RPC methods to the parent entity's client
 
-3. **Wire into `#[entity_impl(rpc_groups(...))]`**
-   - For each group, generate field on Handler: `__{group}_instance: GroupStruct`
+3. **Wire into `#[entity(rpc_groups(...))]`**
+   - `#[entity]` reads the `rpc_groups(...)` list and expects corresponding fields on the struct
+   - `#[entity_impl]` detects composed groups and generates Handler fields, dispatch match arms, client methods, and delegation
    - Implement `__{Group}Access` and `__{Group}Methods` for the entity's view
-   - Add group RPCs to dispatch match arms
    - Add group RPCs to generated client
 
 4. **Remove `#[entity_trait]` / `#[entity_trait_impl]`**
@@ -644,12 +662,14 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 **Goal:** `#[workflow]` and `#[workflow_impl]` generate a working entity with a single `execute` dispatch.
 
 1. **Add `#[workflow]` struct-level macro** ✅
-   - Parse `WorkflowArgs`: `key` (optional closure), `hash` (bool, default true)
+   - Parse `WorkflowArgs`: `activity_groups` (list of paths, optional)
    - Generate hidden methods: `__workflow_name() -> &str`, `__entity_type() -> EntityType` (returns `Workflow/{Name}`)
+   - When `activity_groups(...)` is present, expects corresponding fields on the struct
    - Implemented as dual-purpose: on a struct → standalone workflow codegen, on a method → no-op marker (backward compatible with entity `#[workflow]`)
 
 2. **Add `#[workflow_impl]` impl-level macro** ✅
-   - Parse `WorkflowImplArgs`: `activity_groups` (list of paths)
+   - Parse `WorkflowImplArgs`: `key` (optional closure), `hash` (bool)
+   - Activity groups are declared on the struct-level `#[workflow(activity_groups(...))]`, not on `#[workflow_impl]`
    - Validate: exactly one `execute` method, `&self` only, no `#[state]`, no `#[rpc]`, no `#[workflow]`
    - Classify methods: `execute` (entry point), `#[activity]` (journaled side-effects), unannotated (helpers)
    - Delegates to `standalone_workflow_impl_inner()` (shared codegen with `#[standalone_workflow_impl]`)
@@ -670,8 +690,8 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
    - `spawn()` constructs Handler (no state loading)
 
 7. **Generate type-safe `register`** ✅
-   - `fn register(cluster, workflow, ...activity_groups) -> Result<Client, ClusterError>`
-   - Each activity group from `activity_groups(...)` becomes an explicit typed parameter
+   - `fn register(self, sharding) -> Result<Client, ClusterError>`
+   - Activity group instances are struct fields (declared via `#[workflow(activity_groups(...))]`), not separate register parameters
 
 8. **Add SHA-256 hashing utility** ✅
    - `fn hash_to_id(value: &[u8]) -> String` — SHA-256 hex of bytes
@@ -705,8 +725,9 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
    - Validate: no `&mut self`, no `#[rpc]`, no `#[workflow]`, no `#[state]`
    - Generate: view struct, wrapper methods, access/methods traits
 
-3. **Wire into `#[workflow_impl(activity_groups(...))]`** ✅
-   - Generate group instance fields on Handler
+3. **Wire into `#[workflow(activity_groups(...))]`** ✅
+   - `#[workflow]` reads the `activity_groups(...)` list and expects corresponding fields on the struct
+   - `#[workflow_impl]` detects composed groups and generates Handler fields, delegation, and dispatch
    - Implement access/methods traits on `__ExecuteView`
    - Route through `DurableContext::run()` for journaling
    - Tests added: single group, multiple groups, mixed local + group activities

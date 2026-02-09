@@ -211,7 +211,7 @@ async fn test_matchmaking_different_time_controls_dont_match() {
 #[tokio::test]
 async fn test_leaderboard_record_game_result() {
     let cluster = TestCluster::with_workflow_support().await;
-    let lb_client = Leaderboard
+    let lb_client = Leaderboard::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -257,7 +257,7 @@ async fn test_leaderboard_record_game_result() {
 #[tokio::test]
 async fn test_leaderboard_rankings() {
     let cluster = TestCluster::with_workflow_support().await;
-    let lb_client = Leaderboard
+    let lb_client = Leaderboard::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -322,7 +322,7 @@ async fn test_leaderboard_rankings() {
 #[tokio::test]
 async fn test_leaderboard_draw_updates_both() {
     let cluster = TestCluster::with_workflow_support().await;
-    let lb_client = Leaderboard
+    let lb_client = Leaderboard::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -365,7 +365,7 @@ async fn test_leaderboard_draw_updates_both() {
 #[tokio::test]
 async fn test_leaderboard_aborted_game_rejected() {
     let cluster = TestCluster::with_workflow_support().await;
-    let lb_client = Leaderboard
+    let lb_client = Leaderboard::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -578,7 +578,7 @@ async fn test_game_to_leaderboard_flow() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
     let game_client = ChessGame.register(Arc::clone(&sharding)).await.unwrap();
-    let lb_client = Leaderboard.register(sharding).await.unwrap();
+    let lb_client = Leaderboard::new().register(sharding).await.unwrap();
 
     let game_id = GameId::new();
     let game_entity = EntityId::new(game_id.to_string());
@@ -677,7 +677,7 @@ async fn test_multiple_games_update_rankings() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
     let game_client = ChessGame.register(Arc::clone(&sharding)).await.unwrap();
-    let lb_client = Leaderboard.register(sharding).await.unwrap();
+    let lb_client = Leaderboard::new().register(sharding).await.unwrap();
 
     let lb_entity = EntityId::new("leaderboard");
 

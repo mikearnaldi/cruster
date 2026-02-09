@@ -2,11 +2,14 @@
 //!
 //! This entity maintains global ELO ratings and leaderboard rankings.
 //! It is a singleton - exactly one instance exists across the cluster.
+//!
+//! Uses the pure-RPC entity pattern: no framework-managed state, no workflows,
+//! no activities. State is held directly via `Arc<Mutex<LeaderboardState>>`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -101,22 +104,42 @@ impl LeaderboardState {
 /// This is a singleton - exactly one instance exists across the cluster.
 /// It maintains global ELO ratings and tracks all player rankings.
 ///
-/// ## State (Persisted)
-/// - ratings: Map of PlayerId to PlayerRating
-/// - top_players: Cached top 100 players
-/// - total_games_played: Counter
-/// - last_updated: Timestamp
+/// ## Pure-RPC Design
+/// State is held directly via `Arc<Mutex<LeaderboardState>>`.
+/// State is not persisted by the framework — it is ephemeral in-memory state.
 ///
-/// ## Workflows (durable)
-/// - `record_game_result(result)` - Calculate ELO, update ratings
+/// ## RPCs (persisted, at-least-once)
+/// - `record_game_result(request)` — Calculate ELO, update ratings
+/// - `ensure_player_rating(player_id)` — Initialize or get a player's rating
 ///
-/// ## RPCs
-/// - `get_player_rating(player_id)` - Get a player's rating
-/// - `get_top_players(limit)` - Get top N players
-/// - `get_rankings_around(player_id, range)` - Get players near a given rank
+/// ## RPCs (non-persisted)
+/// - `get_player_rating(player_id)` — Get a player's rating
+/// - `get_top_players(request)` — Get top N players
+/// - `get_rankings_around(request)` — Get players near a given rank
+/// - `get_total_games()` — Get total games played
+/// - `get_total_players()` — Get total rated players
 #[entity(max_idle_time_secs = 60)]
 #[derive(Clone)]
-pub struct Leaderboard;
+pub struct Leaderboard {
+    /// In-memory ephemeral state, shared across all RPC calls for this entity instance.
+    state: Arc<Mutex<LeaderboardState>>,
+}
+
+impl Leaderboard {
+    /// Create a new Leaderboard with empty state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LeaderboardState::default())),
+        }
+    }
+}
+
+impl Default for Leaderboard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Request to record a game result.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -219,14 +242,9 @@ mod elo {
 }
 
 #[entity_impl]
-#[state(LeaderboardState)]
 impl Leaderboard {
-    fn init(&self, _ctx: &EntityContext) -> Result<LeaderboardState, ClusterError> {
-        Ok(LeaderboardState::default())
-    }
-
     /// Record a game result and update ELO ratings.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn record_game_result(
         &self,
         request: RecordGameResultRequest,
@@ -253,27 +271,15 @@ impl Leaderboard {
             }
         };
 
-        // State mutation via activity
-        self.do_record_game_result(request.result, white_score, black_score)
-            .await
-    }
+        let mut state = self.state.lock().unwrap();
 
-    #[activity]
-    async fn do_record_game_result(
-        &mut self,
-        result: GameResultInfo,
-        white_score: f64,
-        black_score: f64,
-    ) -> Result<RecordGameResultResponse, ClusterError> {
         // Get or create ratings for both players
-        let white_rating = self
-            .state
+        let white_rating = state
             .ratings
             .entry(result.white_player)
             .or_default()
             .clone();
-        let black_rating = self
-            .state
+        let black_rating = state
             .ratings
             .entry(result.black_player)
             .or_default()
@@ -284,8 +290,7 @@ impl Leaderboard {
         let black_elo_change = elo::rating_change(black_rating.elo, white_rating.elo, black_score);
 
         // Update white player's rating
-        let white_entry = self
-            .state
+        let white_entry = state
             .ratings
             .get_mut(&result.white_player)
             .expect("white player entry exists");
@@ -302,8 +307,7 @@ impl Leaderboard {
         let new_white_rating = white_entry.clone();
 
         // Update black player's rating
-        let black_entry = self
-            .state
+        let black_entry = state
             .ratings
             .get_mut(&result.black_player)
             .expect("black player entry exists");
@@ -320,9 +324,9 @@ impl Leaderboard {
         let new_black_rating = black_entry.clone();
 
         // Update totals and refresh cache
-        self.state.total_games_played += 1;
-        self.state.last_updated = Utc::now();
-        self.state.refresh_top_players_cache();
+        state.total_games_played += 1;
+        state.last_updated = Utc::now();
+        state.refresh_top_players_cache();
 
         Ok(RecordGameResultResponse {
             white_rating: new_white_rating,
@@ -338,7 +342,8 @@ impl Leaderboard {
         &self,
         player_id: PlayerId,
     ) -> Result<PlayerRating, ClusterError> {
-        self.state
+        let state = self.state.lock().unwrap();
+        state
             .ratings
             .get(&player_id)
             .cloned()
@@ -351,8 +356,8 @@ impl Leaderboard {
         &self,
         request: GetTopPlayersRequest,
     ) -> Result<GetTopPlayersResponse, ClusterError> {
-        let players: Vec<RankedPlayer> = self
-            .state
+        let state = self.state.lock().unwrap();
+        let players: Vec<RankedPlayer> = state
             .top_players
             .iter()
             .take(request.limit as usize)
@@ -370,18 +375,17 @@ impl Leaderboard {
         &self,
         request: GetRankingsAroundRequest,
     ) -> Result<GetRankingsAroundResponse, ClusterError> {
+        let state = self.state.lock().unwrap();
         let player_id = request.player_id;
 
         // Get the player's rating
-        let rating = self
-            .state
+        let rating = state
             .ratings
             .get(&player_id)
             .cloned()
             .ok_or(LeaderboardError::PlayerNotFound { player_id })?;
 
-        let rank = self
-            .state
+        let rank = state
             .get_player_rank(player_id)
             .ok_or(LeaderboardError::PlayerNotFound { player_id })?;
 
@@ -392,8 +396,7 @@ impl Leaderboard {
         };
 
         // Build a sorted list of all players
-        let mut all_players: Vec<_> = self
-            .state
+        let mut all_players: Vec<_> = state
             .ratings
             .iter()
             .map(|(id, r)| (*id, r.clone()))
@@ -441,30 +444,25 @@ impl Leaderboard {
     /// Get the total number of games played.
     #[rpc]
     pub async fn get_total_games(&self) -> Result<u64, ClusterError> {
-        Ok(self.state.total_games_played)
+        let state = self.state.lock().unwrap();
+        Ok(state.total_games_played)
     }
 
     /// Get the total number of players with ratings.
     #[rpc]
     pub async fn get_total_players(&self) -> Result<u32, ClusterError> {
-        Ok(self.state.ratings.len() as u32)
+        let state = self.state.lock().unwrap();
+        Ok(state.ratings.len() as u32)
     }
 
     /// Initialize or get a player's rating.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn ensure_player_rating(
         &self,
         player_id: PlayerId,
     ) -> Result<PlayerRating, ClusterError> {
-        self.do_ensure_player_rating(player_id).await
-    }
-
-    #[activity]
-    async fn do_ensure_player_rating(
-        &mut self,
-        player_id: PlayerId,
-    ) -> Result<PlayerRating, ClusterError> {
-        let rating = self.state.ratings.entry(player_id).or_default().clone();
+        let mut state = self.state.lock().unwrap();
+        let rating = state.ratings.entry(player_id).or_default().clone();
         Ok(rating)
     }
 }

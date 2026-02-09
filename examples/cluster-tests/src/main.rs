@@ -36,7 +36,8 @@ use api::{create_router, AppState};
 use entities::{
     ActivityTest, ActivityWorkflow, Auditable, Counter, CrossEntity, FailingWorkflow, KVStore,
     LongWorkflow, ScheduleTimerWorkflow, SimpleWorkflow, SingletonManager, SqlActivityTest,
-    StatelessCounter, TimerTest, TraitTest, Versioned, WorkflowTest,
+    SqlCountWorkflow, SqlFailingTransferWorkflow, SqlTransferWorkflow, StatelessCounter, TimerTest,
+    TraitTest, Versioned, WorkflowTest,
 };
 
 /// Parse a "host:port" string into a RunnerAddress.
@@ -335,11 +336,31 @@ async fn main() -> Result<()> {
     .expect("failed to register CrossEntity entity");
     tracing::info!("Registered CrossEntity entity");
 
-    let sql_activity_test_client = SqlActivityTest
+    let sql_activity_test_client = SqlActivityTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register SqlActivityTest entity");
+    tracing::info!("Registered SqlActivityTest entity");
+
+    let sql_transfer_workflow_client = SqlTransferWorkflow
         .register(sharding.clone())
         .await
-        .expect("failed to register SqlActivityTest entity");
-    tracing::info!("Registered SqlActivityTest entity");
+        .expect("failed to register SqlTransferWorkflow");
+    tracing::info!("Registered SqlTransferWorkflow");
+
+    let sql_failing_transfer_workflow_client = SqlFailingTransferWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register SqlFailingTransferWorkflow");
+    tracing::info!("Registered SqlFailingTransferWorkflow");
+
+    let sql_count_workflow_client = SqlCountWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register SqlCountWorkflow");
+    tracing::info!("Registered SqlCountWorkflow");
 
     let stateless_counter_client = StatelessCounter {
         pool: cluster.pool(),
@@ -381,6 +402,9 @@ async fn main() -> Result<()> {
         schedule_timer_workflow_client,
         cross_entity_client,
         sql_activity_test_client,
+        sql_transfer_workflow_client,
+        sql_failing_transfer_workflow_client,
+        sql_count_workflow_client,
         stateless_counter_client,
         singleton_manager,
         sharding,
@@ -400,6 +424,9 @@ async fn main() -> Result<()> {
             "Workflow/ScheduleTimerWorkflow".to_string(),
             "CrossEntity".to_string(),
             "SqlActivityTest".to_string(),
+            "Workflow/SqlTransferWorkflow".to_string(),
+            "Workflow/SqlFailingTransferWorkflow".to_string(),
+            "Workflow/SqlCountWorkflow".to_string(),
             "StatelessCounter".to_string(),
             "SingletonTest (singleton)".to_string(),
         ],

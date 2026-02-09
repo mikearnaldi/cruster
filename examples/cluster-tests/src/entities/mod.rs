@@ -41,8 +41,10 @@ pub use kv_store::{
 };
 pub use singleton_test::{SingletonManager, SingletonState};
 pub use sql_activity_test::{
-    FailingTransferRequest, GetSqlCountRequest, SqlActivityTest, SqlActivityTestClient,
-    SqlActivityTestState, TransferRequest,
+    FailingTransferRequest, GetSqlCountRequest, GetStateRequest, SqlActivityTest,
+    SqlActivityTestClient, SqlActivityTestState, SqlCountWorkflow, SqlCountWorkflowClient,
+    SqlFailingTransferWorkflow, SqlFailingTransferWorkflowClient, SqlTransferWorkflow,
+    SqlTransferWorkflowClient, TransferRequest,
 };
 pub use stateless_counter::{
     StatelessCounter, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,

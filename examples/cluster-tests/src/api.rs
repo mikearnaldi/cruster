@@ -17,13 +17,14 @@ use crate::entities::{
     ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient,
     DecrementRequest, DeleteRequest, FailingTransferRequest, FailingWorkflowClient,
     GetActivityLogRequest, GetAuditLogRequest, GetCounterRequest, GetExecutionRequest,
-    GetMessagesRequest, GetPendingTimersRequest, GetRequest, GetSqlCountRequest,
+    GetMessagesRequest, GetPendingTimersRequest, GetRequest, GetSqlCountRequest, GetStateRequest,
     GetTimerFiresRequest, GetTraitDataRequest, GetVersionRequest, IncrementRequest, KVStoreClient,
     ListExecutionsRequest, ListKeysRequest, LongWorkflowClient, Message, PendingTimer, PingRequest,
     ReceiveRequest, ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
     RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
     ScheduleTimerRequest, ScheduleTimerWorkflowClient, SetRequest, SimpleWorkflowClient,
     SingletonManager, SingletonState, SqlActivityTestClient, SqlActivityTestState,
+    SqlCountWorkflowClient, SqlFailingTransferWorkflowClient, SqlTransferWorkflowClient,
     StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
     StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
     TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
@@ -57,8 +58,14 @@ pub struct AppState {
     pub schedule_timer_workflow_client: ScheduleTimerWorkflowClient,
     /// CrossEntity entity client.
     pub cross_entity_client: CrossEntityClient,
-    /// SqlActivityTest entity client.
+    /// SqlActivityTest entity client (for reads).
     pub sql_activity_test_client: SqlActivityTestClient,
+    /// SqlTransferWorkflow client (standalone workflow).
+    pub sql_transfer_workflow_client: SqlTransferWorkflowClient,
+    /// SqlFailingTransferWorkflow client (standalone workflow).
+    pub sql_failing_transfer_workflow_client: SqlFailingTransferWorkflowClient,
+    /// SqlCountWorkflow client (standalone workflow).
+    pub sql_count_workflow_client: SqlCountWorkflowClient,
     /// StatelessCounter entity client (pure-RPC, new API).
     pub stateless_counter_client: StatelessCounterClient,
     /// Singleton manager (uses cluster's register_singleton feature).
@@ -507,16 +514,13 @@ async fn sql_activity_transfer(
     Path(id): Path<String>,
     Json(body): Json<SqlActivityTransferBody>,
 ) -> Result<Json<i64>, AppError> {
-    let entity_id = EntityId::new(&id);
     let count = state
-        .sql_activity_test_client
-        .transfer(
-            &entity_id,
-            &TransferRequest {
-                to_entity: body.to_entity,
-                amount: body.amount,
-            },
-        )
+        .sql_transfer_workflow_client
+        .execute(&TransferRequest {
+            entity_id: id,
+            to_entity: body.to_entity,
+            amount: body.amount,
+        })
         .await?;
     Ok(Json(count))
 }
@@ -527,16 +531,13 @@ async fn sql_activity_failing_transfer(
     Path(id): Path<String>,
     Json(body): Json<SqlActivityTransferBody>,
 ) -> Result<Json<i64>, AppError> {
-    let entity_id = EntityId::new(&id);
     let count = state
-        .sql_activity_test_client
-        .failing_transfer(
-            &entity_id,
-            &FailingTransferRequest {
-                to_entity: body.to_entity,
-                amount: body.amount,
-            },
-        )
+        .sql_failing_transfer_workflow_client
+        .execute(&FailingTransferRequest {
+            entity_id: id,
+            to_entity: body.to_entity,
+            amount: body.amount,
+        })
         .await?;
     Ok(Json(count))
 }
@@ -547,7 +548,10 @@ async fn sql_activity_get_state(
     Path(id): Path<String>,
 ) -> Result<Json<SqlActivityTestState>, AppError> {
     let entity_id = EntityId::new(&id);
-    let entity_state = state.sql_activity_test_client.get_state(&entity_id).await?;
+    let entity_state = state
+        .sql_activity_test_client
+        .get_state(&entity_id, &GetStateRequest { entity_id: id })
+        .await?;
     Ok(Json(entity_state))
 }
 
@@ -556,15 +560,17 @@ async fn sql_activity_get_sql_count(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<i64>, AppError> {
-    let entity_id = EntityId::new(&id);
     // Generate unique query ID to prevent workflow caching
     let query_id = format!(
         "query-{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     );
     let count = state
-        .sql_activity_test_client
-        .get_transfer_count_from_sql(&entity_id, &GetSqlCountRequest { query_id })
+        .sql_count_workflow_client
+        .execute(&GetSqlCountRequest {
+            entity_id: id,
+            query_id,
+        })
         .await?;
     Ok(Json(count))
 }

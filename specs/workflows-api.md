@@ -544,6 +544,17 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 
 ## Implementation Plan
 
+### Current Status
+
+- **Phase 3 & 4 (Workflow macros + Client):** ✅ Done — `#[workflow]` / `#[workflow_impl]` macros exist alongside legacy `#[standalone_workflow]` / `#[standalone_workflow_impl]`. Both delegate to the same codegen. Tests for the new names added.
+- **Remaining work:**
+  - Phase 1 & 2: Entity simplification and RPC groups (not yet started)
+  - Phase 5: Activity groups (not yet started)
+  - Phase 6: Activity retry support (not yet started)
+  - Phase 7: Poll and execution lifecycle (not yet started)
+  - Phase 8: Integration testing (not yet started)
+  - Phase 9: Cleanup — refactor all tests to new names, delete `standalone_workflow`/`standalone_workflow_impl` (not yet started)
+
 ### Phase 1: Simplify Entities
 
 **Goal:** Strip entities down to stateless RPC handlers.
@@ -608,57 +619,59 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 4. **Remove `#[entity_trait]` / `#[entity_trait_impl]`**
    - Emit deprecation/compile error pointing to `#[rpc_group]`
 
-### Phase 3: Workflow Core Macro Infrastructure
+### Phase 3: Workflow Core Macro Infrastructure ✅
 
 **Goal:** `#[workflow]` and `#[workflow_impl]` generate a working entity with a single `execute` dispatch.
 
-1. **Add `#[workflow]` struct-level macro**
+1. **Add `#[workflow]` struct-level macro** ✅
    - Parse `WorkflowArgs`: `key` (optional closure), `hash` (bool, default true)
    - Generate hidden methods: `__workflow_name() -> &str`, `__entity_type() -> EntityType` (returns `Workflow/{Name}`)
+   - Implemented as dual-purpose: on a struct → standalone workflow codegen, on a method → no-op marker (backward compatible with entity `#[workflow]`)
 
-2. **Add `#[workflow_impl]` impl-level macro**
+2. **Add `#[workflow_impl]` impl-level macro** ✅
    - Parse `WorkflowImplArgs`: `activity_groups` (list of paths)
    - Validate: exactly one `execute` method, `&self` only, no `#[state]`, no `#[rpc]`, no `#[workflow]`
    - Classify methods: `execute` (entry point), `#[activity]` (journaled side-effects), unannotated (helpers)
+   - Delegates to `standalone_workflow_impl_inner()` (shared codegen with `#[standalone_workflow_impl]`)
 
-3. **Generate Handler struct**
+3. **Generate Handler struct** ✅
    - Fields: `__workflow` (user struct), `ctx: EntityContext`, `__workflow_engine`, `__message_storage`, `__workflow_storage`, `__sharding`, `__entity_address`
    - No state fields
 
-4. **Generate view structs**
+4. **Generate view structs** ✅
    - `__ExecuteView` — used by `execute`. `Deref<Target = UserStruct>`. Provides durable primitives (`sleep`, `await_deferred`, `resolve_deferred`, `on_interrupt`, `execution_id`). Provides activity delegation methods routing through `DurableContext::run()`.
    - `__ActivityView` — used by `#[activity]` methods. `Deref<Target = UserStruct>`. Provides `transaction()`. No durable primitives.
 
-5. **Generate dispatch**
+5. **Generate dispatch** ✅
    - Single match arm for tag `"execute"`: deserialize request, wrap in `WorkflowScope::run(request_id)`, construct `__ExecuteView`, call `execute`, serialize response.
 
-6. **Generate `Entity` trait impl**
+6. **Generate `Entity` trait impl** ✅
    - `entity_type()` returns `Workflow/{Name}`
    - `spawn()` constructs Handler (no state loading)
 
-7. **Generate type-safe `register`**
+7. **Generate type-safe `register`** ✅
    - `fn register(cluster, workflow, ...activity_groups) -> Result<Client, ClusterError>`
    - Each activity group from `activity_groups(...)` becomes an explicit typed parameter
 
-8. **Add SHA-256 hashing utility**
+8. **Add SHA-256 hashing utility** ✅
    - `fn hash_to_id(value: &[u8]) -> String` — SHA-256 hex of bytes
    - Used by clients for idempotency key derivation
 
-### Phase 4: Workflow Client Generation
+### Phase 4: Workflow Client Generation ✅
 
 **Goal:** Generate `ProcessOrderClient` with `execute`, `start`, `poll`, `with_key`, `with_key_raw`.
 
-1. **Generate client struct** `{Name}Client`
+1. **Generate client struct** `{Name}Client` ✅
    - `execute(&self, request: T) -> Result<R, ClusterError>` — derive entity ID from request per `key`/`hash` config, send persisted message, await reply
    - `start(&self, request: T) -> Result<String, ClusterError>` — same key derivation, fire-and-forget, return entity ID
-   - `poll(&self, execution_id: &str) -> Result<Option<Result<R, ClusterError>>, ClusterError>` — check for completed reply
+   - `poll(&self, execution_id: &str) -> Result<Option<Result<R, ClusterError>>, ClusterError>` — not yet implemented
 
-2. **Generate key-override view** `{Name}ClientWithKey`
+2. **Generate key-override view** `{Name}ClientWithKey` ✅
    - `with_key(key: impl ToString) -> {Name}ClientWithKey` — stores key, hash=true
    - `with_key_raw(key: impl ToString) -> {Name}ClientWithKey` — stores key, hash=false
    - Same `execute`, `start` methods using the stored key
 
-3. **Generate `T::client(&self)` on workflow view structs** — workflows can get clients for other workflows/entities
+3. **Generate `T::client(&self)` on workflow view structs** ✅ — workflows can get clients for other workflows/entities via `WorkflowClientFactory`
 
 ### Phase 5: Activity Groups
 

@@ -3091,4 +3091,225 @@ mod tests {
         let value: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(value, "HELLO");
     }
+
+    // ==========================================================================
+    // New #[workflow] / #[workflow_impl] Macro Tests
+    // ==========================================================================
+    //
+    // These test the new API names that will replace standalone_workflow.
+
+    use crate::workflow_impl;
+
+    // --- Basic workflow using new macros ---
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct NewWfRequest {
+        name: String,
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct NewSimpleWorkflow;
+
+    #[workflow_impl(krate = "crate")]
+    impl NewSimpleWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            Ok(format!("new-hello, {}", request.name))
+        }
+    }
+
+    #[test]
+    fn new_workflow_entity_type() {
+        let w = NewSimpleWorkflow;
+        assert_eq!(w.entity_type().0, "Workflow/NewSimpleWorkflow");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_dispatch() {
+        let w = NewSimpleWorkflow;
+        let ctx = test_ctx("Workflow/NewSimpleWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "world".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "new-hello, world");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_unknown_tag() {
+        let w = NewSimpleWorkflow;
+        let ctx = test_ctx("Workflow/NewSimpleWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let err = handler
+            .handle_request("unknown", &[], &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClusterError::MalformedMessage { .. }));
+    }
+
+    // --- Workflow with activities using new macros ---
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct NewOrderRequest {
+        order_id: String,
+        amount: i32,
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct NewOrderWorkflow;
+
+    #[workflow_impl(krate = "crate")]
+    impl NewOrderWorkflow {
+        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
+            let validated = self.validate(request.order_id.clone()).await?;
+            let charged = self
+                .charge(request.order_id.clone(), request.amount)
+                .await?;
+            Ok(format!("{validated}+{charged}"))
+        }
+
+        #[activity]
+        async fn validate(&self, order_id: String) -> Result<String, ClusterError> {
+            Ok(format!("valid:{order_id}"))
+        }
+
+        #[activity]
+        async fn charge(&self, order_id: String, amount: i32) -> Result<String, ClusterError> {
+            Ok(format!("charged:{order_id}:{amount}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_activities() {
+        let w = NewOrderWorkflow;
+        let ctx = test_ctx("Workflow/NewOrderWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-99".to_string(),
+            amount: 200,
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "valid:order-99+charged:order-99:200");
+    }
+
+    // --- Workflow with struct fields using new macros ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct NewFieldWorkflow {
+        prefix: String,
+    }
+
+    #[workflow_impl(krate = "crate")]
+    impl NewFieldWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            let greeting = self.greet(request.name).await?;
+            Ok(greeting)
+        }
+
+        #[activity]
+        async fn greet(&self, name: String) -> Result<String, ClusterError> {
+            Ok(format!("{}: {name}", self.prefix))
+        }
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_fields() {
+        let w = NewFieldWorkflow {
+            prefix: "Hey".to_string(),
+        };
+        let ctx = test_ctx("Workflow/NewFieldWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "Bob".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "Hey: Bob");
+    }
+
+    // --- Client generation with new macros ---
+
+    #[test]
+    fn new_workflow_client_exists() {
+        fn _assert_client_methods(_c: &NewSimpleWorkflowClient) {
+            // execute, start, with_key, with_key_raw should exist
+        }
+    }
+
+    #[tokio::test]
+    async fn new_workflow_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = NewSimpleWorkflow
+            .register(Arc::clone(&sharding))
+            .await
+            .unwrap();
+        let req = NewWfRequest {
+            name: "test".to_string(),
+        };
+        let _: String = client.execute(&req).await.unwrap();
+    }
+
+    #[test]
+    fn new_workflow_implements_client_factory() {
+        use crate::entity_client::WorkflowClientFactory;
+        fn _assert_factory<T: WorkflowClientFactory>() {}
+        _assert_factory::<NewSimpleWorkflow>();
+    }
+
+    // --- Workflow with helpers using new macros ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct NewHelperWorkflow;
+
+    #[workflow_impl(krate = "crate")]
+    impl NewHelperWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            let upper = self.to_upper(&request.name);
+            Ok(upper)
+        }
+
+        fn to_upper(&self, s: &str) -> String {
+            s.to_uppercase()
+        }
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_helpers() {
+        let w = NewHelperWorkflow;
+        let ctx = test_ctx("Workflow/NewHelperWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "hello".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "HELLO");
+    }
 }

@@ -318,13 +318,48 @@ pub fn rpc(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
-/// Marks an async method as a durable workflow (state mutations).
+/// Dual-purpose macro: standalone workflow struct definition OR entity method marker.
 ///
-/// Use `#[workflow]` for any method that **modifies entity state** via `state_mut()`.
-/// Workflows are persisted and can be replayed on restart, ensuring state changes
-/// are never lost.
+/// ## On a struct: Standalone Workflow Definition
 ///
-/// # Usage
+/// When applied to a struct, `#[workflow]` defines a standalone workflow — a stateless,
+/// durable orchestration construct backed by a hidden entity.
+///
+/// ### Attributes
+///
+/// - `#[workflow]` — default: key = hash(serialize(request))
+/// - `#[workflow(key = |req| req.order_id.clone())]` — custom key, hashed
+/// - `#[workflow(key = |req| req.order_id.clone(), hash = false)]` — custom key, raw
+///
+/// ### Example
+///
+/// ```text
+/// use cruster::prelude::*;
+///
+/// #[workflow]
+/// #[derive(Clone)]
+/// pub struct ProcessOrder {
+///     http: HttpClient,
+/// }
+///
+/// #[workflow_impl]
+/// impl ProcessOrder {
+///     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
+///         let reserved = self.reserve_inventory(request.items.clone()).await?;
+///         Ok(OrderResult { order_id: reserved.id })
+///     }
+///
+///     #[activity]
+///     async fn reserve_inventory(&self, items: Vec<Item>) -> Result<Reservation, ClusterError> {
+///         todo!()
+///     }
+/// }
+/// ```
+///
+/// ## On a method: Entity Workflow Marker (Legacy)
+///
+/// When applied to a method inside `#[entity_impl]`, marks it as a durable workflow
+/// method (persisted, publicly callable).
 ///
 /// ```text
 /// #[entity_impl]
@@ -336,60 +371,61 @@ pub fn rpc(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         state.count += amount;
 ///         Ok(state.count)
 ///     }
-///
-///     #[workflow]
-///     async fn reset(&self) -> Result<(), ClusterError> {
-///         let mut state = self.state_mut().await;
-///         state.count = 0;
-///         Ok(())
-///     }
-/// }
-/// ```
-///
-/// # When to Use
-///
-/// - **Any method that calls `state_mut()`** should be `#[workflow]`
-/// - State mutations are atomic and persisted
-/// - If the process crashes, the workflow will be replayed
-///
-/// # Complex Workflows with Activities
-///
-/// For workflows that need to perform external side effects (API calls, emails, etc.),
-/// use `#[activity]` methods and call them via `DurableContext`:
-///
-/// ```text
-/// #[workflow]
-/// async fn process_order(&self, ctx: &DurableContext, order: Order) -> Result<Receipt, ClusterError> {
-///     // State mutation
-///     {
-///         let mut state = self.state_mut().await;
-///         state.orders.push(order.id);
-///     }
-///     
-///     // External side effect (retryable, persisted)
-///     ctx.run(|| self.send_confirmation_email(&order)).await?;
-///     
-///     Ok(Receipt::new(order.id))
-/// }
-/// ```
-///
-/// # Visibility
-///
-/// By default, `#[workflow]` methods are `#[public]` (externally callable).
-///
-/// # Idempotency Key
-///
-/// Use `#[workflow(key = |req| ...)]` to deduplicate repeated calls:
-///
-/// ```text
-/// #[workflow(key = |order| order.id.clone())]
-/// async fn process_order(&self, order: Order) -> Result<Receipt, ClusterError> {
-///     // Duplicate calls with same order.id return cached result
 /// }
 /// ```
 #[proc_macro_attribute]
-pub fn workflow(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Try to parse as a struct — if it is, do standalone workflow codegen.
+    // If it's a function/method, it's a no-op marker (parsed by #[entity_impl]).
+    let item_clone = item.clone();
+    if syn::parse::<syn::ItemStruct>(item_clone).is_ok() {
+        // Struct: standalone workflow
+        let args = parse_macro_input!(attr as WorkflowStructArgs);
+        let input = parse_macro_input!(item as syn::ItemStruct);
+        match standalone_workflow_struct_inner(args, input) {
+            Ok(tokens) => tokens.into(),
+            Err(e) => e.to_compile_error().into(),
+        }
+    } else {
+        // Method/function: no-op marker for entity_impl parsing
+        item
+    }
+}
+
+/// Attribute macro for standalone workflow impl blocks.
+///
+/// Must contain exactly one `execute` method (the entry point) and zero or more
+/// `#[activity]` methods (journaled side effects).
+///
+/// # Attributes
+///
+/// - `#[workflow_impl]` — default
+/// - `#[workflow_impl(krate = "crate")]` — for internal use
+///
+/// # Example
+///
+/// ```text
+/// #[workflow_impl]
+/// impl ProcessOrder {
+///     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
+///         let charge = self.charge(request.payment).await?;
+///         Ok(OrderResult { charge_id: charge.id })
+///     }
+///
+///     #[activity]
+///     async fn charge(&self, payment: Payment) -> Result<Charge, ClusterError> {
+///         todo!()
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn workflow_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as WorkflowImplArgs);
+    let input = parse_macro_input!(item as syn::ItemImpl);
+    match standalone_workflow_impl_inner(args, input) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
 
 /// Marks an async method as a durable activity (external side effects).

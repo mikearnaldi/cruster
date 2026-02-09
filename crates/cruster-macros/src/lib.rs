@@ -382,7 +382,7 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Struct: standalone workflow
         let args = parse_macro_input!(attr as WorkflowStructArgs);
         let input = parse_macro_input!(item as syn::ItemStruct);
-        match standalone_workflow_struct_inner(args, input) {
+        match workflow_struct_inner(args, input) {
             Ok(tokens) => tokens.into(),
             Err(e) => e.to_compile_error().into(),
         }
@@ -422,7 +422,7 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn workflow_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as WorkflowImplArgs);
     let input = parse_macro_input!(item as syn::ItemImpl);
-    match standalone_workflow_impl_inner(args, input) {
+    match workflow_impl_inner(args, input) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -4293,92 +4293,8 @@ fn extract_result_ok_type(ty: &syn::Type) -> syn::Result<syn::Type> {
 }
 
 // =============================================================================
-// Standalone Workflow Macros
+// Workflow Macros — argument parsing and codegen
 // =============================================================================
-
-/// Attribute macro for standalone workflow struct definitions.
-///
-/// Workflows are stateless, durable orchestration constructs backed by hidden entities.
-/// Each workflow has a single `execute` entry point and `#[activity]` methods for
-/// side effects.
-///
-/// # Attributes
-///
-/// - `#[standalone_workflow]` — default: key = hash(serialize(request))
-/// - `#[standalone_workflow(key = |req| req.order_id.clone())]` — custom key, hashed
-/// - `#[standalone_workflow(key = |req| req.order_id.clone(), hash = false)]` — custom key, raw
-///
-/// # Example
-///
-/// ```text
-/// use cruster::prelude::*;
-///
-/// #[standalone_workflow]
-/// #[derive(Clone)]
-/// pub struct ProcessOrder {
-///     http: HttpClient,
-/// }
-///
-/// #[standalone_workflow_impl]
-/// impl ProcessOrder {
-///     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
-///         let reserved = self.reserve_inventory(request.items.clone()).await?;
-///         Ok(OrderResult { order_id: reserved.id })
-///     }
-///
-///     #[activity]
-///     async fn reserve_inventory(&self, items: Vec<Item>) -> Result<Reservation, ClusterError> {
-///         todo!()
-///     }
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn standalone_workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as WorkflowStructArgs);
-    let input = parse_macro_input!(item as syn::ItemStruct);
-    match standalone_workflow_struct_inner(args, input) {
-        Ok(tokens) => tokens.into(),
-        Err(e) => e.to_compile_error().into(),
-    }
-}
-
-/// Attribute macro for standalone workflow impl blocks.
-///
-/// Must contain exactly one `execute` method (the entry point) and zero or more
-/// `#[activity]` methods (journaled side effects).
-///
-/// # Attributes
-///
-/// - `#[standalone_workflow_impl]` — default
-/// - `#[standalone_workflow_impl(krate = "crate")]` — for internal use
-///
-/// # Example
-///
-/// ```text
-/// #[standalone_workflow_impl]
-/// impl ProcessOrder {
-///     async fn execute(&self, request: OrderRequest) -> Result<OrderResult, ClusterError> {
-///         let charge = self.charge(request.payment).await?;
-///         Ok(OrderResult { charge_id: charge.id })
-///     }
-///
-///     #[activity]
-///     async fn charge(&self, payment: Payment) -> Result<Charge, ClusterError> {
-///         todo!()
-///     }
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn standalone_workflow_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as WorkflowImplArgs);
-    let input = parse_macro_input!(item as syn::ItemImpl);
-    match standalone_workflow_impl_inner(args, input) {
-        Ok(tokens) => tokens.into(),
-        Err(e) => e.to_compile_error().into(),
-    }
-}
-
-// --- Workflow argument parsing ---
 
 struct WorkflowStructArgs {
     key: Option<syn::ExprClosure>,
@@ -4409,10 +4325,12 @@ impl syn::parse::Parse for WorkflowStructArgs {
                     };
                     match expr {
                         syn::Expr::Closure(closure) => args.key = Some(closure),
-                        _ => return Err(syn::Error::new(
-                            expr.span(),
-                            "key must be a closure, e.g. #[standalone_workflow(key = |req| ...)]",
-                        )),
+                        _ => {
+                            return Err(syn::Error::new(
+                                expr.span(),
+                                "key must be a closure, e.g. #[workflow(key = |req| ...)]",
+                            ))
+                        }
                     }
                 }
                 "hash" => {
@@ -4428,7 +4346,7 @@ impl syn::parse::Parse for WorkflowStructArgs {
                 other => {
                     return Err(syn::Error::new(
                         ident.span(),
-                        format!("unknown standalone_workflow attribute: {other}"),
+                        format!("unknown workflow attribute: {other}"),
                     ));
                 }
             }
@@ -4460,7 +4378,7 @@ impl syn::parse::Parse for WorkflowImplArgs {
                 other => {
                     return Err(syn::Error::new(
                         ident.span(),
-                        format!("unknown standalone_workflow_impl attribute: {other}"),
+                        format!("unknown workflow_impl attribute: {other}"),
                     ));
                 }
             }
@@ -4472,9 +4390,9 @@ impl syn::parse::Parse for WorkflowImplArgs {
     }
 }
 
-// --- #[standalone_workflow] struct-level codegen ---
+// --- #[workflow] struct-level codegen ---
 
-fn standalone_workflow_struct_inner(
+fn workflow_struct_inner(
     args: WorkflowStructArgs,
     input: syn::ItemStruct,
 ) -> syn::Result<proc_macro2::TokenStream> {
@@ -4496,9 +4414,9 @@ fn standalone_workflow_struct_inner(
             where __Req: serde::Serialize,
             {
                 // This is a placeholder — the actual key extraction is codegen'd
-                // by standalone_workflow_impl based on the struct's key attribute.
+                // by workflow_impl based on the struct's key attribute.
                 let _ = req;
-                unreachable!("key extraction is generated by standalone_workflow_impl")
+                unreachable!("key extraction is generated by workflow_impl")
             }
         }
     } else {
@@ -4572,9 +4490,9 @@ struct WorkflowExecuteInfo {
     original_method: syn::ImplItemFn,
 }
 
-// --- #[standalone_workflow_impl] codegen ---
+// --- #[workflow_impl] codegen ---
 
-fn standalone_workflow_impl_inner(
+fn workflow_impl_inner(
     args: WorkflowImplArgs,
     input: syn::ItemImpl,
 ) -> syn::Result<proc_macro2::TokenStream> {
@@ -5230,7 +5148,7 @@ fn standalone_workflow_impl_inner(
             /// Get a typed client for another workflow or entity.
             ///
             /// The target type `T` must implement `cruster::entity_client::WorkflowClientFactory`.
-            /// All types annotated with `#[standalone_workflow]` automatically implement this.
+            /// All types annotated with `#[workflow]` automatically implement this.
             #[inline]
             fn client<T: #krate::entity_client::WorkflowClientFactory>(&self) -> T::Client {
                 let sharding = self.__handler.__sharding.clone()

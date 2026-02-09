@@ -39,7 +39,7 @@ impl EntityClientAccessor for EntityClient {
 
 /// Factory trait for creating typed workflow/entity clients.
 ///
-/// Automatically implemented by `#[standalone_workflow]` macros.
+/// Automatically implemented by `#[workflow]` macros.
 /// Used by the `self.client::<T>()` method inside workflow execute bodies
 /// to get a typed client for another workflow or entity.
 pub trait WorkflowClientFactory {

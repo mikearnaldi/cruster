@@ -60,11 +60,8 @@ pub mod types;
 pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
 
 /// Re-export proc macros for standalone workflow definition.
-pub use cruster_macros::{standalone_workflow, standalone_workflow_impl};
-
-/// Re-export the new `#[workflow_impl]` proc macro.
-/// Note: `#[workflow]` is already exported above as a helper attribute macro
-/// and is now dual-purpose (struct-level → standalone workflow, method-level → marker).
+/// `#[workflow]` is dual-purpose (struct-level → standalone workflow, method-level → marker).
+/// `#[workflow_impl]` is used on the workflow impl block.
 pub use cruster_macros::workflow_impl;
 
 /// Prelude module for convenient glob imports.
@@ -104,10 +101,7 @@ pub mod prelude {
     // Main macros
     pub use cruster_macros::{entity, entity_impl, entity_trait, entity_trait_impl};
 
-    // Standalone workflow macros (legacy names)
-    pub use cruster_macros::{standalone_workflow, standalone_workflow_impl};
-
-    // New workflow impl macro (workflow is already exported as helper attribute)
+    // Workflow impl macro (workflow is already exported as helper attribute)
     pub use cruster_macros::workflow_impl;
 
     // Helper attribute macros (for IDE autocomplete and documentation)

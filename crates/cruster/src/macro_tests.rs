@@ -652,7 +652,7 @@ mod tests {
         sharding.shutdown().await.unwrap();
     }
 
-    // --- Persisted method idempotency key override ---
+    // --- Workflow with custom key extraction (migrated from entity #[workflow(key(...))] to standalone workflow) ---
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct UpdateRequest {
@@ -660,14 +660,13 @@ mod tests {
         value: i32,
     }
 
-    #[entity(krate = "crate")]
+    #[workflow(krate = "crate")]
     #[derive(Clone)]
-    struct PersistedKeyEntity;
+    struct UpdateWorkflow;
 
-    #[entity_impl(krate = "crate")]
-    impl PersistedKeyEntity {
-        #[workflow(key(|req: &UpdateRequest| req.id.clone()))]
-        async fn update(&self, req: UpdateRequest) -> Result<String, ClusterError> {
+    #[workflow_impl(krate = "crate", key = |req: &UpdateRequest| req.id.clone())]
+    impl UpdateWorkflow {
+        async fn execute(&self, req: UpdateRequest) -> Result<String, ClusterError> {
             Ok(format!("{}:{}", req.id, req.value))
         }
     }
@@ -856,15 +855,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_key_override_uses_custom_idempotency_key() {
+    async fn workflow_key_override_uses_custom_idempotency_key() {
+        // Migrated from PersistedKeyEntity — tests that custom key extraction
+        // produces the same entity_id for requests with the same key field.
         let captured = Arc::new(Mutex::new(Vec::new()));
         let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
             inner: MockSharding::new(),
             captured: Arc::clone(&captured),
         });
-        let client = PersistedKeyEntityClient::new(Arc::clone(&sharding));
+        let client = UpdateWorkflowClient::new(Arc::clone(&sharding));
 
-        let entity_id = EntityId::new("pk-1");
         let req1 = UpdateRequest {
             id: "same".to_string(),
             value: 1,
@@ -874,23 +874,28 @@ mod tests {
             value: 2,
         };
 
-        let entity = PersistedKeyEntity;
-        let ctx = test_ctx("PersistedKeyEntity", "pk-handler");
-        let handler = entity.spawn(ctx).await.unwrap();
+        // Dispatch works correctly
+        let w = UpdateWorkflow;
+        let ctx = test_ctx("Workflow/UpdateWorkflow", "pk-handler");
+        let handler = w.spawn(ctx).await.unwrap();
         let payload = rmp_serde::to_vec(&req1).unwrap();
         let result = handler
-            .handle_request("update", &payload, &HashMap::new())
+            .handle_request("execute", &payload, &HashMap::new())
             .await
             .unwrap();
         let response: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(response, "same:1");
 
-        let _: String = client.update(&entity_id, &req1).await.unwrap();
-        let _: String = client.update(&entity_id, &req2).await.unwrap();
+        // Client calls with same key field produce same entity_id
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].request_id, captured[1].request_id);
+        assert_eq!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same key field should produce same entity_id"
+        );
     }
 
     // --- Multiple request parameters ---
@@ -922,55 +927,74 @@ mod tests {
         assert_eq!(value, 5);
     }
 
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct MultiParamPersisted;
+    // --- Workflow with key extraction from a subset of fields (migrated from MultiParamPersisted entity) ---
 
-    #[entity_impl(krate = "crate")]
-    impl MultiParamPersisted {
-        #[workflow(key(|order_id: &String, _body: &String| order_id.clone()))]
-        async fn send_email(&self, order_id: String, body: String) -> Result<String, ClusterError> {
-            Ok(format!("{order_id}:{body}"))
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct SendEmailRequest {
+        order_id: String,
+        body: String,
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct SendEmailWorkflow;
+
+    #[workflow_impl(krate = "crate", key = |req: &SendEmailRequest| req.order_id.clone())]
+    impl SendEmailWorkflow {
+        async fn execute(&self, req: SendEmailRequest) -> Result<String, ClusterError> {
+            Ok(format!("{}:{}", req.order_id, req.body))
         }
     }
 
     #[tokio::test]
-    async fn multi_param_persist_key_uses_subset() {
+    async fn workflow_key_uses_subset_of_fields() {
+        // Migrated from MultiParamPersisted — tests that key extraction uses
+        // only a subset of request fields for idempotency.
         let captured = Arc::new(Mutex::new(Vec::new()));
         let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
             inner: MockSharding::new(),
             captured: Arc::clone(&captured),
         });
-        let client = MultiParamPersistedClient::new(Arc::clone(&sharding));
+        let client = SendEmailWorkflowClient::new(Arc::clone(&sharding));
 
-        let entity_id = EntityId::new("mp-1");
         let order_id = "order-1".to_string();
         let body1 = "first".to_string();
         let body2 = "second".to_string();
 
-        let entity = MultiParamPersisted;
-        let ctx = test_ctx("MultiParamPersisted", "mp-handler");
-        let handler = entity.spawn(ctx).await.unwrap();
-        let payload = rmp_serde::to_vec(&(order_id.clone(), body1.clone())).unwrap();
+        // Dispatch works correctly
+        let w = SendEmailWorkflow;
+        let ctx = test_ctx("Workflow/SendEmailWorkflow", "mp-handler");
+        let handler = w.spawn(ctx).await.unwrap();
+        let req1 = SendEmailRequest {
+            order_id: order_id.clone(),
+            body: body1.clone(),
+        };
+        let payload = rmp_serde::to_vec(&req1).unwrap();
         let result = handler
-            .handle_request("send_email", &payload, &HashMap::new())
+            .handle_request("execute", &payload, &HashMap::new())
             .await
             .unwrap();
         let response: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(response, format!("{order_id}:{body1}"));
 
-        let _: String = client
-            .send_email(&entity_id, &order_id, &body1)
-            .await
-            .unwrap();
-        let _: String = client
-            .send_email(&entity_id, &order_id, &body2)
-            .await
-            .unwrap();
+        // Client calls with same order_id but different body produce same entity_id
+        let req_a = SendEmailRequest {
+            order_id: order_id.clone(),
+            body: body1,
+        };
+        let req_b = SendEmailRequest {
+            order_id: order_id.clone(),
+            body: body2,
+        };
+        let _: String = client.execute(&req_a).await.unwrap();
+        let _: String = client.execute(&req_b).await.unwrap();
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].request_id, captured[1].request_id);
+        assert_eq!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same order_id should produce same entity_id regardless of body"
+        );
     }
 
     // --- Entity traits ---

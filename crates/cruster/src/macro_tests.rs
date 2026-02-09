@@ -3104,10 +3104,7 @@ mod tests {
     #[activity_group_impl(krate = "crate")]
     impl TestPayments {
         #[activity]
-        async fn charge(
-            &self,
-            amount: i32,
-        ) -> Result<String, ClusterError> {
+        async fn charge(&self, amount: i32) -> Result<String, ClusterError> {
             let total = (amount as f64 * self.rate) as i32;
             Ok(format!("charged:{total}"))
         }
@@ -3167,10 +3164,7 @@ mod tests {
     async fn activity_group_workflow_register() {
         let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
         let client = PaymentWorkflow
-            .register(
-                Arc::clone(&sharding),
-                TestPayments { rate: 2.0 },
-            )
+            .register(Arc::clone(&sharding), TestPayments { rate: 2.0 })
             .await
             .unwrap();
 
@@ -3309,5 +3303,390 @@ mod tests {
             .unwrap();
         let value: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(value, "test:valid:order-5|charged:30");
+    }
+
+    // ==========================================================================
+    // Activity Retry Support Tests (#[activity(retries = N, backoff = "...")])
+    // ==========================================================================
+
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    /// Workflow engine that returns immediately from sleep (for retry tests).
+    struct InstantWorkflowEngine;
+
+    #[async_trait]
+    impl WorkflowEngine for InstantWorkflowEngine {
+        async fn sleep(
+            &self,
+            _workflow_name: &str,
+            _execution_id: &str,
+            _name: &str,
+            _duration: Duration,
+        ) -> Result<(), ClusterError> {
+            // No-op — instant return for fast tests
+            Ok(())
+        }
+
+        async fn await_deferred(
+            &self,
+            _workflow_name: &str,
+            _execution_id: &str,
+            _name: &str,
+        ) -> Result<Vec<u8>, ClusterError> {
+            Err(ClusterError::PersistenceError {
+                reason: "not supported".to_string(),
+                source: None,
+            })
+        }
+
+        async fn resolve_deferred(
+            &self,
+            _workflow_name: &str,
+            _execution_id: &str,
+            _name: &str,
+            _value: Vec<u8>,
+        ) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        async fn on_interrupt(
+            &self,
+            _workflow_name: &str,
+            _execution_id: &str,
+        ) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+
+    fn test_ctx_with_instant_engine(entity_type: &str, entity_id: &str) -> EntityContext {
+        EntityContext {
+            address: EntityAddress {
+                shard_id: ShardId::new("default", 0),
+                entity_type: EntityType::new(entity_type),
+                entity_id: EntityId::new(entity_id),
+            },
+            runner_address: RunnerAddress::new("127.0.0.1", 9000),
+            snowflake: Arc::new(SnowflakeGenerator::new()),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            state_storage: Some(Arc::new(MemoryWorkflowStorage::new())),
+            workflow_engine: Some(Arc::new(InstantWorkflowEngine)),
+            sharding: None,
+            message_storage: Some(Arc::new(MemoryMessageStorage::new())),
+        }
+    }
+
+    // --- Workflow with retries (no backoff specified = exponential default) ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct RetryWorkflow {
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[workflow_impl(krate = "crate")]
+    impl RetryWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            let result = self.flaky_activity(request.name.clone()).await?;
+            Ok(result)
+        }
+
+        #[activity(retries = 3)]
+        async fn flaky_activity(&self, name: String) -> Result<String, ClusterError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count < 2 {
+                Err(ClusterError::PersistenceError {
+                    reason: format!("flaky failure #{count}"),
+                    source: None,
+                })
+            } else {
+                Ok(format!("success:{name}:attempt-{count}"))
+            }
+        }
+    }
+
+    #[test]
+    fn retry_workflow_entity_type() {
+        let w = RetryWorkflow {
+            call_count: Arc::new(AtomicU32::new(0)),
+        };
+        assert_eq!(w.entity_type().0, "Workflow/RetryWorkflow");
+    }
+
+    #[tokio::test]
+    async fn retry_workflow_activity_succeeds_after_retries() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let w = RetryWorkflow {
+            call_count: call_count.clone(),
+        };
+        let ctx = test_ctx_with_instant_engine("Workflow/RetryWorkflow", "exec-retry-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "retry-test".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        // Succeeds on attempt #2 (0-indexed), after 2 failures
+        assert_eq!(value, "success:retry-test:attempt-2");
+        // Total calls: attempts 0, 1, 2 = 3 calls
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    // --- Workflow with constant backoff ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct ConstantBackoffWorkflow {
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[workflow_impl(krate = "crate")]
+    impl ConstantBackoffWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            self.retryable(request.name).await
+        }
+
+        #[activity(retries = 2, backoff = "constant")]
+        async fn retryable(&self, name: String) -> Result<String, ClusterError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count < 1 {
+                Err(ClusterError::PersistenceError {
+                    reason: "constant-fail".to_string(),
+                    source: None,
+                })
+            } else {
+                Ok(format!("const-ok:{name}"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn constant_backoff_workflow_succeeds() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let w = ConstantBackoffWorkflow {
+            call_count: call_count.clone(),
+        };
+        let ctx = test_ctx_with_instant_engine("Workflow/ConstantBackoffWorkflow", "exec-const-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "const-test".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "const-ok:const-test");
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // --- Workflow where all retries fail ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct AlwaysFailWorkflow {
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[workflow_impl(krate = "crate")]
+    impl AlwaysFailWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            self.always_fail(request.name).await
+        }
+
+        #[activity(retries = 2, backoff = "exponential")]
+        async fn always_fail(&self, _name: String) -> Result<String, ClusterError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            Err(ClusterError::PersistenceError {
+                reason: format!("always-fail-{count}"),
+                source: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_workflow_exhaustion_returns_last_error() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let w = AlwaysFailWorkflow {
+            call_count: call_count.clone(),
+        };
+        let ctx = test_ctx_with_instant_engine("Workflow/AlwaysFailWorkflow", "exec-fail-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "fail-test".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await;
+        assert!(result.is_err());
+        // 1 initial + 2 retries = 3 total calls
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    // --- Activity with retries = 0 (same as no retries) ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct NoRetryWorkflow;
+
+    #[workflow_impl(krate = "crate")]
+    impl NoRetryWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            self.no_retry(request.name).await
+        }
+
+        #[activity(retries = 0)]
+        async fn no_retry(&self, name: String) -> Result<String, ClusterError> {
+            Ok(format!("no-retry:{name}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn no_retry_workflow_succeeds() {
+        let w = NoRetryWorkflow;
+        let ctx = test_ctx("Workflow/NoRetryWorkflow", "exec-noretry-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "no-retry-test".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "no-retry:no-retry-test");
+    }
+
+    // --- Activity group with retries ---
+
+    #[activity_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct RetryPayments {
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[activity_group_impl(krate = "crate")]
+    impl RetryPayments {
+        #[activity(retries = 3, backoff = "exponential")]
+        async fn charge_with_retry(&self, amount: i32) -> Result<String, ClusterError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count < 2 {
+                Err(ClusterError::PersistenceError {
+                    reason: format!("payment-fail-{count}"),
+                    source: None,
+                })
+            } else {
+                Ok(format!("charged:{amount}"))
+            }
+        }
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct GroupRetryWorkflow;
+
+    #[workflow_impl(krate = "crate", activity_groups(RetryPayments))]
+    impl GroupRetryWorkflow {
+        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
+            self.charge_with_retry(request.amount).await
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_group_retry_succeeds() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let payments = RetryPayments {
+            call_count: call_count.clone(),
+        };
+        let workflow = GroupRetryWorkflow;
+        let ctx = test_ctx_with_instant_engine("Workflow/GroupRetryWorkflow", "exec-group-retry-1");
+        let bundle = __GroupRetryWorkflowWithGroups {
+            __workflow: workflow,
+            __group_retry_payments: payments,
+        };
+        let handler = bundle.spawn(ctx).await.unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-retry".to_string(),
+            amount: 42,
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "charged:42");
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    // --- Test compute_retry_backoff utility ---
+
+    #[test]
+    fn test_compute_retry_backoff_exponential() {
+        use crate::durable::compute_retry_backoff;
+
+        assert_eq!(
+            compute_retry_backoff(0, "exponential", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(1, "exponential", 1),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            compute_retry_backoff(2, "exponential", 1),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            compute_retry_backoff(3, "exponential", 1),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            compute_retry_backoff(5, "exponential", 1),
+            Duration::from_secs(32)
+        );
+        // Capped at 60 seconds
+        assert_eq!(
+            compute_retry_backoff(6, "exponential", 1),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            compute_retry_backoff(10, "exponential", 1),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_compute_retry_backoff_constant() {
+        use crate::durable::compute_retry_backoff;
+
+        assert_eq!(
+            compute_retry_backoff(0, "constant", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(1, "constant", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(5, "constant", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(0, "constant", 5),
+            Duration::from_secs(5)
+        );
     }
 }

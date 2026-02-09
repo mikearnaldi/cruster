@@ -1065,6 +1065,14 @@ struct RpcMethod {
     has_durable_context: bool,
     /// Whether this RPC uses persisted (at-least-once) delivery via `#[rpc(persisted)]`.
     rpc_persisted: bool,
+    /// Max retry attempts for activities (from `#[activity(retries = N)]`).
+    /// Used by standalone workflow codegen; entity-based activities do not use retries from here.
+    #[allow(dead_code)]
+    retries: Option<u32>,
+    /// Backoff strategy for activity retries: `"exponential"` or `"constant"`.
+    /// Used by standalone workflow codegen; entity-based activities do not use retries from here.
+    #[allow(dead_code)]
+    backoff: Option<String>,
 }
 
 impl RpcMethod {
@@ -4041,12 +4049,137 @@ impl syn::parse::Parse for KeyArgs {
     }
 }
 
-fn parse_kind_attr(
-    attrs: &[syn::Attribute],
-) -> syn::Result<Option<(RpcKind, Option<syn::ExprClosure>, bool)>> {
+/// Parsed arguments for `#[activity(...)]` supporting `key`, `retries`, and `backoff`.
+///
+/// Supported forms:
+/// - `#[activity]` — no arguments
+/// - `#[activity(key = |req| ...)]` — custom journal key
+/// - `#[activity(retries = 3)]` — retry with default (exponential) backoff
+/// - `#[activity(retries = 3, backoff = "exponential")]` — explicit backoff strategy
+/// - `#[activity(retries = 3, backoff = "constant")]` — constant backoff
+/// - All combinations of the above
+struct ActivityAttrArgs {
+    key: Option<syn::ExprClosure>,
+    retries: Option<u32>,
+    backoff: Option<String>,
+}
+
+impl syn::parse::Parse for ActivityAttrArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut key = None;
+        let mut retries = None;
+        let mut backoff = None;
+
+        if input.is_empty() {
+            return Ok(ActivityAttrArgs {
+                key,
+                retries,
+                backoff,
+            });
+        }
+
+        loop {
+            if input.is_empty() {
+                break;
+            }
+
+            let ident: syn::Ident = input.parse()?;
+            if ident == "key" {
+                if key.is_some() {
+                    return Err(syn::Error::new(ident.span(), "duplicate `key` argument"));
+                }
+                if input.peek(syn::Token![=]) {
+                    input.parse::<syn::Token![=]>()?;
+                }
+                let expr: syn::Expr = if input.peek(syn::token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    content.parse()?
+                } else {
+                    input.parse()?
+                };
+                match expr {
+                    syn::Expr::Closure(closure) => key = Some(closure),
+                    _ => {
+                        return Err(syn::Error::new(
+                            expr.span(),
+                            "key must be a closure, e.g. #[activity(key = |req| ...)]",
+                        ))
+                    }
+                }
+            } else if ident == "retries" {
+                if retries.is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "duplicate `retries` argument",
+                    ));
+                }
+                input.parse::<syn::Token![=]>()?;
+                let lit: syn::LitInt = input.parse()?;
+                retries = Some(lit.base10_parse::<u32>()?);
+            } else if ident == "backoff" {
+                if backoff.is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "duplicate `backoff` argument",
+                    ));
+                }
+                input.parse::<syn::Token![=]>()?;
+                let lit: syn::LitStr = input.parse()?;
+                let value = lit.value();
+                if value != "exponential" && value != "constant" {
+                    return Err(syn::Error::new(
+                        lit.span(),
+                        "backoff must be \"exponential\" or \"constant\"",
+                    ));
+                }
+                backoff = Some(value);
+            } else {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "expected `key`, `retries`, or `backoff` in #[activity(...)]",
+                ));
+            }
+
+            // Consume optional comma separator
+            if input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+
+        // Validate: backoff without retries is an error
+        if backoff.is_some() && retries.is_none() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`backoff` requires `retries` to be specified",
+            ));
+        }
+
+        Ok(ActivityAttrArgs {
+            key,
+            retries,
+            backoff,
+        })
+    }
+}
+
+/// Parsed result from `parse_kind_attr`.
+struct KindAttrInfo {
+    kind: RpcKind,
+    key: Option<syn::ExprClosure>,
+    rpc_persisted: bool,
+    /// Max retry attempts for activities (from `#[activity(retries = N)]`).
+    retries: Option<u32>,
+    /// Backoff strategy for activity retries: `"exponential"` or `"constant"`.
+    backoff: Option<String>,
+}
+
+fn parse_kind_attr(attrs: &[syn::Attribute]) -> syn::Result<Option<KindAttrInfo>> {
     let mut kind: Option<RpcKind> = None;
     let mut key: Option<syn::ExprClosure> = None;
     let mut rpc_persisted = false;
+    let mut retries: Option<u32> = None;
+    let mut backoff: Option<String> = None;
 
     for attr in attrs {
         if attr.path().is_ident("rpc") {
@@ -4096,12 +4229,16 @@ fn parse_kind_attr(
                 return Err(syn::Error::new(attr.span(), "multiple RPC kind attributes"));
             }
             let args = match &attr.meta {
-                syn::Meta::Path(_) => KeyArgs { key: None },
-                syn::Meta::List(_) => attr.parse_args::<KeyArgs>()?,
+                syn::Meta::Path(_) => ActivityAttrArgs {
+                    key: None,
+                    retries: None,
+                    backoff: None,
+                },
+                syn::Meta::List(_) => attr.parse_args::<ActivityAttrArgs>()?,
                 syn::Meta::NameValue(_) => {
                     return Err(syn::Error::new(
                         attr.span(),
-                        "expected #[activity] or #[activity(key(...))]",
+                        "expected #[activity] or #[activity(...)]",
                     ))
                 }
             };
@@ -4109,6 +4246,8 @@ fn parse_kind_attr(
             if args.key.is_some() {
                 key = args.key;
             }
+            retries = args.retries;
+            backoff = args.backoff;
         }
 
         if attr.path().is_ident("method") {
@@ -4129,7 +4268,13 @@ fn parse_kind_attr(
         }
     }
 
-    Ok(kind.map(|kind| (kind, key, rpc_persisted)))
+    Ok(kind.map(|kind| KindAttrInfo {
+        kind,
+        key,
+        rpc_persisted,
+        retries,
+        backoff,
+    }))
 }
 
 fn parse_visibility_attr(attrs: &[syn::Attribute]) -> syn::Result<Option<RpcVisibility>> {
@@ -4176,7 +4321,13 @@ fn parse_rpc_method(method: &syn::ImplItemFn) -> syn::Result<Option<RpcMethod>> 
     let kind_info = parse_kind_attr(&method.attrs)?;
     let visibility_attr = parse_visibility_attr(&method.attrs)?;
 
-    let (kind, persist_key, rpc_persisted) = match kind_info {
+    let KindAttrInfo {
+        kind,
+        key: persist_key,
+        rpc_persisted,
+        retries,
+        backoff,
+    } = match kind_info {
         Some(info) => info,
         None => {
             if visibility_attr.is_some() {
@@ -4322,6 +4473,14 @@ fn parse_rpc_method(method: &syn::ImplItemFn) -> syn::Result<Option<RpcMethod>> 
         }
     };
 
+    // Validate: retries/backoff only valid on activities
+    if retries.is_some() && !matches!(kind, RpcKind::Activity) {
+        return Err(syn::Error::new(
+            method.sig.span(),
+            "`retries` is only valid on #[activity(retries = N)]",
+        ));
+    }
+
     Ok(Some(RpcMethod {
         name,
         tag,
@@ -4333,6 +4492,8 @@ fn parse_rpc_method(method: &syn::ImplItemFn) -> syn::Result<Option<RpcMethod>> 
         persist_key,
         has_durable_context,
         rpc_persisted,
+        retries,
+        backoff,
     }))
 }
 
@@ -4423,6 +4584,10 @@ struct ActivityGroupActivityInfo {
     response_type: syn::Type,
     persist_key: Option<syn::ExprClosure>,
     original_method: syn::ImplItemFn,
+    /// Max retry attempts (from `#[activity(retries = N)]`).
+    retries: Option<u32>,
+    /// Backoff strategy: `"exponential"` (default) or `"constant"`.
+    backoff: Option<String>,
 }
 
 /// Generates the codegen for `#[activity_group_impl]`.
@@ -4512,25 +4677,33 @@ fn activity_group_impl_inner(
                     ));
                 }
 
-                // Parse activity key attribute
-                let persist_key = {
+                // Parse activity attributes (key, retries, backoff)
+                let (persist_key, act_retries, act_backoff) = {
                     let mut key = None;
+                    let mut retries = None;
+                    let mut backoff = None;
                     for attr in &method.attrs {
                         if attr.path().is_ident("activity") {
                             let args = match &attr.meta {
-                                syn::Meta::Path(_) => KeyArgs { key: None },
-                                syn::Meta::List(_) => attr.parse_args::<KeyArgs>()?,
+                                syn::Meta::Path(_) => ActivityAttrArgs {
+                                    key: None,
+                                    retries: None,
+                                    backoff: None,
+                                },
+                                syn::Meta::List(_) => attr.parse_args::<ActivityAttrArgs>()?,
                                 _ => {
                                     return Err(syn::Error::new(
                                         attr.span(),
-                                        "expected #[activity] or #[activity(key(...))]",
+                                        "expected #[activity] or #[activity(...)]",
                                     ))
                                 }
                             };
                             key = args.key;
+                            retries = args.retries;
+                            backoff = args.backoff;
                         }
                     }
-                    key
+                    (key, retries, backoff)
                 };
 
                 // Parse params (skip &self)
@@ -4569,6 +4742,8 @@ fn activity_group_impl_inner(
                     response_type,
                     persist_key,
                     original_method: method.clone(),
+                    retries: act_retries,
+                    backoff: act_backoff,
                 });
             }
 
@@ -4726,6 +4901,88 @@ fn activity_group_impl_inner(
                 }
             };
 
+            // Generate the journal body — either single-shot or retry loop
+            let max_retries = act.retries.unwrap_or(0);
+            let journal_body = if max_retries == 0 {
+                // No retry — single shot
+                quote! {
+                    let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
+                        ::std::sync::Arc::clone(__engine),
+                        self.__entity_type.clone(),
+                        self.__entity_id.clone(),
+                        ::std::sync::Arc::clone(__msg_storage),
+                        ::std::sync::Arc::clone(__wf_storage),
+                    );
+                    let __activity_view = #activity_view_name {
+                        __group: &self.__group,
+                    };
+                    __journal_ctx.run(#method_name_str, &__journal_key_bytes, || {
+                        __activity_view.#method_name(#(#param_names),*)
+                    }).await
+                }
+            } else {
+                let backoff_str = act.backoff.as_deref().unwrap_or("exponential");
+                // Clone params at start of each iteration so owned types survive across retries
+                let param_clones: Vec<proc_macro2::TokenStream> = param_names
+                    .iter()
+                    .map(|name| {
+                        let clone_name = format_ident!("__{}_clone", name);
+                        quote! { let #clone_name = #name.clone(); }
+                    })
+                    .collect();
+                let cloned_param_names: Vec<syn::Ident> = param_names
+                    .iter()
+                    .map(|name| format_ident!("__{}_clone", name))
+                    .collect();
+                quote! {
+                    let mut __attempt = 0u32;
+                    loop {
+                        // Clone params for this attempt (owned types may not be Copy)
+                        #(#param_clones)*
+                        let __retry_key_bytes = {
+                            let mut __k = __journal_key_bytes.clone();
+                            __k.extend_from_slice(&__attempt.to_le_bytes());
+                            __k
+                        };
+                        let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
+                            ::std::sync::Arc::clone(__engine),
+                            self.__entity_type.clone(),
+                            self.__entity_id.clone(),
+                            ::std::sync::Arc::clone(__msg_storage),
+                            ::std::sync::Arc::clone(__wf_storage),
+                        );
+                        let __activity_view = #activity_view_name {
+                            __group: &self.__group,
+                        };
+                        match __journal_ctx.run(#method_name_str, &__retry_key_bytes, || {
+                            __activity_view.#method_name(#(#cloned_param_names),*)
+                        }).await {
+                            ::std::result::Result::Ok(__val) => {
+                                break ::std::result::Result::Ok(__val);
+                            }
+                            ::std::result::Result::Err(__e) if __attempt < #max_retries => {
+                                let __delay = #krate::__internal::compute_retry_backoff(
+                                    __attempt, #backoff_str, 1,
+                                );
+                                let __sleep_name = ::std::format!(
+                                    "{}/retry/{}", #method_name_str, __attempt
+                                );
+                                __engine.sleep(
+                                    &self.__entity_type,
+                                    &self.__entity_id,
+                                    &__sleep_name,
+                                    __delay,
+                                ).await?;
+                                __attempt += 1;
+                            }
+                            ::std::result::Result::Err(__e) => {
+                                break ::std::result::Result::Err(__e);
+                            }
+                        }
+                    }
+                }
+            };
+
             quote! {
                 pub async fn #method_name(&self, #(#params),*) #output {
                     if let (
@@ -4747,19 +5004,7 @@ fn activity_group_impl_inner(
                             __scoped.extend_from_slice(&__journal_key_bytes);
                             __scoped
                         };
-                        let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
-                            ::std::sync::Arc::clone(__engine),
-                            self.__entity_type.clone(),
-                            self.__entity_id.clone(),
-                            ::std::sync::Arc::clone(__msg_storage),
-                            ::std::sync::Arc::clone(__wf_storage),
-                        );
-                        let __activity_view = #activity_view_name {
-                            __group: &self.__group,
-                        };
-                        __journal_ctx.run(#method_name_str, &__journal_key_bytes, || {
-                            __activity_view.#method_name(#(#param_names),*)
-                        }).await
+                        #journal_body
                     } else {
                         // No journal — execute directly
                         let __activity_view = #activity_view_name {
@@ -5084,6 +5329,10 @@ struct WorkflowActivityInfo {
     response_type: syn::Type,
     persist_key: Option<syn::ExprClosure>,
     original_method: syn::ImplItemFn,
+    /// Max retry attempts (from `#[activity(retries = N)]`).
+    retries: Option<u32>,
+    /// Backoff strategy: `"exponential"` (default) or `"constant"`.
+    backoff: Option<String>,
 }
 
 struct WorkflowExecuteInfo {
@@ -5238,25 +5487,33 @@ fn workflow_impl_inner(
                         ));
                     }
 
-                    // Parse activity key attribute
-                    let persist_key = {
+                    // Parse activity attributes (key, retries, backoff)
+                    let (persist_key, act_retries, act_backoff) = {
                         let mut key = None;
+                        let mut retries = None;
+                        let mut backoff = None;
                         for attr in &method.attrs {
                             if attr.path().is_ident("activity") {
                                 let args = match &attr.meta {
-                                    syn::Meta::Path(_) => KeyArgs { key: None },
-                                    syn::Meta::List(_) => attr.parse_args::<KeyArgs>()?,
+                                    syn::Meta::Path(_) => ActivityAttrArgs {
+                                        key: None,
+                                        retries: None,
+                                        backoff: None,
+                                    },
+                                    syn::Meta::List(_) => attr.parse_args::<ActivityAttrArgs>()?,
                                     _ => {
                                         return Err(syn::Error::new(
                                             attr.span(),
-                                            "expected #[activity] or #[activity(key(...))]",
+                                            "expected #[activity] or #[activity(...)]",
                                         ))
                                     }
                                 };
                                 key = args.key;
+                                retries = args.retries;
+                                backoff = args.backoff;
                             }
                         }
-                        key
+                        (key, retries, backoff)
                     };
 
                     // Parse params
@@ -5296,6 +5553,8 @@ fn workflow_impl_inner(
                         response_type,
                         persist_key,
                         original_method: method.clone(),
+                        retries: act_retries,
+                        backoff: act_backoff,
                     });
                 }
             }
@@ -5533,6 +5792,90 @@ fn workflow_impl_inner(
                 }
             };
 
+            // Generate the journal body — either single-shot or retry loop
+            let max_retries = act.retries.unwrap_or(0);
+            let journal_body = if max_retries == 0 {
+                // No retry — single shot
+                quote! {
+                    let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
+                        ::std::sync::Arc::clone(__engine),
+                        self.__handler.ctx.address.entity_type.0.clone(),
+                        self.__handler.ctx.address.entity_id.0.clone(),
+                        ::std::sync::Arc::clone(__msg_storage),
+                        ::std::sync::Arc::clone(__wf_storage),
+                    );
+                    let __activity_view = #activity_view_name {
+                        __handler: self.__handler,
+                    };
+                    __journal_ctx.run(#method_name_str, &__journal_key_bytes, || {
+                        __activity_view.#method_name(#(#param_names),*)
+                    }).await
+                }
+            } else {
+                let backoff_str = act.backoff.as_deref().unwrap_or("exponential");
+                // Clone params at start of each iteration so owned types survive across retries
+                let param_clones: Vec<proc_macro2::TokenStream> = param_names
+                    .iter()
+                    .map(|name| {
+                        let clone_name = format_ident!("__{}_clone", name);
+                        quote! { let #clone_name = #name.clone(); }
+                    })
+                    .collect();
+                let cloned_param_names: Vec<syn::Ident> = param_names
+                    .iter()
+                    .map(|name| format_ident!("__{}_clone", name))
+                    .collect();
+                quote! {
+                    let mut __attempt = 0u32;
+                    loop {
+                        // Clone params for this attempt (owned types may not be Copy)
+                        #(#param_clones)*
+                        // Append attempt number to journal key for independent journaling per retry
+                        let __retry_key_bytes = {
+                            let mut __k = __journal_key_bytes.clone();
+                            __k.extend_from_slice(&__attempt.to_le_bytes());
+                            __k
+                        };
+                        let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
+                            ::std::sync::Arc::clone(__engine),
+                            self.__handler.ctx.address.entity_type.0.clone(),
+                            self.__handler.ctx.address.entity_id.0.clone(),
+                            ::std::sync::Arc::clone(__msg_storage),
+                            ::std::sync::Arc::clone(__wf_storage),
+                        );
+                        let __activity_view = #activity_view_name {
+                            __handler: self.__handler,
+                        };
+                        match __journal_ctx.run(#method_name_str, &__retry_key_bytes, || {
+                            __activity_view.#method_name(#(#cloned_param_names),*)
+                        }).await {
+                            ::std::result::Result::Ok(__val) => {
+                                break ::std::result::Result::Ok(__val);
+                            }
+                            ::std::result::Result::Err(__e) if __attempt < #max_retries => {
+                                // Durable sleep between retries
+                                let __delay = #krate::__internal::compute_retry_backoff(
+                                    __attempt, #backoff_str, 1,
+                                );
+                                let __sleep_name = ::std::format!(
+                                    "{}/retry/{}", #method_name_str, __attempt
+                                );
+                                __engine.sleep(
+                                    &self.__handler.ctx.address.entity_type.0,
+                                    &self.__handler.ctx.address.entity_id.0,
+                                    &__sleep_name,
+                                    __delay,
+                                ).await?;
+                                __attempt += 1;
+                            }
+                            ::std::result::Result::Err(__e) => {
+                                break ::std::result::Result::Err(__e);
+                            }
+                        }
+                    }
+                }
+            };
+
             quote! {
                 #[inline]
                 async fn #method_name(&self, #(#params),*) #output {
@@ -5555,19 +5898,7 @@ fn workflow_impl_inner(
                             __scoped.extend_from_slice(&__journal_key_bytes);
                             __scoped
                         };
-                        let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
-                            ::std::sync::Arc::clone(__engine),
-                            self.__handler.ctx.address.entity_type.0.clone(),
-                            self.__handler.ctx.address.entity_id.0.clone(),
-                            ::std::sync::Arc::clone(__msg_storage),
-                            ::std::sync::Arc::clone(__wf_storage),
-                        );
-                        let __activity_view = #activity_view_name {
-                            __handler: self.__handler,
-                        };
-                        __journal_ctx.run(#method_name_str, &__journal_key_bytes, || {
-                            __activity_view.#method_name(#(#param_names),*)
-                        }).await
+                        #journal_body
                     } else {
                         // No journal — execute directly
                         let __activity_view = #activity_view_name {

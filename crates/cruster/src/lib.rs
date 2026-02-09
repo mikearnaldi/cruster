@@ -125,8 +125,8 @@ mod durable;
 #[doc(hidden)]
 pub mod __internal {
     pub use crate::durable::{
-        DeferredKey, DeferredKeyLike, DurableContext, MemoryWorkflowEngine, MemoryWorkflowStorage,
-        StorageTransaction, WorkflowEngine, WorkflowScope, WorkflowStorage,
+        compute_retry_backoff, DeferredKey, DeferredKeyLike, DurableContext, MemoryWorkflowEngine,
+        MemoryWorkflowStorage, StorageTransaction, WorkflowEngine, WorkflowScope, WorkflowStorage,
     };
     pub use crate::envelope::REQUEST_ID_HEADER_KEY;
     pub use crate::message_storage::MessageStorage;

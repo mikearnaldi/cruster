@@ -547,11 +547,11 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 ### Current Status
 
 - **Phase 3 & 4 (Workflow macros + Client):** ✅ Done — `#[workflow]` / `#[workflow_impl]` macros exist and delegate to shared codegen. Tests for the new names added.
+- **Phase 5 (Activity groups):** ✅ Done — `#[activity_group]` / `#[activity_group_impl]` macros implemented with composition into workflows via `activity_groups(...)`.
+- **Phase 6 (Activity retry support):** ✅ Done — `#[activity(retries = N, backoff = "...")]` implemented for both standalone workflow activities and activity group activities. Retry loop uses attempt-indexed journal keys for independent journaling per retry. Durable sleep between retries via `WorkflowEngine::sleep()`. Backoff strategies: exponential (default, capped at 60s) and constant. `compute_retry_backoff()` utility added. Tests cover: retries with success, constant backoff, retry exhaustion, activity groups with retries, and backoff computation.
 - **Phase 9 (partial):** ✅ Done — all `standalone_workflow` / `standalone_workflow_impl` tests in `macro_tests.rs` have been ported to new `#[workflow]` / `#[workflow_impl]` API names and old tests removed. Legacy `#[standalone_workflow]` / `#[standalone_workflow_impl]` proc_macro entry points and re-exports deleted. Internal functions renamed from `standalone_workflow_*` to `workflow_*`. All doc comments updated.
 - **Remaining work:**
   - Phase 1 & 2: Entity simplification and RPC groups (not yet started)
-  - Phase 5: Activity groups (not yet started)
-  - Phase 6: Activity retry support (not yet started)
   - Phase 7: Poll and execution lifecycle (not yet started)
   - Phase 8: Integration testing (not yet started)
 
@@ -691,31 +691,34 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
    - Route through `DurableContext::run()` for journaling
    - Tests added: single group, multiple groups, mixed local + group activities
 
-### Phase 6: Activity Retry Support
+### Phase 6: Activity Retry Support ✅
 
 **Goal:** `#[activity(retries = N, backoff = "...")]` retries failed activities.
 
-1. **Parse retry attributes** on `#[activity]`
+1. **Parse retry attributes** on `#[activity]` ✅
+   - New `ActivityAttrArgs` parser supports `key`, `retries`, and `backoff` in any combination
+   - `retries` is a `u32`, `backoff` is `"exponential"` (default) or `"constant"`
+   - Validation: `backoff` requires `retries`, `retries` only valid on activities
 
-2. **Generate retry wrapper in activity delegation**
-   ```
-   for attempt in 0..=retries {
-       match durable_ctx.run(key_with_attempt, || handler.activity(args)).await {
-           Ok(result) => return Ok(result),
-           Err(e) if attempt < retries => {
-               let delay = compute_backoff(attempt, backoff_strategy);
-               engine.sleep(delay).await?;  // durable sleep between retries
-           }
-           Err(e) => return Err(e),
-       }
-   }
-   ```
-   - Journal key includes attempt number for independent journaling per retry
-   - Sleep between retries is durable (survives crash)
+2. **Generate retry wrapper in activity delegation** ✅
+   - Implemented for both standalone workflow activities and activity group activities
+   - Uses `loop` with attempt counter; parameters are cloned per iteration for owned types
+   - Journal key includes attempt number (appended as LE bytes) for independent journaling per retry
+   - Durable sleep between retries via `WorkflowEngine::sleep()` with name `"{activity}/retry/{attempt}"`
+   - On exhaustion, returns the last error
 
-3. **Backoff computation**
-   - Exponential: `base * 2^attempt` (base = 1s, capped at 60s)
-   - Constant: `base` (base = 1s)
+3. **Backoff computation** ✅
+   - `compute_retry_backoff(attempt, strategy, base_secs)` utility in `durable.rs`
+   - Exponential: `base * 2^attempt` (capped at 60s)
+   - Constant: `base` (default 1s)
+
+4. **Tests** ✅
+   - `retry_workflow_activity_succeeds_after_retries` — flaky activity succeeds on 3rd attempt
+   - `constant_backoff_workflow_succeeds` — constant backoff strategy
+   - `retry_workflow_exhaustion_returns_last_error` — all retries fail
+   - `no_retry_workflow_succeeds` — `retries = 0` behaves like no retries
+   - `activity_group_retry_succeeds` — activity group with retries
+   - `test_compute_retry_backoff_exponential` / `test_compute_retry_backoff_constant` — unit tests for backoff computation
 
 ### Phase 7: Poll and Execution Lifecycle
 

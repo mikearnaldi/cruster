@@ -718,6 +718,26 @@ impl DurableContext {
     }
 }
 
+/// Compute the backoff delay for an activity retry attempt.
+///
+/// Used by macro-generated retry loops for `#[activity(retries = N, backoff = "...")]`.
+///
+/// - `"exponential"`: `min(base_secs * 2^attempt, 60)` seconds (capped at 60s)
+/// - `"constant"`: `base_secs` seconds (default 1s)
+///
+/// Returns the delay as a [`Duration`].
+pub fn compute_retry_backoff(attempt: u32, backoff_strategy: &str, base_secs: u64) -> Duration {
+    match backoff_strategy {
+        "constant" => Duration::from_secs(base_secs),
+        // Default to exponential
+        _ => {
+            let power = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+            let delay_secs = base_secs.saturating_mul(power);
+            Duration::from_secs(delay_secs.min(60))
+        }
+    }
+}
+
 /// Minimal engine interface required by `DurableContext`.
 #[async_trait]
 pub trait WorkflowEngine: Send + Sync {

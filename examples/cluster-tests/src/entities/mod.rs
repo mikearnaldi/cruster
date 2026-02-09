@@ -49,8 +49,9 @@ pub use stateless_counter::{
     StatelessIncrementRequest, StatelessResetRequest,
 };
 pub use timer_test::{
-    CancelTimerRequest, ClearFiresRequest, PendingTimer, ScheduleTimerRequest, TimerFire,
-    TimerTest, TimerTestClient,
+    CancelTimerRequest, ClearFiresRequest, GetPendingTimersRequest, GetTimerFiresRequest,
+    PendingTimer, ScheduleTimerRequest, ScheduleTimerWorkflow, ScheduleTimerWorkflowClient,
+    TimerFire, TimerTest, TimerTestClient,
 };
 pub use trait_test::{AuditEntry, Auditable, TraitTest, TraitTestClient, UpdateRequest, Versioned};
 pub use workflow_test::{

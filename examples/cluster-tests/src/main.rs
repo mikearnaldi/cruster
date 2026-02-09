@@ -35,8 +35,8 @@ mod entities;
 use api::{create_router, AppState};
 use entities::{
     ActivityTest, ActivityWorkflow, Auditable, Counter, CrossEntity, FailingWorkflow, KVStore,
-    LongWorkflow, SimpleWorkflow, SingletonManager, SqlActivityTest, StatelessCounter, TimerTest,
-    TraitTest, Versioned, WorkflowTest,
+    LongWorkflow, ScheduleTimerWorkflow, SimpleWorkflow, SingletonManager, SqlActivityTest,
+    StatelessCounter, TimerTest, TraitTest, Versioned, WorkflowTest,
 };
 
 /// Parse a "host:port" string into a RunnerAddress.
@@ -301,11 +301,21 @@ async fn main() -> Result<()> {
         .expect("failed to register TraitTest entity");
     tracing::info!("Registered TraitTest entity");
 
-    let timer_test_client = TimerTest
-        .register(sharding.clone())
-        .await
-        .expect("failed to register TimerTest entity");
+    let timer_test_client = TimerTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register TimerTest entity");
     tracing::info!("Registered TimerTest entity");
+
+    let schedule_timer_workflow_client = ScheduleTimerWorkflow {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register ScheduleTimerWorkflow");
+    tracing::info!("Registered ScheduleTimerWorkflow");
 
     let cross_entity_client = CrossEntity {
         pool: cluster.pool(),
@@ -358,6 +368,7 @@ async fn main() -> Result<()> {
         activity_workflow_client,
         trait_test_client,
         timer_test_client,
+        schedule_timer_workflow_client,
         cross_entity_client,
         sql_activity_test_client,
         stateless_counter_client,
@@ -376,6 +387,7 @@ async fn main() -> Result<()> {
             "Workflow/ActivityWorkflow".to_string(),
             "TraitTest".to_string(),
             "TimerTest".to_string(),
+            "Workflow/ScheduleTimerWorkflow".to_string(),
             "CrossEntity".to_string(),
             "SqlActivityTest".to_string(),
             "StatelessCounter".to_string(),

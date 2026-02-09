@@ -17,15 +17,15 @@ use crate::entities::{
     ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient,
     DecrementRequest, DeleteRequest, FailingTransferRequest, FailingWorkflowClient,
     GetActivityLogRequest, GetCounterRequest, GetExecutionRequest, GetMessagesRequest,
-    GetRequest, GetSqlCountRequest, IncrementRequest, KVStoreClient,
-    ListExecutionsRequest, ListKeysRequest, LongWorkflowClient, Message, PendingTimer, PingRequest,
-    ReceiveRequest, ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
-    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
-    ScheduleTimerRequest, SetRequest, SimpleWorkflowClient, SingletonManager, SingletonState,
-    SqlActivityTestClient, SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest,
-    StatelessGetRequest, StatelessIncrementRequest, StatelessResetRequest, TimerFire,
-    TimerTestClient, TraitTestClient, TransferRequest, UpdateRequest, WorkflowExecution,
-    WorkflowTestClient,
+    GetPendingTimersRequest, GetRequest, GetSqlCountRequest, GetTimerFiresRequest,
+    IncrementRequest, KVStoreClient, ListExecutionsRequest, ListKeysRequest, LongWorkflowClient,
+    Message, PendingTimer, PingRequest, ReceiveRequest, ResetCounterRequest, ResetPingCountRequest,
+    RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
+    RunWithActivitiesRequest, ScheduleTimerRequest, ScheduleTimerWorkflowClient, SetRequest,
+    SimpleWorkflowClient, SingletonManager, SingletonState, SqlActivityTestClient,
+    SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
+    StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
+    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
 };
 // Import trait client extensions to make trait methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
@@ -50,8 +50,10 @@ pub struct AppState {
     pub activity_workflow_client: ActivityWorkflowClient,
     /// TraitTest entity client.
     pub trait_test_client: TraitTestClient,
-    /// TimerTest entity client.
+    /// TimerTest entity client (pure-RPC for reads/mutations).
     pub timer_test_client: TimerTestClient,
+    /// ScheduleTimerWorkflow client (standalone workflow for timer scheduling).
+    pub schedule_timer_workflow_client: ScheduleTimerWorkflowClient,
     /// CrossEntity entity client.
     pub cross_entity_client: CrossEntityClient,
     /// SqlActivityTest entity client.
@@ -674,21 +676,20 @@ pub struct TimerCancelBody {
 }
 
 /// Schedule a timer with the given delay.
+///
+/// Uses the ScheduleTimerWorkflow standalone workflow for durable sleep.
 async fn timer_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<TimerScheduleBody>,
 ) -> Result<Json<()>, AppError> {
-    let entity_id = EntityId::new(&id);
     state
-        .timer_test_client
-        .schedule_timer(
-            &entity_id,
-            &ScheduleTimerRequest {
-                timer_id: body.timer_id,
-                delay_ms: body.delay_ms,
-            },
-        )
+        .schedule_timer_workflow_client
+        .execute(&ScheduleTimerRequest {
+            entity_id: id,
+            timer_id: body.timer_id,
+            delay_ms: body.delay_ms,
+        })
         .await?;
     Ok(Json(()))
 }
@@ -705,6 +706,7 @@ async fn timer_cancel(
         .cancel_timer(
             &entity_id,
             &CancelTimerRequest {
+                entity_id: id,
                 timer_id: body.timer_id,
             },
         )
@@ -718,7 +720,15 @@ async fn timer_get_fires(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TimerFire>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let fires = state.timer_test_client.get_timer_fires(&entity_id).await?;
+    let fires = state
+        .timer_test_client
+        .get_timer_fires(
+            &entity_id,
+            &GetTimerFiresRequest {
+                entity_id: id,
+            },
+        )
+        .await?;
     Ok(Json(fires))
 }
 
@@ -728,11 +738,17 @@ async fn timer_clear_fires(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    // Generate unique request ID so each clear is a new workflow execution
+    // Generate unique request ID so each clear is a separate execution
     let request_id = format!("clear-{}-{}", id, chrono::Utc::now().timestamp_millis());
     state
         .timer_test_client
-        .clear_fires(&entity_id, &ClearFiresRequest { request_id })
+        .clear_fires(
+            &entity_id,
+            &ClearFiresRequest {
+                entity_id: id,
+                request_id,
+            },
+        )
         .await?;
     Ok(Json(()))
 }
@@ -745,7 +761,12 @@ async fn timer_get_pending(
     let entity_id = EntityId::new(&id);
     let pending = state
         .timer_test_client
-        .get_pending_timers(&entity_id)
+        .get_pending_timers(
+            &entity_id,
+            &GetPendingTimersRequest {
+                entity_id: id,
+            },
+        )
         .await?;
     Ok(Json(pending))
 }

@@ -1,39 +1,38 @@
-//! Counter entity - basic entity for testing state persistence and simple RPCs.
+//! Counter entity - pure-RPC entity for testing basic cluster operations.
 //!
 //! This entity provides basic counter operations to test:
-//! - State persistence across calls
+//! - Persisted RPCs (at-least-once delivery)
+//! - Read-only RPCs (best-effort delivery)
+//! - State persistence via PostgreSQL (entity manages its own state)
 //! - State survival after entity eviction and reload
-//! - Serialization of concurrent increments
 
-use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
-
-/// State for a counter entity.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CounterState {
-    /// Current counter value.
-    pub value: i64,
-}
+use sqlx::PgPool;
 
 /// Counter entity for testing basic cluster operations.
 ///
-/// ## State (Persisted)
-/// - value: i64 - the counter value
+/// Uses the new stateless entity API — state is managed directly in PostgreSQL
+/// via the `counter_values` table rather than framework-managed state.
 ///
 /// ## RPCs
-/// - `increment(amount)` - Add to counter, return new value
-/// - `decrement(amount)` - Subtract from counter, return new value
-/// - `get()` - Get current value
-/// - `reset()` - Reset to zero
+/// - `increment(amount)` - Add to counter, return new value (persisted)
+/// - `decrement(amount)` - Subtract from counter, return new value (persisted)
+/// - `get()` - Get current value (non-persisted, read-only)
+/// - `reset()` - Reset to zero (persisted)
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
-pub struct Counter;
+pub struct Counter {
+    /// Database pool for direct state management.
+    pub pool: PgPool,
+}
 
 /// Request to increment the counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IncrementRequest {
+    /// Entity identifier (used as the DB key).
+    pub entity_id: String,
     /// Amount to increment by.
     pub amount: i64,
 }
@@ -41,57 +40,110 @@ pub struct IncrementRequest {
 /// Request to decrement the counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecrementRequest {
+    /// Entity identifier (used as the DB key).
+    pub entity_id: String,
     /// Amount to decrement by.
     pub amount: i64,
 }
 
+/// Request to get the counter value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetCounterRequest {
+    /// Entity identifier (used as the DB key).
+    pub entity_id: String,
+}
+
+/// Request to reset the counter.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResetCounterRequest {
+    /// Entity identifier (used as the DB key).
+    pub entity_id: String,
+}
+
 #[entity_impl]
-#[state(CounterState)]
 impl Counter {
-    fn init(&self, _ctx: &EntityContext) -> Result<CounterState, ClusterError> {
-        Ok(CounterState::default())
-    }
-
-    #[activity]
-    async fn do_increment(&mut self, amount: i64) -> Result<i64, ClusterError> {
-        self.state.value += amount;
-        Ok(self.state.value)
-    }
-
-    #[activity]
-    async fn do_decrement(&mut self, amount: i64) -> Result<i64, ClusterError> {
-        self.state.value -= amount;
-        Ok(self.state.value)
-    }
-
-    #[activity]
-    async fn do_reset(&mut self) -> Result<(), ClusterError> {
-        self.state.value = 0;
-        Ok(())
-    }
-
     /// Increment the counter by the given amount and return the new value.
-    #[workflow]
+    ///
+    /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
+    #[rpc(persisted)]
     pub async fn increment(&self, request: IncrementRequest) -> Result<i64, ClusterError> {
-        self.do_increment(request.amount).await
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO counter_values (entity_id, value)
+             VALUES ($1, $2)
+             ON CONFLICT (entity_id)
+             DO UPDATE SET value = counter_values.value + $2
+             RETURNING value",
+        )
+        .bind(&request.entity_id)
+        .bind(request.amount)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("increment failed: {e}"),
+            source: None,
+        })?;
+        Ok(row.0)
     }
 
     /// Decrement the counter by the given amount and return the new value.
-    #[workflow]
+    ///
+    /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
+    #[rpc(persisted)]
     pub async fn decrement(&self, request: DecrementRequest) -> Result<i64, ClusterError> {
-        self.do_decrement(request.amount).await
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO counter_values (entity_id, value)
+             VALUES ($1, -$2)
+             ON CONFLICT (entity_id)
+             DO UPDATE SET value = counter_values.value - $2
+             RETURNING value",
+        )
+        .bind(&request.entity_id)
+        .bind(request.amount)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("decrement failed: {e}"),
+            source: None,
+        })?;
+        Ok(row.0)
     }
 
     /// Get the current counter value.
+    ///
+    /// Uses `#[rpc]` (non-persisted) since this is a read-only operation.
     #[rpc]
-    pub async fn get(&self) -> Result<i64, ClusterError> {
-        Ok(self.state.value)
+    pub async fn get(&self, request: GetCounterRequest) -> Result<i64, ClusterError> {
+        let result: Option<(i64,)> =
+            sqlx::query_as("SELECT value FROM counter_values WHERE entity_id = $1")
+                .bind(&request.entity_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| ClusterError::PersistenceError {
+                    reason: format!("get failed: {e}"),
+                    source: None,
+                })?;
+        Ok(result.map(|r| r.0).unwrap_or(0))
     }
 
     /// Reset the counter to zero.
-    #[workflow]
-    pub async fn reset(&self) -> Result<(), ClusterError> {
-        self.do_reset().await
+    ///
+    /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
+    #[rpc(persisted)]
+    pub async fn reset(&self, request: ResetCounterRequest) -> Result<(), ClusterError> {
+        sqlx::query(
+            "INSERT INTO counter_values (entity_id, value)
+             VALUES ($1, 0)
+             ON CONFLICT (entity_id)
+             DO UPDATE SET value = 0",
+        )
+        .bind(&request.entity_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("reset failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
     }
 }
 
@@ -100,16 +152,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_counter_state_serialization() {
-        let state = CounterState { value: 42 };
-        let json = serde_json::to_string(&state).unwrap();
-        let parsed: CounterState = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.value, 42);
+    fn test_increment_request_serialization() {
+        let req = IncrementRequest {
+            entity_id: "counter-1".to_string(),
+            amount: 42,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: IncrementRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "counter-1");
+        assert_eq!(parsed.amount, 42);
     }
 
     #[test]
-    fn test_counter_state_default() {
-        let state = CounterState::default();
-        assert_eq!(state.value, 0);
+    fn test_decrement_request_serialization() {
+        let req = DecrementRequest {
+            entity_id: "counter-1".to_string(),
+            amount: 10,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: DecrementRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "counter-1");
+        assert_eq!(parsed.amount, 10);
+    }
+
+    #[test]
+    fn test_get_request_serialization() {
+        let req = GetCounterRequest {
+            entity_id: "counter-1".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: GetCounterRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "counter-1");
+    }
+
+    #[test]
+    fn test_reset_request_serialization() {
+        let req = ResetCounterRequest {
+            entity_id: "counter-1".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ResetCounterRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "counter-1");
     }
 }

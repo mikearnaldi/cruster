@@ -15,14 +15,14 @@ use std::sync::Arc;
 use crate::entities::{
     ActivityRecord, ActivityTestClient, AuditEntry, CancelTimerRequest, ClearFiresRequest,
     ClearMessagesRequest, CounterClient, CrossEntityClient, DecrementRequest, DeleteRequest,
-    FailingTransferRequest, GetExecutionRequest, GetRequest, GetSqlCountRequest, IncrementRequest,
-    KVStoreClient, Message, PendingTimer, PingRequest, ReceiveRequest, ResetPingCountRequest,
-    RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
-    RunWithActivitiesRequest, ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState,
-    SqlActivityTestClient, SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest,
-    StatelessGetRequest, StatelessIncrementRequest, StatelessResetRequest, TimerFire,
-    TimerTestClient, TraitTestClient, TransferRequest, UpdateRequest, WorkflowExecution,
-    WorkflowTestClient,
+    FailingTransferRequest, GetCounterRequest, GetExecutionRequest, GetRequest, GetSqlCountRequest,
+    IncrementRequest, KVStoreClient, Message, PendingTimer, PingRequest, ReceiveRequest,
+    ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
+    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
+    ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState, SqlActivityTestClient,
+    SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
+    StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
+    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
 };
 // Import trait client extensions to make trait methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
@@ -165,7 +165,15 @@ async fn counter_get(
     Path(id): Path<String>,
 ) -> Result<Json<i64>, AppError> {
     let entity_id = EntityId::new(&id);
-    let value = state.counter_client.get(&entity_id).await?;
+    let value = state
+        .counter_client
+        .get(
+            &entity_id,
+            &GetCounterRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(value))
 }
 
@@ -179,7 +187,13 @@ async fn counter_increment(
     let entity_id = EntityId::new(&id);
     let value = state
         .counter_client
-        .increment(&entity_id, &IncrementRequest { amount })
+        .increment(
+            &entity_id,
+            &IncrementRequest {
+                entity_id: id.clone(),
+                amount,
+            },
+        )
         .await?;
     tracing::info!("counter_increment completed: id={}, value={}", id, value);
     Ok(Json(value))
@@ -194,7 +208,13 @@ async fn counter_decrement(
     let entity_id = EntityId::new(&id);
     let value = state
         .counter_client
-        .decrement(&entity_id, &DecrementRequest { amount })
+        .decrement(
+            &entity_id,
+            &DecrementRequest {
+                entity_id: id.clone(),
+                amount,
+            },
+        )
         .await?;
     Ok(Json(value))
 }
@@ -205,7 +225,15 @@ async fn counter_reset(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    state.counter_client.reset(&entity_id).await?;
+    state
+        .counter_client
+        .reset(
+            &entity_id,
+            &ResetCounterRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(()))
 }
 

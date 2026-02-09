@@ -230,10 +230,12 @@ async fn main() -> Result<()> {
     let sharding = cluster.sharding();
 
     // Register entities and get typed clients
-    let counter_client = Counter
-        .register(sharding.clone())
-        .await
-        .expect("failed to register Counter entity");
+    let counter_client = Counter {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register Counter entity");
     tracing::info!("Registered Counter entity");
 
     let kv_store_client = KVStore

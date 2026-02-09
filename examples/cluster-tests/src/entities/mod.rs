@@ -27,7 +27,10 @@ pub mod workflow_test;
 pub use activity_test::{
     ActivityRecord, ActivityTest, ActivityTestClient, RunWithActivitiesRequest,
 };
-pub use counter::{Counter, CounterClient, DecrementRequest, IncrementRequest};
+pub use counter::{
+    Counter, CounterClient, DecrementRequest, GetCounterRequest, IncrementRequest,
+    ResetCounterRequest,
+};
 pub use cross_entity::{
     ClearMessagesRequest, CrossEntity, CrossEntityClient, Message, PingRequest, ReceiveRequest,
     ResetPingCountRequest,

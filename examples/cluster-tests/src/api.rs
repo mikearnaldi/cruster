@@ -13,18 +13,18 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::entities::{
-    ActivityRecord, ActivityTestClient, AuditEntry, CancelTimerRequest, ClearFiresRequest,
-    ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient, DecrementRequest,
-    DeleteRequest, FailingTransferRequest, FailingWorkflowClient, GetCounterRequest,
-    GetExecutionRequest, GetRequest, GetSqlCountRequest, IncrementRequest, KVStoreClient,
-    ListExecutionsRequest, ListKeysRequest, LongWorkflowClient, Message, PendingTimer, PingRequest,
-    ReceiveRequest, ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
-    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
-    ScheduleTimerRequest, SetRequest, SimpleWorkflowClient, SingletonManager, SingletonState,
-    SqlActivityTestClient, SqlActivityTestState, StatelessCounterClient,
-    StatelessDecrementRequest, StatelessGetRequest, StatelessIncrementRequest,
-    StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient, TransferRequest,
-    UpdateRequest, WorkflowExecution, WorkflowTestClient,
+    ActivityRecord, ActivityTestClient, ActivityWorkflowClient, AuditEntry, CancelTimerRequest,
+    ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient,
+    DecrementRequest, DeleteRequest, FailingTransferRequest, FailingWorkflowClient,
+    GetActivityLogRequest, GetCounterRequest, GetExecutionRequest, GetRequest, GetSqlCountRequest,
+    IncrementRequest, KVStoreClient, ListExecutionsRequest, ListKeysRequest, LongWorkflowClient,
+    Message, PendingTimer, PingRequest, ReceiveRequest, ResetCounterRequest,
+    ResetPingCountRequest, RunFailingWorkflowRequest, RunLongWorkflowRequest,
+    RunSimpleWorkflowRequest, RunWithActivitiesRequest, ScheduleTimerRequest, SetRequest,
+    SimpleWorkflowClient, SingletonManager, SingletonState, SqlActivityTestClient,
+    SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
+    StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
+    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
 };
 // Import trait client extensions to make trait methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
@@ -43,8 +43,10 @@ pub struct AppState {
     pub failing_workflow_client: FailingWorkflowClient,
     /// LongWorkflow client (standalone workflow).
     pub long_workflow_client: LongWorkflowClient,
-    /// ActivityTest entity client.
+    /// ActivityTest entity client (for read queries).
     pub activity_test_client: ActivityTestClient,
+    /// ActivityWorkflow client (standalone workflow).
+    pub activity_workflow_client: ActivityWorkflowClient,
     /// TraitTest entity client.
     pub trait_test_client: TraitTestClient,
     /// TimerTest entity client.
@@ -486,15 +488,12 @@ async fn activity_run(
     Path(id): Path<String>,
     Json(body): Json<ActivityRunBody>,
 ) -> Result<Json<Vec<String>>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .activity_test_client
-        .run_with_activities(
-            &entity_id,
-            &RunWithActivitiesRequest {
-                exec_id: body.exec_id,
-            },
-        )
+        .activity_workflow_client
+        .execute(&RunWithActivitiesRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -507,7 +506,12 @@ async fn activity_get_log(
     let entity_id = EntityId::new(&id);
     let log = state
         .activity_test_client
-        .get_activity_log(&entity_id)
+        .get_activity_log(
+            &entity_id,
+            &GetActivityLogRequest {
+                entity_id: id,
+            },
+        )
         .await?;
     Ok(Json(log))
 }

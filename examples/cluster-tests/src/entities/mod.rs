@@ -25,7 +25,8 @@ pub mod trait_test;
 pub mod workflow_test;
 
 pub use activity_test::{
-    ActivityRecord, ActivityTest, ActivityTestClient, RunWithActivitiesRequest,
+    ActivityRecord, ActivityTest, ActivityTestClient, ActivityWorkflow, ActivityWorkflowClient,
+    GetActivityLogRequest, RunWithActivitiesRequest,
 };
 pub use counter::{
     Counter, CounterClient, DecrementRequest, GetCounterRequest, IncrementRequest,

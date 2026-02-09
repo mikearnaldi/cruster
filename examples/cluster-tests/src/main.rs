@@ -34,9 +34,9 @@ mod entities;
 
 use api::{create_router, AppState};
 use entities::{
-    ActivityTest, Auditable, Counter, CrossEntity, FailingWorkflow, KVStore, LongWorkflow,
-    SimpleWorkflow, SingletonManager, SqlActivityTest, StatelessCounter, TimerTest, TraitTest,
-    Versioned, WorkflowTest,
+    ActivityTest, ActivityWorkflow, Auditable, Counter, CrossEntity, FailingWorkflow, KVStore,
+    LongWorkflow, SimpleWorkflow, SingletonManager, SqlActivityTest, StatelessCounter, TimerTest,
+    TraitTest, Versioned, WorkflowTest,
 };
 
 /// Parse a "host:port" string into a RunnerAddress.
@@ -279,11 +279,21 @@ async fn main() -> Result<()> {
     .expect("failed to register LongWorkflow");
     tracing::info!("Registered LongWorkflow");
 
-    let activity_test_client = ActivityTest
-        .register(sharding.clone())
-        .await
-        .expect("failed to register ActivityTest entity");
+    let activity_test_client = ActivityTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register ActivityTest entity");
     tracing::info!("Registered ActivityTest entity");
+
+    let activity_workflow_client = ActivityWorkflow {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register ActivityWorkflow");
+    tracing::info!("Registered ActivityWorkflow");
 
     let trait_test_client = TraitTest
         .register(sharding.clone(), Auditable, Versioned)
@@ -343,6 +353,7 @@ async fn main() -> Result<()> {
         failing_workflow_client,
         long_workflow_client,
         activity_test_client,
+        activity_workflow_client,
         trait_test_client,
         timer_test_client,
         cross_entity_client,
@@ -360,6 +371,7 @@ async fn main() -> Result<()> {
             "Workflow/FailingWorkflow".to_string(),
             "Workflow/LongWorkflow".to_string(),
             "ActivityTest".to_string(),
+            "Workflow/ActivityWorkflow".to_string(),
             "TraitTest".to_string(),
             "TimerTest".to_string(),
             "CrossEntity".to_string(),

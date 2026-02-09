@@ -1,15 +1,18 @@
 //! Entity definitions for the chess cluster.
 //!
+//! All entities use the pure-RPC pattern: no framework-managed state, no workflows,
+//! no activities. State is held directly via `Arc<Mutex<...>>`.
+//!
 //! ## Entities
 //!
-//! - `PlayerSession` - In-memory state tracking connected players
-//! - `ChessGame` - Persisted game state with durable workflows
-//! - `MatchmakingService` - Stateless service for pairing players
+//! - `PlayerSession` - Ephemeral session state tracking connected players
+//! - `ChessGame` - Ephemeral game state with move validation
+//! - `MatchmakingService` - Ephemeral queue for pairing players
 //! - `Leaderboard` - Singleton for global rankings
 //!
-//! ## Traits
+//! ## RPC Groups
 //!
-//! - `Auditable` - Shared audit logging capability
+//! - `Auditable` - Shared audit logging capability (`#[rpc_group]`, composable into entities)
 
 pub mod chess_game;
 pub mod leaderboard;
@@ -34,6 +37,7 @@ pub use matchmaking::{
 };
 pub use player_session::{
     ConnectRequest, ConnectResponse, GameEvent, GameEventResult, MatchFoundNotification,
-    PlayerSession, PlayerSessionClient, PlayerSessionError, PlayerSessionState, StatusResponse,
+    NotifyGameEventRequest, PlayerSession, PlayerSessionClient, PlayerSessionError,
+    PlayerSessionState, StatusResponse,
 };
 pub use traits::{AuditEntry, AuditLog, Auditable, GetAuditLogRequest, GetAuditLogResponse};

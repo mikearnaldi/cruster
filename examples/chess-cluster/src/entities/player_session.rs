@@ -2,8 +2,13 @@
 //!
 //! This is an in-memory entity that maintains state only while the player is connected.
 //! State is lost on restart, which is appropriate since it tracks ephemeral connection state.
+//!
+//! Uses the pure-RPC entity pattern: no framework-managed state, no workflows,
+//! no activities. State is held directly via `Arc<Mutex<HashMap<...>>>`.
 
-use cruster::entity::EntityContext;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -26,24 +31,53 @@ pub struct PlayerSessionState {
 
 /// PlayerSession entity tracks a connected player's state.
 ///
-/// ## State
-/// - player_id, username, current_game_id, status, connected_at, last_activity
+/// ## Pure-RPC Design
+/// This entity maintains ephemeral session state via `Arc<Mutex<HashMap<String, PlayerSessionState>>>`.
+/// Each player is keyed by their player_id string. State is not persisted by the framework
+/// — on restart, players need to reconnect.
 ///
-/// ## RPCs
-/// - `connect(username)` - Initialize session
-/// - `join_matchmaking_queue()` - Enter queue
-/// - `leave_queue()` - Exit queue
-/// - `get_status()` - Return current state
-/// - `resign_game()` - Resign current game
+/// ## RPCs (persisted, at-least-once)
+/// - `connect(request)` - Initialize session
+/// - `disconnect(player_id)` - End session
+/// - `join_matchmaking_queue(player_id)` - Enter queue
+/// - `leave_queue(player_id)` - Exit queue
+/// - `resign_game(player_id)` - Resign current game
 /// - `notify_game_event(event)` - Called by ChessGame to push events
-/// - `notify_match_found(game_id, color)` - Called by Matchmaking when paired
+/// - `notify_match_found(notification)` - Called by Matchmaking when paired
+/// - `heartbeat(player_id)` - Update last activity
+///
+/// ## RPCs (non-persisted)
+/// - `get_status(player_id)` - Return current state
+/// - `get_current_game(player_id)` - Return current game ID
 #[entity(max_idle_time_secs = 60)]
 #[derive(Clone)]
-pub struct PlayerSession;
+pub struct PlayerSession {
+    /// In-memory ephemeral state, shared across all entity instances.
+    /// Maps player_id string to session state.
+    sessions: Arc<Mutex<HashMap<String, PlayerSessionState>>>,
+}
+
+impl PlayerSession {
+    /// Create a new PlayerSession entity with empty state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl Default for PlayerSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Request to connect a player session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectRequest {
+    /// The player ID for this session.
+    pub player_id: PlayerId,
     /// Display username for the player.
     pub username: String,
 }
@@ -124,12 +158,23 @@ pub enum GameEventResult {
 /// Notification that a match was found.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MatchFoundNotification {
+    /// The player ID for this notification.
+    pub player_id: PlayerId,
     /// The game ID for the new game.
     pub game_id: GameId,
     /// Your assigned color.
     pub color: Color,
     /// The opponent's player ID.
     pub opponent_id: PlayerId,
+}
+
+/// Request to notify a player of a game event.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NotifyGameEventRequest {
+    /// The player ID.
+    pub player_id: PlayerId,
+    /// The game event.
+    pub event: GameEvent,
 }
 
 /// Error types specific to player session operations.
@@ -168,37 +213,30 @@ impl From<PlayerSessionError> for ClusterError {
 }
 
 #[entity_impl]
-#[state(PlayerSessionState)]
 impl PlayerSession {
-    fn init(&self, ctx: &EntityContext) -> Result<PlayerSessionState, ClusterError> {
-        // Parse the entity ID as a player ID
-        let player_id: PlayerId =
-            ctx.address
-                .entity_id
-                .as_ref()
-                .parse()
-                .map_err(|e| ClusterError::MalformedMessage {
-                    reason: format!("invalid player ID: {e}"),
-                    source: None,
-                })?;
-
-        Ok(PlayerSessionState {
-            player_id,
-            info: None,
-        })
-    }
-
     /// Connect a player session with the given username.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn connect(&self, request: ConnectRequest) -> Result<ConnectResponse, ClusterError> {
-        // Validation (deterministic)
-        if self.state.info.is_some() {
-            return Err(PlayerSessionError::AlreadyConnected.into());
-        }
-        let player_id = self.state.player_id;
+        let mut sessions = self.sessions.lock().unwrap();
+        let player_id = request.player_id;
+        let key = player_id.to_string();
 
-        // State mutation via activity
-        self.do_connect(player_id, request.username.clone()).await?;
+        // Check if already connected
+        if let Some(state) = sessions.get(&key) {
+            if state.info.is_some() {
+                return Err(PlayerSessionError::AlreadyConnected.into());
+            }
+        }
+
+        // Create session with connected info
+        let info = PlayerInfo::new(player_id, request.username.clone());
+        sessions.insert(
+            key,
+            PlayerSessionState {
+                player_id,
+                info: Some(info),
+            },
+        );
 
         Ok(ConnectResponse {
             player_id,
@@ -207,53 +245,53 @@ impl PlayerSession {
         })
     }
 
-    #[activity]
-    async fn do_connect(
-        &mut self,
-        player_id: PlayerId,
-        username: String,
-    ) -> Result<(), ClusterError> {
-        let info = PlayerInfo::new(player_id, username);
-        self.state.info = Some(info);
-        Ok(())
-    }
-
     /// Disconnect the player session.
-    #[workflow]
-    pub async fn disconnect(&self) -> Result<(), ClusterError> {
-        self.do_disconnect().await
-    }
+    #[rpc(persisted)]
+    pub async fn disconnect(&self, player_id: PlayerId) -> Result<(), ClusterError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = player_id.to_string();
 
-    #[activity]
-    async fn do_disconnect(&mut self) -> Result<(), ClusterError> {
-        if let Some(info) = &mut self.state.info {
-            info.status = PlayerStatus::Offline;
+        if let Some(state) = sessions.get_mut(&key) {
+            if let Some(info) = &mut state.info {
+                info.status = PlayerStatus::Offline;
+            }
         }
         Ok(())
     }
 
     /// Get the current status of the player session.
     #[rpc]
-    pub async fn get_status(&self) -> Result<StatusResponse, ClusterError> {
-        Ok(StatusResponse {
-            connected: self
-                .state
-                .info
-                .as_ref()
-                .is_some_and(|i| i.status.is_connected()),
-            info: self.state.info.clone(),
-        })
+    pub async fn get_status(&self, player_id: PlayerId) -> Result<StatusResponse, ClusterError> {
+        let sessions = self.sessions.lock().unwrap();
+        let key = player_id.to_string();
+
+        match sessions.get(&key) {
+            Some(state) => Ok(StatusResponse {
+                connected: state
+                    .info
+                    .as_ref()
+                    .is_some_and(|i| i.status.is_connected()),
+                info: state.info.clone(),
+            }),
+            None => Ok(StatusResponse {
+                connected: false,
+                info: None,
+            }),
+        }
     }
 
     /// Join the matchmaking queue.
-    #[workflow]
-    pub async fn join_matchmaking_queue(&self) -> Result<u32, ClusterError> {
-        // Validation (deterministic)
-        let info = self
-            .state
-            .info
-            .as_ref()
-            .ok_or(PlayerSessionError::NotConnected)?;
+    #[rpc(persisted)]
+    pub async fn join_matchmaking_queue(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<u32, ClusterError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = player_id.to_string();
+
+        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
+        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+
         if !info.status.can_join_queue() {
             return Err(PlayerSessionError::CannotJoinQueue {
                 status: info.status,
@@ -261,103 +299,58 @@ impl PlayerSession {
             .into());
         }
 
-        // State mutation via activity
-        self.do_join_queue().await?;
+        info.status = PlayerStatus::InQueue;
+        info.touch();
         Ok(1) // Placeholder queue position
     }
 
-    #[activity]
-    async fn do_join_queue(&mut self) -> Result<(), ClusterError> {
-        let info = self
-            .state
-            .info
-            .as_mut()
-            .ok_or(PlayerSessionError::NotConnected)?;
-        info.status = PlayerStatus::InQueue;
-        info.touch();
-        Ok(())
-    }
-
     /// Leave the matchmaking queue.
-    #[workflow]
-    pub async fn leave_queue(&self) -> Result<(), ClusterError> {
-        // Validation (deterministic)
-        let info = self
-            .state
-            .info
-            .as_ref()
-            .ok_or(PlayerSessionError::NotConnected)?;
+    #[rpc(persisted)]
+    pub async fn leave_queue(&self, player_id: PlayerId) -> Result<(), ClusterError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = player_id.to_string();
+
+        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
+        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+
         if info.status != PlayerStatus::InQueue {
             return Err(PlayerSessionError::NotInQueue.into());
         }
 
-        // State mutation via activity
-        self.do_leave_queue().await
-    }
-
-    #[activity]
-    async fn do_leave_queue(&mut self) -> Result<(), ClusterError> {
-        let info = self
-            .state
-            .info
-            .as_mut()
-            .ok_or(PlayerSessionError::NotConnected)?;
         info.status = PlayerStatus::Online;
         info.touch();
         Ok(())
     }
 
     /// Resign from the current game.
-    #[workflow]
-    pub async fn resign_game(&self) -> Result<GameId, ClusterError> {
-        // Validation (deterministic)
-        let game_id = self
-            .state
-            .info
-            .as_ref()
-            .ok_or(PlayerSessionError::NotConnected)?
-            .current_game_id
-            .ok_or(PlayerSessionError::NotInGame)?;
+    #[rpc(persisted)]
+    pub async fn resign_game(&self, player_id: PlayerId) -> Result<GameId, ClusterError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = player_id.to_string();
 
-        // State mutation via activity
-        self.do_resign_game().await?;
-        Ok(game_id)
-    }
+        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
+        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
 
-    #[activity]
-    async fn do_resign_game(&mut self) -> Result<(), ClusterError> {
-        let info = self
-            .state
-            .info
-            .as_mut()
-            .ok_or(PlayerSessionError::NotConnected)?;
+        let game_id = info.current_game_id.ok_or(PlayerSessionError::NotInGame)?;
         info.current_game_id = None;
         info.status = PlayerStatus::Online;
         info.touch();
-        Ok(())
+        Ok(game_id)
     }
 
     /// Notify this player of a game event.
-    #[workflow]
-    pub async fn notify_game_event(&self, event: GameEvent) -> Result<(), ClusterError> {
-        // Validation (deterministic)
-        if self.state.info.is_none() {
-            return Err(PlayerSessionError::NotConnected.into());
-        }
+    #[rpc(persisted)]
+    pub async fn notify_game_event(
+        &self,
+        request: NotifyGameEventRequest,
+    ) -> Result<(), ClusterError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = request.player_id.to_string();
 
-        // State mutation via activity
-        self.do_notify_game_event(event).await
-    }
+        let state = sessions.get_mut(&key).ok_or(PlayerSessionError::NotConnected)?;
+        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
 
-    #[activity]
-    async fn do_notify_game_event(&mut self, event: GameEvent) -> Result<(), ClusterError> {
-        let info = self
-            .state
-            .info
-            .as_mut()
-            .ok_or(PlayerSessionError::NotConnected)?;
-
-        match &event {
+        match &request.event {
             GameEvent::GameStarted { game_id, .. } => {
                 info.current_game_id = Some(*game_id);
                 info.status = PlayerStatus::InGame;
@@ -373,28 +366,20 @@ impl PlayerSession {
     }
 
     /// Notify this player that a match was found.
-    #[workflow]
+    #[rpc(persisted)]
     pub async fn notify_match_found(
         &self,
         notification: MatchFoundNotification,
     ) -> Result<(), ClusterError> {
-        // Validation (deterministic)
-        if self.state.info.is_none() {
-            return Err(PlayerSessionError::NotConnected.into());
-        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = notification.player_id.to_string();
 
-        // State mutation via activity
-        self.do_notify_match_found(notification.game_id).await
-    }
-
-    #[activity]
-    async fn do_notify_match_found(&mut self, game_id: GameId) -> Result<(), ClusterError> {
-        let info = self
-            .state
-            .info
-            .as_mut()
+        let state = sessions
+            .get_mut(&key)
             .ok_or(PlayerSessionError::NotConnected)?;
-        info.current_game_id = Some(game_id);
+        let info = state.info.as_mut().ok_or(PlayerSessionError::NotConnected)?;
+
+        info.current_game_id = Some(notification.game_id);
         info.status = PlayerStatus::InGame;
         info.touch();
         Ok(())
@@ -402,20 +387,29 @@ impl PlayerSession {
 
     /// Get the player's current game ID, if any.
     #[rpc]
-    pub async fn get_current_game(&self) -> Result<Option<GameId>, ClusterError> {
-        Ok(self.state.info.as_ref().and_then(|i| i.current_game_id))
+    pub async fn get_current_game(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Option<GameId>, ClusterError> {
+        let sessions = self.sessions.lock().unwrap();
+        let key = player_id.to_string();
+
+        Ok(sessions
+            .get(&key)
+            .and_then(|s| s.info.as_ref())
+            .and_then(|i| i.current_game_id))
     }
 
     /// Update the last activity timestamp.
-    #[workflow]
-    pub async fn heartbeat(&self) -> Result<(), ClusterError> {
-        self.do_heartbeat().await
-    }
+    #[rpc(persisted)]
+    pub async fn heartbeat(&self, player_id: PlayerId) -> Result<(), ClusterError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let key = player_id.to_string();
 
-    #[activity]
-    async fn do_heartbeat(&mut self) -> Result<(), ClusterError> {
-        if let Some(info) = &mut self.state.info {
-            info.touch();
+        if let Some(state) = sessions.get_mut(&key) {
+            if let Some(info) = &mut state.info {
+                info.touch();
+            }
         }
         Ok(())
     }

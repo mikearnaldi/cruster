@@ -15,7 +15,8 @@ use chess_cluster::entities::{
     CancelSearchRequest, ChessGame, ChessGameClient, ConnectRequest, CreateGameRequest,
     FindMatchRequest, FindMatchResponse, GameEvent, GameEventResult, GetTopPlayersRequest,
     Leaderboard, LeaderboardClient, MakeMoveRequest, MatchFoundNotification, MatchPreferences,
-    MatchmakingService, PlayerSession, RecordGameResultRequest, ResignRequest,
+    MatchmakingService, NotifyGameEventRequest, PlayerSession, RecordGameResultRequest,
+    ResignRequest,
 };
 use chess_cluster::types::{
     Color, GameId, GameResult, GameResultInfo, GameStatus, PlayerId, PlayerStatus, TimeControl,
@@ -373,7 +374,10 @@ async fn test_leaderboard_aborted_game_rejected() {
 async fn test_full_matchmaking_to_game_flow() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
-    let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
+    let session_client = PlayerSession::new()
+        .register(Arc::clone(&sharding))
+        .await
+        .unwrap();
     let mm_client = MatchmakingService::new()
         .register(Arc::clone(&sharding))
         .await
@@ -391,6 +395,7 @@ async fn test_full_matchmaking_to_game_flow() {
         .connect(
             &player1_session,
             &ConnectRequest {
+                player_id: player1_id,
                 username: "player1".to_string(),
             },
         )
@@ -401,6 +406,7 @@ async fn test_full_matchmaking_to_game_flow() {
         .connect(
             &player2_session,
             &ConnectRequest {
+                player_id: player2_id,
                 username: "player2".to_string(),
             },
         )
@@ -464,6 +470,7 @@ async fn test_full_matchmaking_to_game_flow() {
         .notify_match_found(
             &EntityId::new(white_id.to_string()),
             &MatchFoundNotification {
+                player_id: white_id,
                 game_id,
                 color: Color::White,
                 opponent_id: black_id,
@@ -476,6 +483,7 @@ async fn test_full_matchmaking_to_game_flow() {
         .notify_match_found(
             &EntityId::new(black_id.to_string()),
             &MatchFoundNotification {
+                player_id: black_id,
                 game_id,
                 color: Color::Black,
                 opponent_id: white_id,
@@ -485,7 +493,7 @@ async fn test_full_matchmaking_to_game_flow() {
         .unwrap();
 
     let white_status = session_client
-        .get_status(&EntityId::new(white_id.to_string()))
+        .get_status(&EntityId::new(white_id.to_string()), &white_id)
         .await
         .unwrap();
     assert_eq!(
@@ -498,7 +506,7 @@ async fn test_full_matchmaking_to_game_flow() {
     );
 
     let black_status = session_client
-        .get_status(&EntityId::new(black_id.to_string()))
+        .get_status(&EntityId::new(black_id.to_string()), &black_id)
         .await
         .unwrap();
     assert_eq!(
@@ -792,7 +800,10 @@ async fn test_multiple_games_update_rankings() {
 async fn test_player_session_game_lifecycle() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
-    let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
+    let session_client = PlayerSession::new()
+        .register(Arc::clone(&sharding))
+        .await
+        .unwrap();
     let game_client = ChessGame::new().register(sharding).await.unwrap();
 
     let white_id = PlayerId::new();
@@ -807,6 +818,7 @@ async fn test_player_session_game_lifecycle() {
         .connect(
             &white_session,
             &ConnectRequest {
+                player_id: white_id,
                 username: "white_player".to_string(),
             },
         )
@@ -817,13 +829,17 @@ async fn test_player_session_game_lifecycle() {
         .connect(
             &black_session,
             &ConnectRequest {
+                player_id: black_id,
                 username: "black_player".to_string(),
             },
         )
         .await
         .unwrap();
 
-    let status = session_client.get_status(&white_session).await.unwrap();
+    let status = session_client
+        .get_status(&white_session, &white_id)
+        .await
+        .unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::Online);
 
     game_client
@@ -842,10 +858,13 @@ async fn test_player_session_game_lifecycle() {
     session_client
         .notify_game_event(
             &white_session,
-            &GameEvent::GameStarted {
-                game_id,
-                opponent: black_id,
-                your_color: Color::White,
+            &NotifyGameEventRequest {
+                player_id: white_id,
+                event: GameEvent::GameStarted {
+                    game_id,
+                    opponent: black_id,
+                    your_color: Color::White,
+                },
             },
         )
         .await
@@ -854,16 +873,22 @@ async fn test_player_session_game_lifecycle() {
     session_client
         .notify_game_event(
             &black_session,
-            &GameEvent::GameStarted {
-                game_id,
-                opponent: white_id,
-                your_color: Color::Black,
+            &NotifyGameEventRequest {
+                player_id: black_id,
+                event: GameEvent::GameStarted {
+                    game_id,
+                    opponent: white_id,
+                    your_color: Color::Black,
+                },
             },
         )
         .await
         .unwrap();
 
-    let status = session_client.get_status(&white_session).await.unwrap();
+    let status = session_client
+        .get_status(&white_session, &white_id)
+        .await
+        .unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::InGame);
     assert_eq!(status.info.as_ref().unwrap().current_game_id, Some(game_id));
 
@@ -906,10 +931,13 @@ async fn test_player_session_game_lifecycle() {
     session_client
         .notify_game_event(
             &white_session,
-            &GameEvent::GameEnded {
-                game_id,
-                result: GameEventResult::Won,
-                reason: "resignation".to_string(),
+            &NotifyGameEventRequest {
+                player_id: white_id,
+                event: GameEvent::GameEnded {
+                    game_id,
+                    result: GameEventResult::Won,
+                    reason: "resignation".to_string(),
+                },
             },
         )
         .await
@@ -918,20 +946,29 @@ async fn test_player_session_game_lifecycle() {
     session_client
         .notify_game_event(
             &black_session,
-            &GameEvent::GameEnded {
-                game_id,
-                result: GameEventResult::Lost,
-                reason: "resignation".to_string(),
+            &NotifyGameEventRequest {
+                player_id: black_id,
+                event: GameEvent::GameEnded {
+                    game_id,
+                    result: GameEventResult::Lost,
+                    reason: "resignation".to_string(),
+                },
             },
         )
         .await
         .unwrap();
 
-    let status = session_client.get_status(&white_session).await.unwrap();
+    let status = session_client
+        .get_status(&white_session, &white_id)
+        .await
+        .unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::Online);
     assert_eq!(status.info.as_ref().unwrap().current_game_id, None);
 
-    let status = session_client.get_status(&black_session).await.unwrap();
+    let status = session_client
+        .get_status(&black_session, &black_id)
+        .await
+        .unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::Online);
 
     cluster.shutdown().await.unwrap();

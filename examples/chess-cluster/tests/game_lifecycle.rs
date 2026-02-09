@@ -640,7 +640,7 @@ async fn test_game_abort_early() {
 #[tokio::test]
 async fn test_player_connect() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = PlayerSession
+    let client = PlayerSession::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -652,6 +652,7 @@ async fn test_player_connect() {
         .connect(
             &entity_id,
             &ConnectRequest {
+                player_id,
                 username: "alice".to_string(),
             },
         )
@@ -667,7 +668,7 @@ async fn test_player_connect() {
 #[tokio::test]
 async fn test_player_get_status() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = PlayerSession
+    let client = PlayerSession::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -679,13 +680,14 @@ async fn test_player_get_status() {
         .connect(
             &entity_id,
             &ConnectRequest {
+                player_id,
                 username: "bob".to_string(),
             },
         )
         .await
         .unwrap();
 
-    let status = client.get_status(&entity_id).await.unwrap();
+    let status = client.get_status(&entity_id, &player_id).await.unwrap();
 
     assert!(status.connected);
     assert!(status.info.is_some());
@@ -697,7 +699,7 @@ async fn test_player_get_status() {
 #[tokio::test]
 async fn test_player_join_and_leave_queue() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = PlayerSession
+    let client = PlayerSession::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -709,22 +711,26 @@ async fn test_player_join_and_leave_queue() {
         .connect(
             &entity_id,
             &ConnectRequest {
+                player_id,
                 username: "charlie".to_string(),
             },
         )
         .await
         .unwrap();
 
-    let position = client.join_matchmaking_queue(&entity_id).await.unwrap();
+    let position = client
+        .join_matchmaking_queue(&entity_id, &player_id)
+        .await
+        .unwrap();
     assert_eq!(position, 1);
 
-    let status = client.get_status(&entity_id).await.unwrap();
+    let status = client.get_status(&entity_id, &player_id).await.unwrap();
     assert!(status.info.is_some());
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::InQueue);
 
-    client.leave_queue(&entity_id).await.unwrap();
+    client.leave_queue(&entity_id, &player_id).await.unwrap();
 
-    let status = client.get_status(&entity_id).await.unwrap();
+    let status = client.get_status(&entity_id, &player_id).await.unwrap();
     assert_eq!(status.info.as_ref().unwrap().status, PlayerStatus::Online);
 
     cluster.shutdown().await.unwrap();
@@ -734,7 +740,10 @@ async fn test_player_join_and_leave_queue() {
 async fn test_player_cannot_join_queue_while_in_game() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
-    let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
+    let session_client = PlayerSession::new()
+        .register(Arc::clone(&sharding))
+        .await
+        .unwrap();
     let game_client = ChessGame::new().register(sharding).await.unwrap();
 
     let player_id = PlayerId::new();
@@ -747,6 +756,7 @@ async fn test_player_cannot_join_queue_while_in_game() {
         .connect(
             &session_entity_id,
             &ConnectRequest {
+                player_id,
                 username: "dave".to_string(),
             },
         )
@@ -770,6 +780,7 @@ async fn test_player_cannot_join_queue_while_in_game() {
         .notify_match_found(
             &session_entity_id,
             &MatchFoundNotification {
+                player_id,
                 game_id,
                 color: Color::White,
                 opponent_id,
@@ -779,7 +790,7 @@ async fn test_player_cannot_join_queue_while_in_game() {
         .unwrap();
 
     let result = session_client
-        .join_matchmaking_queue(&session_entity_id)
+        .join_matchmaking_queue(&session_entity_id, &player_id)
         .await;
 
     assert!(result.is_err());
@@ -790,7 +801,7 @@ async fn test_player_cannot_join_queue_while_in_game() {
 #[tokio::test]
 async fn test_player_disconnect() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = PlayerSession
+    let client = PlayerSession::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -802,15 +813,16 @@ async fn test_player_disconnect() {
         .connect(
             &entity_id,
             &ConnectRequest {
+                player_id,
                 username: "eve".to_string(),
             },
         )
         .await
         .unwrap();
 
-    client.disconnect(&entity_id).await.unwrap();
+    client.disconnect(&entity_id, &player_id).await.unwrap();
 
-    let status = client.get_status(&entity_id).await.unwrap();
+    let status = client.get_status(&entity_id, &player_id).await.unwrap();
     assert!(!status.connected);
 
     cluster.shutdown().await.unwrap();
@@ -819,7 +831,7 @@ async fn test_player_disconnect() {
 #[tokio::test]
 async fn test_player_heartbeat() {
     let cluster = TestCluster::with_workflow_support().await;
-    let client = PlayerSession
+    let client = PlayerSession::new()
         .register(cluster.sharding().clone())
         .await
         .unwrap();
@@ -831,15 +843,16 @@ async fn test_player_heartbeat() {
         .connect(
             &entity_id,
             &ConnectRequest {
+                player_id,
                 username: "frank".to_string(),
             },
         )
         .await
         .unwrap();
 
-    client.heartbeat(&entity_id).await.unwrap();
+    client.heartbeat(&entity_id, &player_id).await.unwrap();
 
-    let status = client.get_status(&entity_id).await.unwrap();
+    let status = client.get_status(&entity_id, &player_id).await.unwrap();
     assert!(status.connected);
 
     cluster.shutdown().await.unwrap();
@@ -853,7 +866,10 @@ async fn test_player_heartbeat() {
 async fn test_game_notifies_player_session() {
     let cluster = TestCluster::with_workflow_support().await;
     let sharding: Arc<dyn Sharding> = cluster.sharding().clone();
-    let session_client = PlayerSession.register(Arc::clone(&sharding)).await.unwrap();
+    let session_client = PlayerSession::new()
+        .register(Arc::clone(&sharding))
+        .await
+        .unwrap();
     let game_client = ChessGame::new().register(sharding).await.unwrap();
 
     let white_id = PlayerId::new();
@@ -868,6 +884,7 @@ async fn test_game_notifies_player_session() {
         .connect(
             &white_session,
             &ConnectRequest {
+                player_id: white_id,
                 username: "white_player".to_string(),
             },
         )
@@ -878,6 +895,7 @@ async fn test_game_notifies_player_session() {
         .connect(
             &black_session,
             &ConnectRequest {
+                player_id: black_id,
                 username: "black_player".to_string(),
             },
         )
@@ -897,15 +915,18 @@ async fn test_game_notifies_player_session() {
         .await
         .unwrap();
 
-    use chess_cluster::entities::GameEvent;
+    use chess_cluster::entities::{GameEvent, NotifyGameEventRequest};
 
     session_client
         .notify_game_event(
             &white_session,
-            &GameEvent::GameStarted {
-                game_id,
-                opponent: black_id,
-                your_color: Color::White,
+            &NotifyGameEventRequest {
+                player_id: white_id,
+                event: GameEvent::GameStarted {
+                    game_id,
+                    opponent: black_id,
+                    your_color: Color::White,
+                },
             },
         )
         .await
@@ -914,16 +935,22 @@ async fn test_game_notifies_player_session() {
     session_client
         .notify_game_event(
             &black_session,
-            &GameEvent::GameStarted {
-                game_id,
-                opponent: white_id,
-                your_color: Color::Black,
+            &NotifyGameEventRequest {
+                player_id: black_id,
+                event: GameEvent::GameStarted {
+                    game_id,
+                    opponent: white_id,
+                    your_color: Color::Black,
+                },
             },
         )
         .await
         .unwrap();
 
-    let white_status = session_client.get_status(&white_session).await.unwrap();
+    let white_status = session_client
+        .get_status(&white_session, &white_id)
+        .await
+        .unwrap();
     assert_eq!(
         white_status.info.as_ref().unwrap().status,
         PlayerStatus::InGame
@@ -933,7 +960,10 @@ async fn test_game_notifies_player_session() {
         Some(game_id)
     );
 
-    let black_status = session_client.get_status(&black_session).await.unwrap();
+    let black_status = session_client
+        .get_status(&black_session, &black_id)
+        .await
+        .unwrap();
     assert_eq!(
         black_status.info.as_ref().unwrap().status,
         PlayerStatus::InGame

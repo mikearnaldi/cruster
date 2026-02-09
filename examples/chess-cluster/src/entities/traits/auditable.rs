@@ -1,11 +1,12 @@
-//! Auditable entity trait - shared audit logging capability for entities.
+//! Auditable RPC group - shared audit logging capability for entities.
 //!
-//! This trait provides a composable audit logging capability that can be
-//! added to entities that need audit trails. When an entity uses this trait
-//! via `#[entity_impl(traits(Auditable))]`, it gains audit logging methods
-//! like `log_player_action` that can be called directly on `self`.
+//! This RPC group provides a composable audit logging capability that can be
+//! added to entities that need audit trails. When an entity uses this group
+//! via `#[entity_impl(rpc_groups(Auditable))]`, it gains audit logging RPCs
+//! like `log_player_action` that can be called on the entity's client.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use cruster::error::ClusterError;
@@ -53,7 +54,7 @@ impl AuditEntry {
     }
 }
 
-/// The audit log state for the Auditable trait.
+/// The audit log state for the Auditable RPC group.
 ///
 /// This is a bounded deque of audit entries that automatically
 /// trims old entries when the max size is exceeded.
@@ -200,91 +201,86 @@ pub struct GetAuditLogResponse {
     pub total_entries: usize,
 }
 
-/// Auditable entity trait - provides audit logging capability.
+/// Auditable RPC group - provides audit logging capability.
 ///
-/// This trait can be composed with entities using `#[entity_impl(traits(Auditable))]`.
-/// The entity then gains access to audit logging methods via `self.log_player_action()`,
-/// `self.log_system_action()`, and `self.get_audit_log()`.
+/// This group can be composed with entities using `#[entity_impl(rpc_groups(Auditable))]`.
+/// The entity's client then gains audit logging RPCs: `log_player_action`,
+/// `log_system_action`, `get_audit_log`, `get_audit_log_by_actor`, and
+/// `get_audit_log_by_action`.
 ///
-/// The audit log state is persisted alongside the entity state.
-#[entity_trait]
+/// State is ephemeral, held in an `Arc<Mutex<AuditLog>>` — same pattern as
+/// other chess-cluster entities.
+#[rpc_group]
 #[derive(Clone)]
 pub struct Auditable {
     /// Maximum number of entries to retain (configurable per-entity).
     pub max_entries: usize,
+    /// Ephemeral audit log state.
+    pub log: Arc<Mutex<AuditLog>>,
 }
 
 impl Default for Auditable {
     fn default() -> Self {
+        let max_entries = AuditLog::DEFAULT_MAX_ENTRIES;
         Self {
-            max_entries: AuditLog::DEFAULT_MAX_ENTRIES,
+            max_entries,
+            log: Arc::new(Mutex::new(AuditLog::with_max_entries(max_entries))),
         }
     }
 }
 
 impl Auditable {
-    /// Create a new Auditable trait with default settings.
+    /// Create a new Auditable group with default settings.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a new Auditable trait with a custom max entries limit.
+    /// Create a new Auditable group with a custom max entries limit.
     #[must_use]
     pub fn with_max_entries(max_entries: usize) -> Self {
-        Self { max_entries }
+        Self {
+            max_entries,
+            log: Arc::new(Mutex::new(AuditLog::with_max_entries(max_entries))),
+        }
     }
 }
 
-#[entity_trait_impl]
-#[state(AuditLog)]
+#[rpc_group_impl]
 impl Auditable {
-    fn init(&self) -> Result<AuditLog, ClusterError> {
-        Ok(AuditLog::with_max_entries(self.max_entries))
-    }
-
     /// Log a player action to the audit log.
-    ///
-    /// This is an activity because it mutates state.
-    /// Protected so it's visible to entities using this trait.
-    #[activity]
-    #[protected]
+    #[rpc(persisted)]
     pub async fn log_player_action(
-        &mut self,
+        &self,
         request: LogPlayerActionRequest,
     ) -> Result<(), ClusterError> {
         let entry = AuditEntry::player_action(request.action, request.actor, request.details);
-        self.state.log(entry);
+        self.log.lock().unwrap().log(entry);
         Ok(())
     }
 
     /// Log a system action to the audit log.
-    ///
-    /// This is an activity because it mutates state.
-    /// Protected so it's visible to entities using this trait.
-    #[activity]
-    #[protected]
+    #[rpc(persisted)]
     pub async fn log_system_action(
-        &mut self,
+        &self,
         request: LogSystemActionRequest,
     ) -> Result<(), ClusterError> {
         let entry = AuditEntry::system_action(request.action, request.details);
-        self.state.log(entry);
+        self.log.lock().unwrap().log(entry);
         Ok(())
     }
 
     /// Get recent audit log entries.
-    ///
-    /// This is an RPC because it only reads state.
     #[rpc]
     pub async fn get_audit_log(
         &self,
         request: GetAuditLogRequest,
     ) -> Result<GetAuditLogResponse, ClusterError> {
+        let log = self.log.lock().unwrap();
         let limit = request.limit.unwrap_or(50);
         Ok(GetAuditLogResponse {
-            entries: self.state.get_recent(limit),
-            total_entries: self.state.len(),
+            entries: log.get_recent(limit),
+            total_entries: log.len(),
         })
     }
 
@@ -294,7 +290,8 @@ impl Auditable {
         &self,
         actor: PlayerId,
     ) -> Result<Vec<AuditEntry>, ClusterError> {
-        Ok(self.state.entries_by_actor(actor))
+        let log = self.log.lock().unwrap();
+        Ok(log.entries_by_actor(actor))
     }
 
     /// Get all audit entries for a specific action type.
@@ -303,7 +300,8 @@ impl Auditable {
         &self,
         action: String,
     ) -> Result<Vec<AuditEntry>, ClusterError> {
-        Ok(self.state.entries_by_action(&action))
+        let log = self.log.lock().unwrap();
+        Ok(log.entries_by_action(&action))
     }
 }
 

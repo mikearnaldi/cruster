@@ -4,13 +4,11 @@
 //!
 //! ## Features
 //!
-//! - **Stateless Entity**: `MatchmakingService` - pairs players into games
-//! - **Stateful Entity (in-memory)**: `PlayerSession` - tracks connected player state
-//! - **Persisted State**: `ChessGame` - board state survives crashes
-//! - **Workflows (durable)**: `ChessGame::make_move` - move with validation, persisted
+//! - **Pure-RPC Entity**: `MatchmakingService` - pairs players into games
+//! - **Pure-RPC Entity**: `PlayerSession` - tracks connected player state (ephemeral)
+//! - **Pure-RPC Entity**: `ChessGame` - board state with move validation
 //! - **Singletons**: `Leaderboard` - single instance for global rankings
-//! - **Streaming**: `ChessGame::watch` - live game event stream
-//! - **Scheduled Messages**: Move timeout - auto-forfeit after configurable delay
+//! - **RPC Groups**: `Auditable` - composable audit logging capability
 
 pub mod chess;
 pub mod entities;

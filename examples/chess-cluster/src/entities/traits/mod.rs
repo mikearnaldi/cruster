@@ -1,4 +1,4 @@
-//! Shared entity traits.
+//! Shared RPC groups for entity composition.
 //!
 //! - `Auditable` - Provides audit logging capability for entities
 

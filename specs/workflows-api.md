@@ -547,13 +547,14 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 ### Current Status
 
 - **Phase 3 & 4 (Workflow macros + Client):** ✅ Done — `#[workflow]` / `#[workflow_impl]` macros exist alongside legacy `#[standalone_workflow]` / `#[standalone_workflow_impl]`. Both delegate to the same codegen. Tests for the new names added.
+- **Phase 9 (partial):** ✅ Tests refactored — all `standalone_workflow` / `standalone_workflow_impl` tests in `macro_tests.rs` have been ported to new `#[workflow]` / `#[workflow_impl]` API names and old tests removed. New tests cover: basic dispatch, activities, struct fields, helpers, client exists, start (fire-and-forget), with_key (hashed), with_key_raw (no hash), with_key start, register, and WorkflowClientFactory.
 - **Remaining work:**
   - Phase 1 & 2: Entity simplification and RPC groups (not yet started)
   - Phase 5: Activity groups (not yet started)
   - Phase 6: Activity retry support (not yet started)
   - Phase 7: Poll and execution lifecycle (not yet started)
   - Phase 8: Integration testing (not yet started)
-  - Phase 9: Cleanup — refactor all tests to new names, delete `standalone_workflow`/`standalone_workflow_impl` (not yet started)
+  - Phase 9 (remaining): Delete `standalone_workflow`/`standalone_workflow_impl` macros and re-exports from cruster-macros and cruster crates
 
 ### Phase 1: Simplify Entities
 

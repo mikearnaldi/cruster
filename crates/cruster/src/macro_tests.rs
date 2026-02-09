@@ -2758,345 +2758,9 @@ mod tests {
     // Standalone Workflow Macro Tests
     // ==========================================================================
 
-    use crate::standalone_workflow;
-    use crate::standalone_workflow_impl;
-
-    // --- Basic standalone workflow ---
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize)]
-    struct SimpleRequest {
-        name: String,
-    }
-
-    #[standalone_workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct SimpleWorkflow;
-
-    #[standalone_workflow_impl(krate = "crate")]
-    impl SimpleWorkflow {
-        async fn execute(&self, request: SimpleRequest) -> Result<String, ClusterError> {
-            Ok(format!("hello, {}", request.name))
-        }
-    }
-
-    #[test]
-    fn standalone_workflow_entity_type() {
-        let w = SimpleWorkflow;
-        assert_eq!(w.entity_type().0, "Workflow/SimpleWorkflow");
-    }
-
-    #[tokio::test]
-    async fn standalone_workflow_dispatch() {
-        let w = SimpleWorkflow;
-        let ctx = test_ctx("Workflow/SimpleWorkflow", "exec-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = SimpleRequest {
-            name: "world".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "hello, world");
-    }
-
-    #[tokio::test]
-    async fn standalone_workflow_unknown_tag() {
-        let w = SimpleWorkflow;
-        let ctx = test_ctx("Workflow/SimpleWorkflow", "exec-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let err = handler
-            .handle_request("unknown", &[], &HashMap::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ClusterError::MalformedMessage { .. }));
-    }
-
-    // --- Workflow with activities ---
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize)]
-    struct OrderRequest {
-        order_id: String,
-        amount: i32,
-    }
-
-    #[standalone_workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct OrderWorkflow;
-
-    #[standalone_workflow_impl(krate = "crate")]
-    impl OrderWorkflow {
-        async fn execute(&self, request: OrderRequest) -> Result<String, ClusterError> {
-            let validated = self.validate(request.order_id.clone()).await?;
-            let charged = self
-                .charge(request.order_id.clone(), request.amount)
-                .await?;
-            Ok(format!("{validated}+{charged}"))
-        }
-
-        #[activity]
-        async fn validate(&self, order_id: String) -> Result<String, ClusterError> {
-            Ok(format!("valid:{order_id}"))
-        }
-
-        #[activity]
-        async fn charge(&self, order_id: String, amount: i32) -> Result<String, ClusterError> {
-            Ok(format!("charged:{order_id}:{amount}"))
-        }
-    }
-
-    #[tokio::test]
-    async fn standalone_workflow_with_activities() {
-        let w = OrderWorkflow;
-        let ctx = test_ctx("Workflow/OrderWorkflow", "exec-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = OrderRequest {
-            order_id: "order-42".to_string(),
-            amount: 100,
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "valid:order-42+charged:order-42:100");
-    }
-
-    // --- Workflow with struct fields ---
-
-    #[standalone_workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct FieldWorkflow {
-        prefix: String,
-    }
-
-    #[standalone_workflow_impl(krate = "crate")]
-    impl FieldWorkflow {
-        async fn execute(&self, request: SimpleRequest) -> Result<String, ClusterError> {
-            let greeting = self.greet(request.name).await?;
-            Ok(greeting)
-        }
-
-        #[activity]
-        async fn greet(&self, name: String) -> Result<String, ClusterError> {
-            // Access struct field via self.prefix (Deref)
-            Ok(format!("{}: {name}", self.prefix))
-        }
-    }
-
-    #[tokio::test]
-    async fn standalone_workflow_with_fields() {
-        let w = FieldWorkflow {
-            prefix: "Hi".to_string(),
-        };
-        let ctx = test_ctx("Workflow/FieldWorkflow", "exec-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = SimpleRequest {
-            name: "Alice".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "Hi: Alice");
-    }
-
-    // --- Workflow client exists and has expected methods ---
-
-    #[test]
-    fn standalone_workflow_client_exists() {
-        fn _assert_client_methods(_c: &SimpleWorkflowClient) {
-            // execute, start, with_key, with_key_raw should exist
-        }
-    }
-
-    // --- Workflow client start() (fire-and-forget) ---
-
-    #[tokio::test]
-    async fn standalone_workflow_start_returns_execution_id() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
-            inner: MockSharding::new(),
-            captured: Arc::clone(&captured),
-        });
-        let client = SimpleWorkflow
-            .register(Arc::clone(&sharding))
-            .await
-            .unwrap();
-
-        let req = SimpleRequest {
-            name: "fire-and-forget".to_string(),
-        };
-        let exec_id = client.start(&req).await.unwrap();
-
-        // The execution ID should be a non-empty string (the derived entity ID)
-        assert!(!exec_id.is_empty(), "execution ID should not be empty");
-
-        // The message should have been sent via notify (not send)
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.len(), 1, "exactly one message should be captured");
-        assert_eq!(captured[0].tag, "execute");
-    }
-
-    // --- Workflow client with_key() / with_key_raw() ---
-
-    #[tokio::test]
-    async fn standalone_workflow_with_key_hashes() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
-            inner: MockSharding::new(),
-            captured: Arc::clone(&captured),
-        });
-        let client = SimpleWorkflowClient::new(Arc::clone(&sharding));
-
-        let req = SimpleRequest {
-            name: "keyed".to_string(),
-        };
-
-        // execute via with_key — should hash the key
-        let _: String = client.with_key("my-key").execute(&req).await.unwrap();
-
-        let captured_msgs = captured.lock().unwrap();
-        assert_eq!(captured_msgs.len(), 1);
-
-        // The entity_id should be the SHA-256 hash of "my-key", not "my-key" itself
-        let entity_id = &captured_msgs[0].address.entity_id.0;
-        assert_ne!(entity_id, "my-key", "key should be hashed");
-        assert_eq!(
-            entity_id,
-            &crate::hash::sha256_hex("my-key".as_bytes()),
-            "entity_id should match SHA-256 of key"
-        );
-    }
-
-    #[tokio::test]
-    async fn standalone_workflow_with_key_raw_no_hash() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
-            inner: MockSharding::new(),
-            captured: Arc::clone(&captured),
-        });
-        let client = SimpleWorkflowClient::new(Arc::clone(&sharding));
-
-        let req = SimpleRequest {
-            name: "raw-keyed".to_string(),
-        };
-
-        // execute via with_key_raw — should use key as-is
-        let _: String = client.with_key_raw("raw-id-42").execute(&req).await.unwrap();
-
-        let captured_msgs = captured.lock().unwrap();
-        assert_eq!(captured_msgs.len(), 1);
-        assert_eq!(
-            captured_msgs[0].address.entity_id.0, "raw-id-42",
-            "raw key should be used directly as entity_id"
-        );
-    }
-
-    #[tokio::test]
-    async fn standalone_workflow_with_key_start() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
-            inner: MockSharding::new(),
-            captured: Arc::clone(&captured),
-        });
-        let client = SimpleWorkflowClient::new(Arc::clone(&sharding));
-
-        let req = SimpleRequest {
-            name: "start-keyed".to_string(),
-        };
-
-        // start via with_key_raw — fire-and-forget with raw key
-        let exec_id = client
-            .with_key_raw("start-raw-1")
-            .start(&req)
-            .await
-            .unwrap();
-        assert_eq!(exec_id, "start-raw-1");
-
-        let captured_msgs = captured.lock().unwrap();
-        assert_eq!(captured_msgs.len(), 1);
-        assert_eq!(captured_msgs[0].address.entity_id.0, "start-raw-1");
-        assert_eq!(captured_msgs[0].tag, "execute");
-    }
-
-    // --- WorkflowClientFactory (client::<T>() support) ---
-
-    #[test]
-    fn standalone_workflow_implements_client_factory() {
-        use crate::entity_client::WorkflowClientFactory;
-        // SimpleWorkflow should implement WorkflowClientFactory
-        fn _assert_factory<T: WorkflowClientFactory>() {}
-        _assert_factory::<SimpleWorkflow>();
-    }
-
-    // --- Workflow register returns typed client ---
-
-    #[tokio::test]
-    async fn standalone_workflow_register() {
-        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
-        let client = SimpleWorkflow
-            .register(Arc::clone(&sharding))
-            .await
-            .unwrap();
-        // Client should be usable
-        let req = SimpleRequest {
-            name: "test".to_string(),
-        };
-        // This sends through sharding — mock returns "ok"
-        let _: String = client.execute(&req).await.unwrap();
-    }
-
-    // --- Workflow with helper methods ---
-
-    #[standalone_workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct HelperWorkflow;
-
-    #[standalone_workflow_impl(krate = "crate")]
-    impl HelperWorkflow {
-        async fn execute(&self, request: SimpleRequest) -> Result<String, ClusterError> {
-            let upper = self.to_upper(&request.name);
-            Ok(upper)
-        }
-
-        fn to_upper(&self, s: &str) -> String {
-            s.to_uppercase()
-        }
-    }
-
-    #[tokio::test]
-    async fn standalone_workflow_with_helpers() {
-        let w = HelperWorkflow;
-        let ctx = test_ctx("Workflow/HelperWorkflow", "exec-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = SimpleRequest {
-            name: "hello".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "HELLO");
-    }
-
     // ==========================================================================
-    // New #[workflow] / #[workflow_impl] Macro Tests
+    // #[workflow] / #[workflow_impl] Macro Tests
     // ==========================================================================
-    //
-    // These test the new API names that will replace standalone_workflow.
 
     use crate::workflow_impl;
 
@@ -3255,6 +2919,112 @@ mod tests {
         fn _assert_client_methods(_c: &NewSimpleWorkflowClient) {
             // execute, start, with_key, with_key_raw should exist
         }
+    }
+
+    #[tokio::test]
+    async fn new_workflow_start_returns_execution_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflow
+            .register(Arc::clone(&sharding))
+            .await
+            .unwrap();
+
+        let req = NewWfRequest {
+            name: "fire-and-forget".to_string(),
+        };
+        let exec_id = client.start(&req).await.unwrap();
+
+        // The execution ID should be a non-empty string (the derived entity ID)
+        assert!(!exec_id.is_empty(), "execution ID should not be empty");
+
+        // The message should have been sent via notify (not send)
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "exactly one message should be captured");
+        assert_eq!(captured[0].tag, "execute");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_key_hashes() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "keyed".to_string(),
+        };
+
+        // execute via with_key — should hash the key
+        let _: String = client.with_key("my-key").execute(&req).await.unwrap();
+
+        let captured_msgs = captured.lock().unwrap();
+        assert_eq!(captured_msgs.len(), 1);
+
+        // The entity_id should be the SHA-256 hash of "my-key", not "my-key" itself
+        let entity_id = &captured_msgs[0].address.entity_id.0;
+        assert_ne!(entity_id, "my-key", "key should be hashed");
+        assert_eq!(
+            entity_id,
+            &crate::hash::sha256_hex("my-key".as_bytes()),
+            "entity_id should match SHA-256 of key"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_key_raw_no_hash() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "raw-keyed".to_string(),
+        };
+
+        // execute via with_key_raw — should use key as-is
+        let _: String = client.with_key_raw("raw-id-42").execute(&req).await.unwrap();
+
+        let captured_msgs = captured.lock().unwrap();
+        assert_eq!(captured_msgs.len(), 1);
+        assert_eq!(
+            captured_msgs[0].address.entity_id.0, "raw-id-42",
+            "raw key should be used directly as entity_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_key_start() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "start-keyed".to_string(),
+        };
+
+        // start via with_key_raw — fire-and-forget with raw key
+        let exec_id = client
+            .with_key_raw("start-raw-1")
+            .start(&req)
+            .await
+            .unwrap();
+        assert_eq!(exec_id, "start-raw-1");
+
+        let captured_msgs = captured.lock().unwrap();
+        assert_eq!(captured_msgs.len(), 1);
+        assert_eq!(captured_msgs[0].address.entity_id.0, "start-raw-1");
+        assert_eq!(captured_msgs[0].tag, "execute");
     }
 
     #[tokio::test]

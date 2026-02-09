@@ -16,15 +16,16 @@ use crate::entities::{
     ActivityRecord, ActivityTestClient, ActivityWorkflowClient, AuditEntry, CancelTimerRequest,
     ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient, CrossEntityClient,
     DecrementRequest, DeleteRequest, FailingTransferRequest, FailingWorkflowClient,
-    GetActivityLogRequest, GetCounterRequest, GetExecutionRequest, GetRequest, GetSqlCountRequest,
-    IncrementRequest, KVStoreClient, ListExecutionsRequest, ListKeysRequest, LongWorkflowClient,
-    Message, PendingTimer, PingRequest, ReceiveRequest, ResetCounterRequest,
-    ResetPingCountRequest, RunFailingWorkflowRequest, RunLongWorkflowRequest,
-    RunSimpleWorkflowRequest, RunWithActivitiesRequest, ScheduleTimerRequest, SetRequest,
-    SimpleWorkflowClient, SingletonManager, SingletonState, SqlActivityTestClient,
-    SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
-    StatelessIncrementRequest, StatelessResetRequest, TimerFire, TimerTestClient, TraitTestClient,
-    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
+    GetActivityLogRequest, GetCounterRequest, GetExecutionRequest, GetMessagesRequest,
+    GetRequest, GetSqlCountRequest, IncrementRequest, KVStoreClient,
+    ListExecutionsRequest, ListKeysRequest, LongWorkflowClient, Message, PendingTimer, PingRequest,
+    ReceiveRequest, ResetCounterRequest, ResetPingCountRequest, RunFailingWorkflowRequest,
+    RunLongWorkflowRequest, RunSimpleWorkflowRequest, RunWithActivitiesRequest,
+    ScheduleTimerRequest, SetRequest, SimpleWorkflowClient, SingletonManager, SingletonState,
+    SqlActivityTestClient, SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest,
+    StatelessGetRequest, StatelessIncrementRequest, StatelessResetRequest, TimerFire,
+    TimerTestClient, TraitTestClient, TransferRequest, UpdateRequest, WorkflowExecution,
+    WorkflowTestClient,
 };
 // Import trait client extensions to make trait methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
@@ -808,6 +809,7 @@ async fn cross_send(
         .receive(
             &target_entity_id,
             &ReceiveRequest {
+                entity_id: body.target_id.clone(),
                 from: id,
                 message: body.message,
             },
@@ -829,6 +831,7 @@ async fn cross_receive(
         .receive(
             &entity_id,
             &ReceiveRequest {
+                entity_id: id,
                 from: body.from,
                 message: body.message,
             },
@@ -843,7 +846,15 @@ async fn cross_get_messages(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<Message>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let messages = state.cross_entity_client.get_messages(&entity_id).await?;
+    let messages = state
+        .cross_entity_client
+        .get_messages(
+            &entity_id,
+            &GetMessagesRequest {
+                entity_id: id,
+            },
+        )
+        .await?;
     Ok(Json(messages))
 }
 
@@ -853,11 +864,14 @@ async fn cross_clear_messages(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    // Generate unique request ID so each clear is a new workflow execution
-    let request_id = format!("clear-{}-{}", id, chrono::Utc::now().timestamp_millis());
     state
         .cross_entity_client
-        .clear_messages(&entity_id, &ClearMessagesRequest { request_id })
+        .clear_messages(
+            &entity_id,
+            &ClearMessagesRequest {
+                entity_id: id,
+            },
+        )
         .await?;
     Ok(Json(()))
 }
@@ -878,14 +892,13 @@ async fn cross_ping_pong(
     let entity_a_id = EntityId::new(&id);
     let entity_b_id = EntityId::new(&body.partner_id);
 
-    // Reset both entities' ping counts (with unique request IDs)
-    let ts = chrono::Utc::now().timestamp_millis();
+    // Reset both entities' ping counts
     state
         .cross_entity_client
         .reset_ping_count(
             &entity_a_id,
             &ResetPingCountRequest {
-                request_id: format!("reset-{}-{}", id, ts),
+                entity_id: id.clone(),
             },
         )
         .await?;
@@ -894,7 +907,7 @@ async fn cross_ping_pong(
         .reset_ping_count(
             &entity_b_id,
             &ResetPingCountRequest {
-                request_id: format!("reset-{}-{}", body.partner_id, ts),
+                entity_id: body.partner_id.clone(),
             },
         )
         .await?;
@@ -909,6 +922,7 @@ async fn cross_ping_pong(
             .ping(
                 &entity_b_id,
                 &PingRequest {
+                    entity_id: body.partner_id.clone(),
                     count: current_count,
                 },
             )
@@ -921,6 +935,7 @@ async fn cross_ping_pong(
             .ping(
                 &entity_a_id,
                 &PingRequest {
+                    entity_id: id.clone(),
                     count: current_count,
                 },
             )

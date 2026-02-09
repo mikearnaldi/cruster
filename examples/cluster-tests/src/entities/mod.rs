@@ -33,8 +33,8 @@ pub use counter::{
     ResetCounterRequest,
 };
 pub use cross_entity::{
-    ClearMessagesRequest, CrossEntity, CrossEntityClient, Message, PingRequest, ReceiveRequest,
-    ResetPingCountRequest,
+    ClearMessagesRequest, CrossEntity, CrossEntityClient, GetMessagesRequest, Message, PingRequest,
+    ReceiveRequest, ResetPingCountRequest,
 };
 pub use kv_store::{
     ClearRequest, DeleteRequest, GetRequest, KVStore, KVStoreClient, ListKeysRequest, SetRequest,

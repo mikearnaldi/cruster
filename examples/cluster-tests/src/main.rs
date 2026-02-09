@@ -307,10 +307,12 @@ async fn main() -> Result<()> {
         .expect("failed to register TimerTest entity");
     tracing::info!("Registered TimerTest entity");
 
-    let cross_entity_client = CrossEntity
-        .register(sharding.clone())
-        .await
-        .expect("failed to register CrossEntity entity");
+    let cross_entity_client = CrossEntity {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register CrossEntity entity");
     tracing::info!("Registered CrossEntity entity");
 
     let sql_activity_test_client = SqlActivityTest

@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::entities::{
-    ActivityGroupTestClient, ActivityRecord, ActivityTestClient, ActivityWorkflowClient, AuditEntry,
-    CancelTimerRequest, ClearFiresRequest, ClearMessagesRequest, ClearRequest, CounterClient,
-    CrossEntityClient, DecrementRequest, DeleteRequest, FailingTransferRequest,
+    ActivityGroupTestClient, ActivityRecord, ActivityTestClient, ActivityWorkflowClient,
+    AuditEntry, CancelTimerRequest, ClearFiresRequest, ClearMessagesRequest, ClearRequest,
+    CounterClient, CrossEntityClient, DecrementRequest, DeleteRequest, FailingTransferRequest,
     FailingWorkflowClient, GetActivityLogRequest, GetAuditLogRequest, GetCounterRequest,
     GetExecutionRequest, GetMessagesRequest, GetOrderStepsRequest, GetPendingTimersRequest,
     GetRequest, GetSqlCountRequest, GetStateRequest, GetTimerFiresRequest, GetTraitDataRequest,
@@ -1039,12 +1039,7 @@ async fn activity_group_get_order_steps(
     let entity_id = EntityId::new(&id);
     let steps = state
         .activity_group_test_client
-        .get_order_steps(
-            &entity_id,
-            &GetOrderStepsRequest {
-                order_id: id,
-            },
-        )
+        .get_order_steps(&entity_id, &GetOrderStepsRequest { order_id: id })
         .await?;
     Ok(Json(steps))
 }

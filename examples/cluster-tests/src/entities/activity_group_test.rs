@@ -9,6 +9,7 @@
 //! All state is stored in PostgreSQL `activity_group_test_orders` table.
 
 use chrono::{DateTime, Utc};
+use cruster::__internal::ActivityScope;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -19,12 +20,11 @@ use sqlx::PgPool;
 // ============================================================================
 
 /// Reusable activity group for inventory operations.
+///
+/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
 #[activity_group]
 #[derive(Clone)]
-pub struct Inventory {
-    /// Database pool for inventory queries.
-    pub pool: PgPool,
-}
+pub struct Inventory;
 
 /// Request to reserve inventory items.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,21 +48,20 @@ pub struct ConfirmReservationRequest {
 impl Inventory {
     /// Reserve inventory items. Returns a reservation ID.
     #[activity]
-    async fn reserve_items(
-        &self,
-        request: ReserveItemsRequest,
-    ) -> Result<String, ClusterError> {
+    async fn reserve_items(&self, request: ReserveItemsRequest) -> Result<String, ClusterError> {
         let reservation_id = format!("res-{}-{}", request.order_id, request.item_count);
 
-        // Record the reservation in the database
-        sqlx::query(
-            "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
-             VALUES ($1, 'reserve', $2, NOW())
-             ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+        // Record the reservation in the database via framework transaction
+        let db = ActivityScope::db().await;
+        db.execute(
+            sqlx::query(
+                "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
+                 VALUES ($1, 'reserve', $2, NOW())
+                 ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+            )
+            .bind(&request.order_id)
+            .bind(&reservation_id),
         )
-        .bind(&request.order_id)
-        .bind(&reservation_id)
-        .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("reserve_items failed: {e}"),
@@ -80,14 +79,16 @@ impl Inventory {
     ) -> Result<String, ClusterError> {
         let confirmation = format!("confirmed-{}", request.reservation_id);
 
-        sqlx::query(
-            "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
-             VALUES ($1, 'confirm', $2, NOW())
-             ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+        let db = ActivityScope::db().await;
+        db.execute(
+            sqlx::query(
+                "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
+                 VALUES ($1, 'confirm', $2, NOW())
+                 ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+            )
+            .bind(&request.order_id)
+            .bind(&confirmation),
         )
-        .bind(&request.order_id)
-        .bind(&confirmation)
-        .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("confirm_reservation failed: {e}"),
@@ -103,12 +104,11 @@ impl Inventory {
 // ============================================================================
 
 /// Reusable activity group for payment operations.
+///
+/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
 #[activity_group]
 #[derive(Clone)]
-pub struct Payments {
-    /// Database pool for payment records.
-    pub pool: PgPool,
-}
+pub struct Payments;
 
 /// Request to charge a payment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,20 +123,19 @@ pub struct ChargePaymentRequest {
 impl Payments {
     /// Charge a payment. Returns a transaction ID.
     #[activity]
-    async fn charge_payment(
-        &self,
-        request: ChargePaymentRequest,
-    ) -> Result<String, ClusterError> {
+    async fn charge_payment(&self, request: ChargePaymentRequest) -> Result<String, ClusterError> {
         let tx_id = format!("tx-{}-{}", request.order_id, request.amount);
 
-        sqlx::query(
-            "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
-             VALUES ($1, 'charge', $2, NOW())
-             ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+        let db = ActivityScope::db().await;
+        db.execute(
+            sqlx::query(
+                "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
+                 VALUES ($1, 'charge', $2, NOW())
+                 ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+            )
+            .bind(&request.order_id)
+            .bind(&tx_id),
         )
-        .bind(&request.order_id)
-        .bind(&tx_id)
-        .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("charge_payment failed: {e}"),
@@ -183,12 +182,11 @@ pub struct OrderResult {
 /// - Two activity groups (`Inventory` and `Payments`) composed into one workflow
 /// - Local `#[activity]` methods alongside group activities
 /// - Sequential orchestration of group and local activities
+///
+/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
-pub struct OrderWorkflow {
-    /// Database pool for the local summarize activity.
-    pub pool: PgPool,
-}
+pub struct OrderWorkflow;
 
 #[workflow_impl(
     key = |req: &ProcessOrderRequest| req.order_id.clone(),
@@ -249,14 +247,16 @@ impl OrderWorkflow {
             request.order_id, request.reservation_id, request.transaction_id
         );
 
-        sqlx::query(
-            "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
-             VALUES ($1, 'summary', $2, NOW())
-             ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+        let db = ActivityScope::db().await;
+        db.execute(
+            sqlx::query(
+                "INSERT INTO activity_group_test_orders (order_id, step, detail, created_at)
+                 VALUES ($1, 'summary', $2, NOW())
+                 ON CONFLICT (order_id, step) DO UPDATE SET detail = $2",
+            )
+            .bind(&request.order_id)
+            .bind(&summary),
         )
-        .bind(&request.order_id)
-        .bind(&summary)
-        .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("summarize failed: {e}"),

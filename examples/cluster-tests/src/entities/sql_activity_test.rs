@@ -6,15 +6,15 @@
 //! - `SqlActivityTest` entity: pure-RPC for reading state from PG (`sql_activity_test_state` table)
 //! - `SqlTransferWorkflow`: standalone workflow with activity that writes to both
 //!   `sql_activity_test_state` and `sql_activity_test_transfers` atomically via
-//!   `ActivityScope::sql_transaction()`
+//!   `ActivityScope::db()`
 //! - `SqlFailingTransferWorkflow`: standalone workflow with activity that writes then fails,
 //!   testing that both state and transfer writes are rolled back
 //! - `SqlCountWorkflow`: standalone workflow with activity that queries the transfers table
-//!   via `ActivityScope::sql_transaction()`
+//!   via `ActivityScope::db()`
 //!
 //! All state is stored in PostgreSQL. The key feature being tested is that
-//! `ActivityScope::sql_transaction()` allows executing arbitrary SQL within the
-//! same transaction as journal writes, ensuring atomicity.
+//! `ActivityScope::db()` provides a SQL transaction handle for executing arbitrary SQL
+//! within the same transaction as journal writes, ensuring atomicity.
 
 use cruster::__internal::ActivityScope;
 use cruster::error::ClusterError;
@@ -108,7 +108,7 @@ pub struct TransferRequest {
     pub amount: i64,
 }
 
-/// Workflow that performs a transfer using `ActivityScope::sql_transaction()`.
+/// Workflow that performs a transfer using `ActivityScope::db()`.
 ///
 /// The activity writes to both `sql_activity_test_state` and
 /// `sql_activity_test_transfers` in the same transaction, ensuring atomicity.
@@ -125,7 +125,7 @@ impl SqlTransferWorkflow {
 
     /// Activity that records a transfer in both the state table AND the transfers table.
     ///
-    /// Both operations happen in the same SQL transaction (via `ActivityScope::sql_transaction()`):
+    /// Both operations happen in the same SQL transaction (via `ActivityScope::db()`):
     /// - UPSERT into `sql_activity_test_state` (transfer_count, total_transferred)
     /// - INSERT into `sql_activity_test_transfers`
     #[activity]
@@ -135,15 +135,17 @@ impl SqlTransferWorkflow {
         to_entity: String,
         amount: i64,
     ) -> Result<i64, ClusterError> {
-        if let Some(tx) = ActivityScope::sql_transaction().await {
-            // Upsert state
-            #[derive(sqlx::FromRow)]
-            struct CountResult {
-                transfer_count: i64,
-            }
+        let db = ActivityScope::db().await;
 
-            let result: CountResult = tx
-                .fetch_one(sqlx::query_as(
+        // Upsert state
+        #[derive(sqlx::FromRow)]
+        struct CountResult {
+            transfer_count: i64,
+        }
+
+        let result: CountResult = db
+            .fetch_one(
+                sqlx::query_as(
                     "INSERT INTO sql_activity_test_state (entity_id, transfer_count, total_transferred)
                      VALUES ($1, 1, $2)
                      ON CONFLICT (entity_id) DO UPDATE SET
@@ -152,28 +154,23 @@ impl SqlTransferWorkflow {
                      RETURNING transfer_count",
                 )
                 .bind(&entity_id)
-                .bind(amount))
-                .await?;
-
-            // Insert transfer record
-            tx.execute(
-                sqlx::query(
-                    "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
-                     VALUES ($1, $2, $3, NOW())",
-                )
-                .bind(&entity_id)
-                .bind(&to_entity)
                 .bind(amount),
             )
             .await?;
 
-            Ok(result.transfer_count)
-        } else {
-            Err(ClusterError::PersistenceError {
-                reason: "no SQL transaction available".to_string(),
-                source: None,
-            })
-        }
+        // Insert transfer record
+        db.execute(
+            sqlx::query(
+                "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
+                 VALUES ($1, $2, $3, NOW())",
+            )
+            .bind(&entity_id)
+            .bind(&to_entity)
+            .bind(amount),
+        )
+        .await?;
+
+        Ok(result.transfer_count)
     }
 }
 
@@ -213,33 +210,33 @@ impl SqlFailingTransferWorkflow {
         to_entity: String,
         amount: i64,
     ) -> Result<i64, ClusterError> {
-        if let Some(tx) = ActivityScope::sql_transaction().await {
-            // Upsert state (should be rolled back)
-            tx.execute(
-                sqlx::query(
-                    "INSERT INTO sql_activity_test_state (entity_id, transfer_count, total_transferred)
-                     VALUES ($1, 1, $2)
-                     ON CONFLICT (entity_id) DO UPDATE SET
-                       transfer_count = sql_activity_test_state.transfer_count + 1,
-                       total_transferred = sql_activity_test_state.total_transferred + $2",
-                )
-                .bind(&entity_id)
-                .bind(amount),
-            )
-            .await?;
+        let db = ActivityScope::db().await;
 
-            // Insert transfer record (should also be rolled back)
-            tx.execute(
-                sqlx::query(
-                    "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
-                     VALUES ($1, $2, $3, NOW())",
-                )
-                .bind(&entity_id)
-                .bind(&to_entity)
-                .bind(amount),
+        // Upsert state (should be rolled back)
+        db.execute(
+            sqlx::query(
+                "INSERT INTO sql_activity_test_state (entity_id, transfer_count, total_transferred)
+                 VALUES ($1, 1, $2)
+                 ON CONFLICT (entity_id) DO UPDATE SET
+                   transfer_count = sql_activity_test_state.transfer_count + 1,
+                   total_transferred = sql_activity_test_state.total_transferred + $2",
             )
-            .await?;
-        }
+            .bind(&entity_id)
+            .bind(amount),
+        )
+        .await?;
+
+        // Insert transfer record (should also be rolled back)
+        db.execute(
+            sqlx::query(
+                "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
+                 VALUES ($1, $2, $3, NOW())",
+            )
+            .bind(&entity_id)
+            .bind(&to_entity)
+            .bind(amount),
+        )
+        .await?;
 
         // Now fail - both state and SQL should roll back
         Err(ClusterError::PersistenceError {
@@ -262,7 +259,7 @@ pub struct GetSqlCountRequest {
     pub query_id: String,
 }
 
-/// Workflow that queries the transfers table using `ActivityScope::sql_transaction()`.
+/// Workflow that queries the transfers table using `ActivityScope::db()`.
 #[workflow]
 #[derive(Clone)]
 pub struct SqlCountWorkflow;
@@ -276,26 +273,23 @@ impl SqlCountWorkflow {
     /// Activity that queries the transfers table within a SQL transaction.
     #[activity]
     async fn do_get_transfer_count(&self, entity_id: String) -> Result<i64, ClusterError> {
-        if let Some(tx) = ActivityScope::sql_transaction().await {
-            #[derive(sqlx::FromRow)]
-            struct CountResult {
-                count: i64,
-            }
+        let db = ActivityScope::db().await;
 
-            let result: CountResult = tx
-                .fetch_one(
-                    sqlx::query_as(
-                        "SELECT COUNT(*) as count FROM sql_activity_test_transfers WHERE from_entity = $1",
-                    )
-                    .bind(&entity_id),
-                )
-                .await?;
-
-            Ok(result.count)
-        } else {
-            // No SQL transaction available
-            Ok(-1)
+        #[derive(sqlx::FromRow)]
+        struct CountResult {
+            count: i64,
         }
+
+        let result: CountResult = db
+            .fetch_one(
+                sqlx::query_as(
+                    "SELECT COUNT(*) as count FROM sql_activity_test_transfers WHERE from_entity = $1",
+                )
+                .bind(&entity_id),
+            )
+            .await?;
+
+        Ok(result.count)
     }
 }
 

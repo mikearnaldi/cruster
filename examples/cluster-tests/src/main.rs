@@ -257,28 +257,22 @@ async fn main() -> Result<()> {
     .expect("failed to register WorkflowTest entity");
     tracing::info!("Registered WorkflowTest entity");
 
-    let simple_workflow_client = SimpleWorkflow {
-        pool: cluster.pool(),
-    }
-    .register(sharding.clone())
-    .await
-    .expect("failed to register SimpleWorkflow");
+    let simple_workflow_client = SimpleWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register SimpleWorkflow");
     tracing::info!("Registered SimpleWorkflow");
 
-    let failing_workflow_client = FailingWorkflow {
-        pool: cluster.pool(),
-    }
-    .register(sharding.clone())
-    .await
-    .expect("failed to register FailingWorkflow");
+    let failing_workflow_client = FailingWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register FailingWorkflow");
     tracing::info!("Registered FailingWorkflow");
 
-    let long_workflow_client = LongWorkflow {
-        pool: cluster.pool(),
-    }
-    .register(sharding.clone())
-    .await
-    .expect("failed to register LongWorkflow");
+    let long_workflow_client = LongWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register LongWorkflow");
     tracing::info!("Registered LongWorkflow");
 
     let activity_test_client = ActivityTest {
@@ -289,12 +283,10 @@ async fn main() -> Result<()> {
     .expect("failed to register ActivityTest entity");
     tracing::info!("Registered ActivityTest entity");
 
-    let activity_workflow_client = ActivityWorkflow {
-        pool: cluster.pool(),
-    }
-    .register(sharding.clone())
-    .await
-    .expect("failed to register ActivityWorkflow");
+    let activity_workflow_client = ActivityWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register ActivityWorkflow");
     tracing::info!("Registered ActivityWorkflow");
 
     let trait_test_client = TraitTest {
@@ -321,12 +313,10 @@ async fn main() -> Result<()> {
     .expect("failed to register TimerTest entity");
     tracing::info!("Registered TimerTest entity");
 
-    let schedule_timer_workflow_client = ScheduleTimerWorkflow {
-        pool: cluster.pool(),
-    }
-    .register(sharding.clone())
-    .await
-    .expect("failed to register ScheduleTimerWorkflow");
+    let schedule_timer_workflow_client = ScheduleTimerWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register ScheduleTimerWorkflow");
     tracing::info!("Registered ScheduleTimerWorkflow");
 
     let cross_entity_client = CrossEntity {
@@ -379,20 +369,10 @@ async fn main() -> Result<()> {
     .expect("failed to register ActivityGroupTest entity");
     tracing::info!("Registered ActivityGroupTest entity");
 
-    let order_workflow_client = OrderWorkflow {
-        pool: cluster.pool(),
-    }
-    .register(
-        sharding.clone(),
-        Inventory {
-            pool: cluster.pool(),
-        },
-        Payments {
-            pool: cluster.pool(),
-        },
-    )
-    .await
-    .expect("failed to register OrderWorkflow");
+    let order_workflow_client = OrderWorkflow
+        .register(sharding.clone(), Inventory, Payments)
+        .await
+        .expect("failed to register OrderWorkflow");
     tracing::info!("Registered OrderWorkflow");
 
     // Register the singleton using cluster's register_singleton feature

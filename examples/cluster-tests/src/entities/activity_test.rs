@@ -9,6 +9,7 @@
 //! All activity state is stored in PostgreSQL `activity_test_logs` table.
 
 use chrono::{DateTime, Utc};
+use cruster::__internal::ActivityScope;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -114,12 +115,11 @@ pub struct ExternalCallRequest {
 }
 
 /// Workflow that runs multiple activities to test journaling and replay.
+///
+/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
-pub struct ActivityWorkflow {
-    /// Database pool for writing activity data.
-    pub pool: PgPool,
-}
+pub struct ActivityWorkflow;
 
 #[workflow_impl(key = |req: &RunWithActivitiesRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
 impl ActivityWorkflow {
@@ -179,19 +179,21 @@ impl ActivityWorkflow {
 
     /// Log an activity to the activity log.
     ///
-    /// Writes the activity record to PostgreSQL. On replay, this should be
-    /// journaled and not re-executed.
+    /// Writes the activity record to PostgreSQL via the framework transaction.
+    /// On replay, this should be journaled and not re-executed.
     #[activity]
     async fn log_activity(&self, request: LogActivityRequest) -> Result<(), ClusterError> {
-        sqlx::query(
-            "INSERT INTO activity_test_logs (id, entity_id, action, timestamp)
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (entity_id, id) DO NOTHING",
+        let db = ActivityScope::db().await;
+        db.execute(
+            sqlx::query(
+                "INSERT INTO activity_test_logs (id, entity_id, action, timestamp)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (entity_id, id) DO NOTHING",
+            )
+            .bind(&request.id)
+            .bind(&request.entity_id)
+            .bind(&request.action),
         )
-        .bind(&request.id)
-        .bind(&request.entity_id)
-        .bind(&request.action)
-        .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("log_activity failed: {e}"),

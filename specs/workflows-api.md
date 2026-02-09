@@ -591,8 +591,7 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
  - **chess-cluster:** ✅ Removed — was a poor example (ephemeral in-memory state via `Arc<Mutex<...>>` instead of real DB, no workflows, no activity transactions). The `examples/cluster-tests/` suite is the canonical reference for correct patterns. Directory deleted, workspace Cargo.toml, knope.toml, README.md, and .rulesync rules updated.
  - **Phase 1 (entity compile errors + old codegen removal):** ✅ Done — `entity_impl_block_inner` now emits compile errors for: `#[state(...)]` ("entities are stateless; use a database for state management"), `#[workflow]` on entity methods ("use standalone #[workflow] for durable orchestration"), `#[activity]` on entity methods ("activities belong on workflows, not entities"), `&mut self` on entity methods ("entity methods must use &self"), `init()` method ("entities are stateless; fn init is no longer needed"), `traits(...)` on entity_impl ("entity traits have been replaced by #[rpc_group]"). Old stateful entity codegen path (`generate_entity`, `generate_dispatch_arms`, `TraitInfo`, `trait_infos_from_paths`) removed (~2000 lines). All entities now go through `generate_pure_rpc_entity`. UI trybuild tests updated to verify new compile errors.
  - **Phase 9 (old entity_trait and state infrastructure removal):** ✅ Done — Removed `#[entity_trait]` / `#[entity_trait_impl]` proc macro codegen (~480 lines `entity_trait_impl_inner`, ~280 lines `generate_trait_dispatch_impl` + `generate_trait_client_ext`). Macros now emit compile errors directing to `#[rpc_group]`/`#[rpc_group_impl]`. Removed `StateMutGuard`, `TraitStateMutGuard`, `StateRef` from `state_guard.rs` (~500 lines); kept `ActivityScope` (still used by workflow journaling) and `SqlTransactionHandle`. Removed `ArcSwap` dependency and `arc-swap` from all Cargo.toml files. Cleaned up lib.rs re-exports and prelude. Updated doc comments on `#[entity_impl]`. Updated UI trybuild test to not depend on removed macros.
-   - **Remaining work:**
-     - Phase 10.2-10.4: Fix cluster-tests anti-patterns (workflows/activity groups carrying `pool: PgPool` and using `self.pool` in activities instead of `ActivityScope::db()` framework transaction)
+   - **Phase 10.2-10.4 (fix cluster-tests anti-patterns):** ✅ Done — All workflows and activity groups in `examples/cluster-tests/` refactored to remove `pool: PgPool` fields and use `ActivityScope::db()` for transactional DB writes. **Workflows fixed:** `SimpleWorkflow`, `FailingWorkflow`, `LongWorkflow` (workflow_test.rs — 10 activity methods), `ActivityWorkflow` (activity_test.rs — 1 activity method), `ScheduleTimerWorkflow` (timer_test.rs — 4 activity methods), `OrderWorkflow` (activity_group_test.rs — 1 local activity). **Activity groups fixed:** `Inventory` (2 activity methods), `Payments` (1 activity method). **Also updated:** `SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, `SqlCountWorkflow` (sql_activity_test.rs) migrated from `ActivityScope::sql_transaction()` pattern to cleaner `ActivityScope::db()`. Registration in `main.rs` updated — workflows are now unit structs, activity groups are unit structs.
 
 ### Phase 1: Simplify Entities
 
@@ -823,29 +822,29 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 4. **Note on `self.db()` via codegen:** Generating `self.db()` directly on `__ActivityView` was not feasible because `#[cfg(feature = "sql")]` in macro-generated code evaluates against the downstream crate's features (not cruster's), causing either unexpected-cfg warnings or missing methods. Instead, `ActivityScope::db()` is a standalone method users call in activity bodies.
 5. **Test added:** `db_panics_for_memory_storage` verifies panic when using memory storage.
 
-#### 10.2: Fix cluster-tests workflows (remove `pool: PgPool`, use `self.db()`)
+#### 10.2: Fix cluster-tests workflows (remove `pool: PgPool`, use `ActivityScope::db()`) ✅
 
-All workflows below carry `pool: PgPool` and use `self.pool` in `#[activity]` methods, bypassing the framework transaction. Each must be refactored to: remove the `pool` field, use `ActivityScope::db().await` in activities.
+All workflows refactored to remove `pool: PgPool` fields and use `ActivityScope::db().await` in activities.
 
-1. **`SimpleWorkflow`** (`workflow_test.rs:138`) — 3 activities (`create_execution`, `complete_step`, `mark_completed`) use `self.pool`
-2. **`FailingWorkflow`** (`workflow_test.rs:257`) — 4 activities (`create_execution`, `complete_step`, `mark_completed`, `mark_failed`) use `self.pool`
-3. **`LongWorkflow`** (`workflow_test.rs:407`) — 3 activities (`create_execution`, `complete_step`, `mark_completed`) use `self.pool`
-4. **`ActivityWorkflow`** (`activity_test.rs:119`) — 1 activity (`log_activity`) uses `self.pool`
-5. **`ScheduleTimerWorkflow`** (`timer_test.rs:224`) — 4 activities (`add_pending_timer`, `check_cancelled`, `record_timer_fire`, `remove_pending_timer`) use `self.pool`; `record_timer_fire` runs 2 SQL statements outside any transaction
-6. **`OrderWorkflow`** (`activity_group_test.rs:188`) — 1 local activity (`summarize`) uses `self.pool`
+1. **`SimpleWorkflow`** — 3 activities updated ✅
+2. **`FailingWorkflow`** — 4 activities updated ✅
+3. **`LongWorkflow`** — 3 activities updated ✅
+4. **`ActivityWorkflow`** — 1 activity updated ✅
+5. **`ScheduleTimerWorkflow`** — 4 activities updated (including `record_timer_fire` which now runs both SQL statements in the same framework transaction) ✅
+6. **`OrderWorkflow`** — 1 local activity updated ✅
 
-#### 10.3: Fix cluster-tests activity groups (remove `pool: PgPool`, use `self.db()`)
+#### 10.3: Fix cluster-tests activity groups (remove `pool: PgPool`, use `ActivityScope::db()`) ✅
 
-1. **`Inventory`** (`activity_group_test.rs:24`) — 2 activities (`reserve_items`, `confirm_reservation`) use `self.pool`
-2. **`Payments`** (`activity_group_test.rs:108`) — 1 activity (`charge_payment`) uses `self.pool`
+1. **`Inventory`** — 2 activities updated ✅
+2. **`Payments`** — 1 activity updated ✅
 
-#### 10.4: Update registration in `main.rs`
+#### 10.4: Update registration in `main.rs` ✅
 
-Remove `pool: cluster.pool()` from all workflow and activity group constructions. Workflows become unit structs or carry only non-DB fields (e.g., HTTP clients). Entity registrations (which legitimately need `pool`) remain unchanged.
+Removed `pool: cluster.pool()` from all workflow and activity group constructions. Workflows are now unit structs. Activity groups are unit structs. Entity registrations (which legitimately need `pool`) remain unchanged.
 
-**Total: 8 structs, 22 activity methods to fix.**
+#### 10.6: Update `sql_activity_test.rs` to use `ActivityScope::db()` ✅
 
-> **Note:** The `SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, and `SqlCountWorkflow` in `sql_activity_test.rs` already use `ActivityScope::sql_transaction()` correctly — they can be updated to use `ActivityScope::db().await` for a cleaner API (no `if let Some(tx)` pattern needed).
+`SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, and `SqlCountWorkflow` migrated from `ActivityScope::sql_transaction()` (with `if let Some(tx)` pattern) to cleaner `ActivityScope::db().await` API.
 
 #### 10.5: Delete `examples/chess-cluster/` ✅
 

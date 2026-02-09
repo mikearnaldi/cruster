@@ -16,6 +16,7 @@
 //! - `timer_test_pending` — currently pending/cancelled timers
 
 use chrono::{DateTime, Utc};
+use cruster::__internal::ActivityScope;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -219,12 +220,11 @@ pub struct ScheduleTimerRequest {
 /// Creates a pending timer record, sleeps for the delay duration,
 /// then checks if the timer was cancelled. If not cancelled, records
 /// the timer fire and removes the pending record.
+///
+/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
-pub struct ScheduleTimerWorkflow {
-    /// Database pool for writing timer data.
-    pub pool: PgPool,
-}
+pub struct ScheduleTimerWorkflow;
 
 #[workflow_impl(key = |req: &ScheduleTimerRequest| format!("{}/{}", req.entity_id, req.timer_id), hash = false)]
 impl ScheduleTimerWorkflow {
@@ -272,16 +272,18 @@ impl ScheduleTimerWorkflow {
         scheduled_at: DateTime<Utc>,
         delay_ms: i64,
     ) -> Result<(), ClusterError> {
-        sqlx::query(
-            "INSERT INTO timer_test_pending (entity_id, timer_id, scheduled_at, delay_ms, cancelled)
-             VALUES ($1, $2, $3, $4, false)
-             ON CONFLICT (entity_id, timer_id) DO NOTHING",
+        let db = ActivityScope::db().await;
+        db.execute(
+            sqlx::query(
+                "INSERT INTO timer_test_pending (entity_id, timer_id, scheduled_at, delay_ms, cancelled)
+                 VALUES ($1, $2, $3, $4, false)
+                 ON CONFLICT (entity_id, timer_id) DO NOTHING",
+            )
+            .bind(&entity_id)
+            .bind(&timer_id)
+            .bind(scheduled_at)
+            .bind(delay_ms),
         )
-        .bind(&entity_id)
-        .bind(&timer_id)
-        .bind(scheduled_at)
-        .bind(delay_ms)
-        .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("add_pending_timer failed: {e}"),
@@ -296,18 +298,21 @@ impl ScheduleTimerWorkflow {
         entity_id: String,
         timer_id: String,
     ) -> Result<bool, ClusterError> {
-        let row: Option<(bool,)> = sqlx::query_as(
-            "SELECT cancelled FROM timer_test_pending
-             WHERE entity_id = $1 AND timer_id = $2",
-        )
-        .bind(&entity_id)
-        .bind(&timer_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| ClusterError::PersistenceError {
-            reason: format!("check_cancelled failed: {e}"),
-            source: None,
-        })?;
+        let db = ActivityScope::db().await;
+        let row: Option<(bool,)> = db
+            .fetch_optional(
+                sqlx::query_as(
+                    "SELECT cancelled FROM timer_test_pending
+                     WHERE entity_id = $1 AND timer_id = $2",
+                )
+                .bind(&entity_id)
+                .bind(&timer_id),
+            )
+            .await
+            .map_err(|e| ClusterError::PersistenceError {
+                reason: format!("check_cancelled failed: {e}"),
+                source: None,
+            })?;
 
         Ok(row.is_some_and(|(cancelled,)| cancelled))
     }
@@ -320,17 +325,20 @@ impl ScheduleTimerWorkflow {
         scheduled_at: DateTime<Utc>,
         fired_at: DateTime<Utc>,
     ) -> Result<(), ClusterError> {
+        let db = ActivityScope::db().await;
+
         // Insert fire record
-        sqlx::query(
-            "INSERT INTO timer_test_fires (entity_id, timer_id, scheduled_at, fired_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (entity_id, timer_id) DO NOTHING",
+        db.execute(
+            sqlx::query(
+                "INSERT INTO timer_test_fires (entity_id, timer_id, scheduled_at, fired_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (entity_id, timer_id) DO NOTHING",
+            )
+            .bind(&entity_id)
+            .bind(&timer_id)
+            .bind(scheduled_at)
+            .bind(fired_at),
         )
-        .bind(&entity_id)
-        .bind(&timer_id)
-        .bind(scheduled_at)
-        .bind(fired_at)
-        .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("record_timer_fire failed: {e}"),
@@ -338,15 +346,16 @@ impl ScheduleTimerWorkflow {
         })?;
 
         // Remove from pending
-        sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
-            .bind(&entity_id)
-            .bind(&timer_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| ClusterError::PersistenceError {
-                reason: format!("record_timer_fire (cleanup) failed: {e}"),
-                source: None,
-            })?;
+        db.execute(
+            sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
+                .bind(&entity_id)
+                .bind(&timer_id),
+        )
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("record_timer_fire (cleanup) failed: {e}"),
+            source: None,
+        })?;
 
         Ok(())
     }
@@ -357,15 +366,17 @@ impl ScheduleTimerWorkflow {
         entity_id: String,
         timer_id: String,
     ) -> Result<(), ClusterError> {
-        sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
-            .bind(&entity_id)
-            .bind(&timer_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| ClusterError::PersistenceError {
-                reason: format!("remove_pending_timer failed: {e}"),
-                source: None,
-            })?;
+        let db = ActivityScope::db().await;
+        db.execute(
+            sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
+                .bind(&entity_id)
+                .bind(&timer_id),
+        )
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("remove_pending_timer failed: {e}"),
+            source: None,
+        })?;
         Ok(())
     }
 }

@@ -66,6 +66,9 @@ echo ""
 "$SCRIPT_DIR/test_shard_topology.sh"
 echo ""
 
+"$SCRIPT_DIR/test_stateless_counter.sh"
+echo ""
+
 # Singleton failover test runs last since it kills a node
 # Only run if DOCKER_COMPOSE_PROJECT is set
 if [ -n "$DOCKER_COMPOSE_PROJECT" ]; then

@@ -19,8 +19,10 @@ use crate::entities::{
     KVStoreClient, Message, PendingTimer, PingRequest, ReceiveRequest, ResetPingCountRequest,
     RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
     RunWithActivitiesRequest, ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState,
-    SqlActivityTestClient, SqlActivityTestState, TimerFire, TimerTestClient, TraitTestClient,
-    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
+    SqlActivityTestClient, SqlActivityTestState, StatelessCounterClient, StatelessDecrementRequest,
+    StatelessGetRequest, StatelessIncrementRequest, StatelessResetRequest, TimerFire,
+    TimerTestClient, TraitTestClient, TransferRequest, UpdateRequest, WorkflowExecution,
+    WorkflowTestClient,
 };
 // Import trait client extensions to make trait methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
@@ -43,6 +45,8 @@ pub struct AppState {
     pub cross_entity_client: CrossEntityClient,
     /// SqlActivityTest entity client.
     pub sql_activity_test_client: SqlActivityTestClient,
+    /// StatelessCounter entity client (pure-RPC, new API).
+    pub stateless_counter_client: StatelessCounterClient,
     /// Singleton manager (uses cluster's register_singleton feature).
     pub singleton_manager: Arc<SingletonManager>,
     /// Reference to the sharding implementation for debug endpoints.
@@ -120,6 +124,23 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/cross/:id/messages", get(cross_get_messages))
         .route("/cross/:id/clear", post(cross_clear_messages))
         .route("/cross/:id/ping-pong", post(cross_ping_pong))
+        // StatelessCounter routes (pure-RPC, new API)
+        .route(
+            "/stateless-counter/:id",
+            get(stateless_counter_get),
+        )
+        .route(
+            "/stateless-counter/:id/increment",
+            post(stateless_counter_increment),
+        )
+        .route(
+            "/stateless-counter/:id/decrement",
+            post(stateless_counter_decrement),
+        )
+        .route(
+            "/stateless-counter/:id/reset",
+            post(stateless_counter_reset),
+        )
         // SingletonTest routes (uses cluster's register_singleton feature)
         .route("/singleton/state", get(singleton_state))
         .route("/singleton/tick-count", get(singleton_tick_count))
@@ -873,6 +894,86 @@ async fn singleton_current_runner(
 /// Reset the singleton state (for testing).
 async fn singleton_reset(State(state): State<Arc<AppState>>) -> Result<Json<()>, AppError> {
     state.singleton_manager.reset().await?;
+    Ok(Json(()))
+}
+
+// ============================================================================
+// StatelessCounter handlers (pure-RPC, new API)
+// ============================================================================
+
+/// Get current stateless counter value.
+async fn stateless_counter_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<i64>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let value = state
+        .stateless_counter_client
+        .get(
+            &entity_id,
+            &StatelessGetRequest {
+                entity_id: id,
+            },
+        )
+        .await?;
+    Ok(Json(value))
+}
+
+/// Increment stateless counter by given amount.
+async fn stateless_counter_increment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(amount): Json<i64>,
+) -> Result<Json<i64>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let value = state
+        .stateless_counter_client
+        .increment(
+            &entity_id,
+            &StatelessIncrementRequest {
+                entity_id: id,
+                amount,
+            },
+        )
+        .await?;
+    Ok(Json(value))
+}
+
+/// Decrement stateless counter by given amount.
+async fn stateless_counter_decrement(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(amount): Json<i64>,
+) -> Result<Json<i64>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let value = state
+        .stateless_counter_client
+        .decrement(
+            &entity_id,
+            &StatelessDecrementRequest {
+                entity_id: id,
+                amount,
+            },
+        )
+        .await?;
+    Ok(Json(value))
+}
+
+/// Reset stateless counter to zero.
+async fn stateless_counter_reset(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<()>, AppError> {
+    let entity_id = EntityId::new(&id);
+    state
+        .stateless_counter_client
+        .reset(
+            &entity_id,
+            &StatelessResetRequest {
+                entity_id: id,
+            },
+        )
+        .await?;
     Ok(Json(()))
 }
 

@@ -559,10 +559,11 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 - **Phase 1 (partial):** ✅ Done — Pure-RPC entity codegen path added. When an entity has no `#[state]`, no `#[workflow]`, no `#[activity]` methods (only `#[rpc]` methods), `generate_pure_rpc_entity()` generates a simplified Handler without `__state`, `__write_lock`, `__state_storage`, `__state_key`, `__workflow_engine`, view structs, or ArcSwap. Methods are called directly on `__entity`. Tests: entity type, dispatch, multi-param, unknown tag, register, persisted RPC. Old stateful codegen path untouched — all existing tests pass.
 - **Phase 9 (test migration, partial):** ✅ Done — `PersistedMethodEntity`, `MixedEntity`, and `PersistedIdempotentEntity` tests migrated from `#[workflow]` to `#[rpc(persisted)]`. These entities previously used `#[workflow]` purely for persisted delivery (no activities, no state); they now correctly use the new API pattern.
 - **Phase 9 (test migration, key extraction):** ✅ Done — `PersistedKeyEntity` and `MultiParamPersisted` migrated from entity `#[workflow(key(...))]` to standalone `#[workflow]`/`#[workflow_impl(key = ...)]`. `PersistedKeyEntity` → `UpdateWorkflow` with `key = |req: &UpdateRequest| req.id.clone()`. `MultiParamPersisted` → `SendEmailWorkflow` with `SendEmailRequest` struct and `key = |req: &SendEmailRequest| req.order_id.clone()`. Tests verify same-key-field produces same entity_id and subset-field key extraction.
+- **Phase 8 (partial):** StatelessCounter integration test entity added to `examples/cluster-tests/`. Pure-RPC entity with `#[rpc]` and `#[rpc(persisted)]` methods, manages state directly in PostgreSQL (`stateless_counter_values` table). HTTP routes, shell test script (`test_stateless_counter.sh`), and SQL migration added.
 - **Remaining work:**
-  - Phase 1 (remaining): Emit compile errors for #[state], #[workflow], #[activity], &mut self on entities; remove old codegen
-  - Phase 8: Integration testing (not yet started)
-  - Phase 9 (remaining): Remove old entity_trait macros, state infrastructure, delete remaining old-pattern tests (Counter, PersistedCounter, entity traits, stateful entities — these test features being removed, not migrated)
+   - Phase 1 (remaining): Emit compile errors for #[state], #[workflow], #[activity], &mut self on entities; remove old codegen
+   - Phase 8 (remaining): Add standalone workflow integration test, RPC group integration test, activity group integration test
+   - Phase 9 (remaining): Remove old entity_trait macros, state infrastructure, delete remaining old-pattern tests (Counter, PersistedCounter, entity traits, stateful entities — these test features being removed, not migrated)
 
 ### Phase 1: Simplify Entities
 

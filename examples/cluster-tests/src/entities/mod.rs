@@ -11,6 +11,7 @@
 //! - `CrossEntity` - Entity-to-entity calls
 //! - `SingletonTest` - Singleton entity behavior
 //! - `SqlActivityTest` - SQL execution within activity transactions
+//! - `StatelessCounter` - Pure-RPC stateless entity (new API)
 
 pub mod activity_test;
 pub mod counter;
@@ -18,6 +19,7 @@ pub mod cross_entity;
 pub mod kv_store;
 pub mod singleton_test;
 pub mod sql_activity_test;
+pub mod stateless_counter;
 pub mod timer_test;
 pub mod trait_test;
 pub mod workflow_test;
@@ -41,6 +43,10 @@ pub use timer_test::{
     TimerTest, TimerTestClient,
 };
 pub use trait_test::{AuditEntry, Auditable, TraitTest, TraitTestClient, UpdateRequest, Versioned};
+pub use stateless_counter::{
+    StatelessCounter, StatelessCounterClient, StatelessDecrementRequest, StatelessGetRequest,
+    StatelessIncrementRequest, StatelessResetRequest,
+};
 pub use workflow_test::{
     GetExecutionRequest, RunFailingWorkflowRequest, RunLongWorkflowRequest,
     RunSimpleWorkflowRequest, WorkflowExecution, WorkflowTest, WorkflowTestClient,

@@ -149,6 +149,39 @@ impl ActivityScope {
         });
     }
 
+    /// Get the activity's SQL transaction handle.
+    ///
+    /// This is a convenience method that calls `sql_transaction()` and panics
+    /// if no SQL transaction is available. Use this in `#[activity]` methods
+    /// when you know the storage backend supports SQL transactions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside of an activity scope or if the storage
+    /// backend does not support SQL transactions (e.g., memory storage).
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// #[activity]
+    /// async fn transfer(&self, to: String, amount: i64) -> Result<(), ClusterError> {
+    ///     let db = ActivityScope::db().await;
+    ///     db.execute(
+    ///         sqlx::query("INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)")
+    ///             .bind(&self.id)
+    ///             .bind(&to)
+    ///             .bind(amount)
+    ///     ).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(feature = "sql")]
+    pub async fn db() -> SqlTransactionHandle {
+        Self::sql_transaction()
+            .await
+            .expect("db() requires an active SQL transaction; are you inside an #[activity] with SQL storage?")
+    }
+
     /// Get the underlying SQL transaction for executing arbitrary SQL.
     ///
     /// Returns `None` if:
@@ -160,7 +193,6 @@ impl ActivityScope {
     /// ```text
     /// #[activity]
     /// async fn transfer(&self, to: String, amount: i64) -> Result<(), ClusterError> {
-    ///     // Execute arbitrary SQL in the activity's transaction
     ///     if let Some(tx) = ActivityScope::sql_transaction().await {
     ///         tx.execute(
     ///             sqlx::query("INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)")
@@ -169,7 +201,6 @@ impl ActivityScope {
     ///                 .bind(amount)
     ///         ).await?;
     ///     }
-    ///     
     ///     Ok(())
     /// }
     /// ```
@@ -381,5 +412,20 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sql")]
+    #[should_panic(expected = "db() requires an active SQL transaction")]
+    async fn db_panics_for_memory_storage() {
+        let storage: Arc<dyn crate::durable::WorkflowStorage> =
+            Arc::new(MemoryWorkflowStorage::new());
+
+        let _ = ActivityScope::run(&storage, || async {
+            // db() should panic when using memory storage (no SQL transaction)
+            let _db = ActivityScope::db().await;
+            Ok::<_, crate::error::ClusterError>(())
+        })
+        .await;
     }
 }

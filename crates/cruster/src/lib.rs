@@ -112,6 +112,11 @@ pub mod prelude {
     pub use crate::entity::{Entity, EntityContext, EntityHandler};
     pub use crate::entity_client::WorkflowClientFactory;
     pub use crate::error::ClusterError;
+
+    // Activity scope for transactional activities
+    pub use crate::state_guard::ActivityScope;
+    #[cfg(feature = "sql")]
+    pub use crate::state_guard::SqlTransactionHandle;
 }
 mod durable;
 

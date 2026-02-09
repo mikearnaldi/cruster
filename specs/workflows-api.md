@@ -592,7 +592,7 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
  - **Phase 1 (entity compile errors + old codegen removal):** ✅ Done — `entity_impl_block_inner` now emits compile errors for: `#[state(...)]` ("entities are stateless; use a database for state management"), `#[workflow]` on entity methods ("use standalone #[workflow] for durable orchestration"), `#[activity]` on entity methods ("activities belong on workflows, not entities"), `&mut self` on entity methods ("entity methods must use &self"), `init()` method ("entities are stateless; fn init is no longer needed"), `traits(...)` on entity_impl ("entity traits have been replaced by #[rpc_group]"). Old stateful entity codegen path (`generate_entity`, `generate_dispatch_arms`, `TraitInfo`, `trait_infos_from_paths`) removed (~2000 lines). All entities now go through `generate_pure_rpc_entity`. UI trybuild tests updated to verify new compile errors.
  - **Phase 9 (old entity_trait and state infrastructure removal):** ✅ Done — Removed `#[entity_trait]` / `#[entity_trait_impl]` proc macro codegen (~480 lines `entity_trait_impl_inner`, ~280 lines `generate_trait_dispatch_impl` + `generate_trait_client_ext`). Macros now emit compile errors directing to `#[rpc_group]`/`#[rpc_group_impl]`. Removed `StateMutGuard`, `TraitStateMutGuard`, `StateRef` from `state_guard.rs` (~500 lines); kept `ActivityScope` (still used by workflow journaling) and `SqlTransactionHandle`. Removed `ArcSwap` dependency and `arc-swap` from all Cargo.toml files. Cleaned up lib.rs re-exports and prelude. Updated doc comments on `#[entity_impl]`. Updated UI trybuild test to not depend on removed macros.
    - **Remaining work:**
-     - Phase 10: Replace `self.transaction()` with `self.db()` in activity view codegen; fix cluster-tests anti-patterns (workflows/activity groups carrying `pool: PgPool` and using `self.pool` in activities instead of the framework transaction)
+     - Phase 10.2-10.4: Fix cluster-tests anti-patterns (workflows/activity groups carrying `pool: PgPool` and using `self.pool` in activities instead of `ActivityScope::db()` framework transaction)
 
 ### Phase 1: Simplify Entities
 
@@ -815,22 +815,17 @@ Each workflow type maps to an entity type. The entity is fully managed by the fr
 
 **Goal:** Activities get the DB transaction automatically via `self.db()`. Workflows and activity groups should not carry `PgPool` fields for activity SQL. Fix all cluster-tests anti-patterns.
 
-#### 10.1: Framework changes
+#### 10.1: Framework changes ✅
 
-1. **Replace `self.transaction()` with `self.db()` in `__ActivityView`**
-   - Rename the generated method from `transaction()` to `db()`
-   - Return type: `&mut PgConnection` (or equivalent executor that is the activity's transaction)
-   - The transaction is opened automatically by the activity delegation wrapper (already happens via `ActivityScope`)
-   - `self.db()` is available in both workflow activities and activity group activities
-
-2. **Remove `SqlTransactionHandle` from public API** (if `self.db()` replaces it)
-   - Or keep as an internal type used by the generated code
-
-3. **Update `ActivityScope`** to make the transaction accessible through the view struct rather than requiring `ActivityScope::sql_transaction()` calls
+1. **Added `ActivityScope::db()` convenience method** — returns `SqlTransactionHandle`, panics if no SQL transaction available. This is the recommended API for activity methods. Available when cruster's `sql` feature is enabled.
+2. **Kept `SqlTransactionHandle` as public API** — exported from both `cruster::prelude` and `cruster::__internal`. It's the return type of `ActivityScope::db()` and `ActivityScope::sql_transaction()`.
+3. **Added `ActivityScope` and `SqlTransactionHandle` to `cruster::prelude`** — users can now `use cruster::prelude::*` and call `ActivityScope::db().await` in activities.
+4. **Note on `self.db()` via codegen:** Generating `self.db()` directly on `__ActivityView` was not feasible because `#[cfg(feature = "sql")]` in macro-generated code evaluates against the downstream crate's features (not cruster's), causing either unexpected-cfg warnings or missing methods. Instead, `ActivityScope::db()` is a standalone method users call in activity bodies.
+5. **Test added:** `db_panics_for_memory_storage` verifies panic when using memory storage.
 
 #### 10.2: Fix cluster-tests workflows (remove `pool: PgPool`, use `self.db()`)
 
-All workflows below carry `pool: PgPool` and use `self.pool` in `#[activity]` methods, bypassing the framework transaction. Each must be refactored to: remove the `pool` field, use `self.db()` in activities.
+All workflows below carry `pool: PgPool` and use `self.pool` in `#[activity]` methods, bypassing the framework transaction. Each must be refactored to: remove the `pool` field, use `ActivityScope::db().await` in activities.
 
 1. **`SimpleWorkflow`** (`workflow_test.rs:138`) — 3 activities (`create_execution`, `complete_step`, `mark_completed`) use `self.pool`
 2. **`FailingWorkflow`** (`workflow_test.rs:257`) — 4 activities (`create_execution`, `complete_step`, `mark_completed`, `mark_failed`) use `self.pool`
@@ -850,7 +845,7 @@ Remove `pool: cluster.pool()` from all workflow and activity group constructions
 
 **Total: 8 structs, 22 activity methods to fix.**
 
-> **Note:** The `SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, and `SqlCountWorkflow` in `sql_activity_test.rs` already use `ActivityScope::sql_transaction()` correctly — they are the exemplar pattern and do not need changes beyond renaming to `self.db()`.
+> **Note:** The `SqlTransferWorkflow`, `SqlFailingTransferWorkflow`, and `SqlCountWorkflow` in `sql_activity_test.rs` already use `ActivityScope::sql_transaction()` correctly — they can be updated to use `ActivityScope::db().await` for a cleaner API (no `if let Some(tx)` pattern needed).
 
 #### 10.5: Delete `examples/chess-cluster/` ✅
 

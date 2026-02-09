@@ -1868,6 +1868,520 @@ fn entity_trait_impl_inner(
 /// views Deref to the entity struct so `self.field` keeps working.
 ///
 /// Persistence infrastructure (storage, sharding, journaling, durable builtins) is
+/// Generate simplified entity code for "pure RPC" entities.
+///
+/// Pure-RPC entities have no `#[state]`, no `#[workflow]`, no `#[activity]`,
+/// and no `&mut self` methods. The generated Handler is minimal:
+/// - `__entity`: the user struct (methods called directly via Deref)
+/// - `ctx`: EntityContext
+/// - `__sharding`, `__entity_address`: for inter-entity communication
+/// - `__message_storage`: for persisted RPCs
+///
+/// No view structs, no ArcSwap, no write locks, no workflow engine.
+#[allow(clippy::too_many_arguments)]
+fn generate_pure_rpc_entity(
+    krate: &syn::Path,
+    struct_name: &syn::Ident,
+    handler_name: &syn::Ident,
+    client_name: &syn::Ident,
+    rpc_group_infos: &[RpcGroupInfo],
+    rpcs: &[RpcMethod],
+    original_methods: &[syn::ImplItemFn],
+) -> syn::Result<proc_macro2::TokenStream> {
+    let has_rpc_groups = !rpc_group_infos.is_empty();
+    let struct_name_str = struct_name.to_string();
+
+    // --- Entity trait impl (only when no rpc_groups — groups generate their own) ---
+    let entity_impl = if has_rpc_groups {
+        quote! {}
+    } else {
+        quote! {
+            #[async_trait::async_trait]
+            impl #krate::entity::Entity for #struct_name {
+                fn entity_type(&self) -> #krate::types::EntityType {
+                    self.__entity_type()
+                }
+
+                fn shard_group(&self) -> &str {
+                    self.__shard_group()
+                }
+
+                fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
+                    self.__shard_group_for(entity_id)
+                }
+
+                fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
+                    self.__max_idle_time()
+                }
+
+                fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
+                    self.__mailbox_capacity()
+                }
+
+                fn concurrency(&self) -> ::std::option::Option<usize> {
+                    self.__concurrency()
+                }
+
+                async fn spawn(
+                    &self,
+                    ctx: #krate::entity::EntityContext,
+                ) -> ::std::result::Result<
+                    ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
+                    #krate::error::ClusterError,
+                > {
+                    let handler = #handler_name::__new(self.clone(), ctx).await?;
+                    ::std::result::Result::Ok(::std::boxed::Box::new(handler))
+                }
+            }
+        }
+    };
+
+    // --- Dispatch arms: call methods directly on __entity ---
+    let dispatch_arms: Vec<proc_macro2::TokenStream> = rpcs
+        .iter()
+        .filter(|rpc| rpc.is_dispatchable())
+        .map(|rpc| {
+            let tag = &rpc.tag;
+            let method_name = &rpc.name;
+            let param_count = rpc.params.len();
+            let param_names: Vec<_> = rpc.params.iter().map(|p| &p.name).collect();
+            let param_types: Vec<_> = rpc.params.iter().map(|p| &p.ty).collect();
+
+            let deserialize_request = match param_count {
+                0 => quote! {},
+                1 => {
+                    let name = &param_names[0];
+                    let ty = &param_types[0];
+                    quote! {
+                        let #name: #ty = rmp_serde::from_slice(payload)
+                            .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                                reason: ::std::format!("failed to deserialize request for '{}': {e}", #tag),
+                                source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                            })?;
+                    }
+                }
+                _ => quote! {
+                    let (#(#param_names),*): (#(#param_types),*) = rmp_serde::from_slice(payload)
+                        .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                            reason: ::std::format!("failed to deserialize request for '{}': {e}", #tag),
+                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                        })?;
+                },
+            };
+
+            let mut call_args: Vec<proc_macro2::TokenStream> = Vec::new();
+            for name in &param_names {
+                call_args.push(quote! { #name });
+            }
+            let call_args = quote! { #(#call_args),* };
+            let method_call = quote! { self.__entity.#method_name(#call_args).await? };
+
+            quote! {
+                #tag => {
+                    #deserialize_request
+                    let response = { #method_call };
+                    rmp_serde::to_vec(&response)
+                        .map_err(|e| #krate::error::ClusterError::MalformedMessage {
+                            reason: ::std::format!("failed to serialize response for '{}': {e}", #tag),
+                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                        })
+                }
+            }
+        })
+        .collect();
+
+    // --- Client methods (reuse existing function) ---
+    let client_methods = generate_client_methods(krate, rpcs);
+
+    // --- RPC group infrastructure ---
+    let rpc_group_field_defs: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let wrapper_path = &info.wrapper_path;
+            quote! { #field: #wrapper_path, }
+        })
+        .collect();
+
+    let rpc_group_params: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let path = &info.path;
+            let field = &info.field;
+            quote! { #field: #path }
+        })
+        .collect();
+
+    let rpc_group_field_inits: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            let wrapper_path = &info.wrapper_path;
+            quote! { #field: #wrapper_path::new(#field), }
+        })
+        .collect();
+
+    let rpc_group_dispatch_checks: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let field = &info.field;
+            quote! {
+                if let ::std::option::Option::Some(response) = self.#field.__dispatch(tag, payload, headers).await? {
+                    return ::std::result::Result::Ok(response);
+                }
+            }
+        })
+        .collect();
+
+    let rpc_group_handler_access_impls: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let wrapper_path = &info.wrapper_path;
+            let access_trait_path = &info.access_trait_path;
+            let field = &info.field;
+            quote! {
+                impl #access_trait_path for #handler_name {
+                    fn __rpc_group_wrapper(&self) -> &#wrapper_path {
+                        &self.#field
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let rpc_group_use_tokens: Vec<proc_macro2::TokenStream> = rpc_group_infos
+        .iter()
+        .map(|info| {
+            let methods_trait_path = &info.methods_trait_path;
+            quote! {
+                #[allow(unused_imports)]
+                use #methods_trait_path as _;
+            }
+        })
+        .collect();
+
+    let dispatch_fallback = if has_rpc_groups {
+        quote! {{
+            #(#rpc_group_dispatch_checks)*
+            ::std::result::Result::Err(
+                #krate::error::ClusterError::MalformedMessage {
+                    reason: ::std::format!("unknown RPC tag: {tag}"),
+                    source: ::std::option::Option::None,
+                }
+            )
+        }}
+    } else {
+        quote! {{
+            ::std::result::Result::Err(
+                #krate::error::ClusterError::MalformedMessage {
+                    reason: ::std::format!("unknown RPC tag: {tag}"),
+                    source: ::std::option::Option::None,
+                }
+            )
+        }}
+    };
+
+    // --- Method impls on struct (user's original method bodies) ---
+    let method_impls: Vec<proc_macro2::TokenStream> = original_methods
+        .iter()
+        .map(|m| {
+            let attrs: Vec<_> = m
+                .attrs
+                .iter()
+                .filter(|a| {
+                    !a.path().is_ident("rpc")
+                        && !a.path().is_ident("workflow")
+                        && !a.path().is_ident("activity")
+                        && !a.path().is_ident("method")
+                        && !a.path().is_ident("public")
+                        && !a.path().is_ident("protected")
+                        && !a.path().is_ident("private")
+                })
+                .collect();
+            let vis = &m.vis;
+            let sig = &m.sig;
+            let block = &m.block;
+            quote! {
+                #(#attrs)*
+                #vis #sig #block
+            }
+        })
+        .collect();
+
+    // --- Constructor functions ---
+    let new_fn = if has_rpc_groups {
+        quote! {}
+    } else {
+        quote! {
+            #[doc(hidden)]
+            pub async fn __new(entity: #struct_name, ctx: #krate::entity::EntityContext) -> ::std::result::Result<Self, #krate::error::ClusterError> {
+                let __sharding = ctx.sharding.clone();
+                let __entity_address = ctx.address.clone();
+                let __message_storage = ctx.message_storage.clone();
+                ::std::result::Result::Ok(Self {
+                    __entity: entity,
+                    ctx,
+                    __sharding,
+                    __entity_address,
+                    __message_storage,
+                })
+            }
+        }
+    };
+
+    let new_with_rpc_groups_fn = if has_rpc_groups {
+        quote! {
+            #[doc(hidden)]
+            pub async fn __new_with_rpc_groups(
+                entity: #struct_name,
+                #(#rpc_group_params,)*
+                ctx: #krate::entity::EntityContext,
+            ) -> ::std::result::Result<Self, #krate::error::ClusterError> {
+                let __sharding = ctx.sharding.clone();
+                let __entity_address = ctx.address.clone();
+                let __message_storage = ctx.message_storage.clone();
+                ::std::result::Result::Ok(Self {
+                    __entity: entity,
+                    ctx,
+                    __sharding,
+                    __entity_address,
+                    __message_storage,
+                    #(#rpc_group_field_inits)*
+                })
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // --- Sharding helper methods (always available) ---
+    let sharding_builtin_impls = quote! {
+        /// Get the sharding interface for inter-entity communication.
+        pub fn sharding(&self) -> ::std::option::Option<&::std::sync::Arc<dyn #krate::sharding::Sharding>> {
+            self.__sharding.as_ref()
+        }
+
+        /// Get the entity's own address.
+        pub fn entity_address(&self) -> &#krate::types::EntityAddress {
+            &self.__entity_address
+        }
+
+        /// Get the entity ID.
+        pub fn entity_id(&self) -> &#krate::types::EntityId {
+            &self.__entity_address.entity_id
+        }
+
+        /// Create an entity client for this entity type.
+        pub fn self_client(&self) -> ::std::option::Option<#krate::entity_client::EntityClient> {
+            self.__sharding.as_ref().map(|s| {
+                ::std::sync::Arc::clone(s).make_client(self.__entity_address.entity_type.clone())
+            })
+        }
+    };
+
+    // --- WithRpcGroups wrapper (if applicable) ---
+    let with_rpc_groups_impl = if has_rpc_groups {
+        let with_groups_name = format_ident!("{}WithRpcGroups", struct_name);
+        let rpc_group_option_fields: Vec<proc_macro2::TokenStream> = rpc_group_infos
+            .iter()
+            .map(|info| {
+                let field = &info.field;
+                let path = &info.path;
+                quote! { #field: #path, }
+            })
+            .collect();
+        let register_rpc_group_params: Vec<proc_macro2::TokenStream> = rpc_group_infos
+            .iter()
+            .map(|info| {
+                let field = &info.field;
+                let path = &info.path;
+                quote! { #field: #path }
+            })
+            .collect();
+        let register_rpc_group_fields: Vec<_> =
+            rpc_group_infos.iter().map(|info| &info.field).collect();
+        quote! {
+            /// Wrapper struct that bundles an entity with its RPC groups.
+            #[doc(hidden)]
+            pub struct #with_groups_name {
+                pub entity: #struct_name,
+                #(pub #rpc_group_option_fields)*
+            }
+
+            #[async_trait::async_trait]
+            impl #krate::entity::Entity for #with_groups_name
+            where
+                #struct_name: ::std::clone::Clone,
+            {
+                fn entity_type(&self) -> #krate::types::EntityType {
+                    self.entity.__entity_type()
+                }
+
+                fn shard_group(&self) -> &str {
+                    self.entity.__shard_group()
+                }
+
+                fn shard_group_for(&self, entity_id: &#krate::types::EntityId) -> &str {
+                    self.entity.__shard_group_for(entity_id)
+                }
+
+                fn max_idle_time(&self) -> ::std::option::Option<::std::time::Duration> {
+                    self.entity.__max_idle_time()
+                }
+
+                fn mailbox_capacity(&self) -> ::std::option::Option<usize> {
+                    self.entity.__mailbox_capacity()
+                }
+
+                fn concurrency(&self) -> ::std::option::Option<usize> {
+                    self.entity.__concurrency()
+                }
+
+                async fn spawn(
+                    &self,
+                    ctx: #krate::entity::EntityContext,
+                ) -> ::std::result::Result<
+                    ::std::boxed::Box<dyn #krate::entity::EntityHandler>,
+                    #krate::error::ClusterError,
+                > {
+                    let handler = #handler_name::__new_with_rpc_groups(
+                        self.entity.clone(),
+                        #(self.#register_rpc_group_fields.clone(),)*
+                        ctx,
+                    )
+                    .await?;
+                    ::std::result::Result::Ok(::std::boxed::Box::new(handler))
+                }
+            }
+
+            impl #struct_name {
+                /// Register this entity with RPC groups and return a typed client.
+                pub async fn register(
+                    self,
+                    sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
+                    #(#register_rpc_group_params),*
+                ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
+                    let entity_with_groups = #with_groups_name {
+                        entity: self,
+                        #(#register_rpc_group_fields,)*
+                    };
+                    sharding.register_entity(::std::sync::Arc::new(entity_with_groups)).await?;
+                    ::std::result::Result::Ok(#client_name::new(sharding))
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // --- Register impl for entities without groups ---
+    let register_impl = if has_rpc_groups {
+        quote! {} // Already generated in with_rpc_groups_impl
+    } else {
+        quote! {
+            impl #struct_name {
+                /// Register this entity with the cluster and return a typed client.
+                pub async fn register(
+                    self,
+                    sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>,
+                ) -> ::std::result::Result<#client_name, #krate::error::ClusterError> {
+                    sharding.register_entity(::std::sync::Arc::new(self)).await?;
+                    ::std::result::Result::Ok(#client_name::new(sharding))
+                }
+            }
+        }
+    };
+
+    Ok(quote! {
+        #(#rpc_group_use_tokens)*
+
+        // Method implementations directly on the entity struct
+        impl #struct_name {
+            #(#method_impls)*
+        }
+
+        #with_rpc_groups_impl
+        #entity_impl
+
+        /// Generated handler for the pure-RPC entity.
+        #[doc(hidden)]
+        pub struct #handler_name {
+            /// Entity instance.
+            #[allow(dead_code)]
+            __entity: #struct_name,
+            /// Entity context.
+            #[allow(dead_code)]
+            ctx: #krate::entity::EntityContext,
+            /// Sharding interface for inter-entity communication.
+            __sharding: ::std::option::Option<::std::sync::Arc<dyn #krate::sharding::Sharding>>,
+            /// Entity address for self-referencing.
+            __entity_address: #krate::types::EntityAddress,
+            /// Message storage for persisted RPCs.
+            #[allow(dead_code)]
+            __message_storage: ::std::option::Option<::std::sync::Arc<dyn #krate::__internal::MessageStorage>>,
+            #(#rpc_group_field_defs)*
+        }
+
+        impl #handler_name {
+            #new_fn
+            #new_with_rpc_groups_fn
+
+            #sharding_builtin_impls
+        }
+
+        #[async_trait::async_trait]
+        impl #krate::entity::EntityHandler for #handler_name {
+            async fn handle_request(
+                &self,
+                tag: &str,
+                payload: &[u8],
+                headers: &::std::collections::HashMap<::std::string::String, ::std::string::String>,
+            ) -> ::std::result::Result<::std::vec::Vec<u8>, #krate::error::ClusterError> {
+                #[allow(unused_variables)]
+                let headers = headers;
+                match tag {
+                    #(#dispatch_arms,)*
+                    _ => #dispatch_fallback,
+                }
+            }
+        }
+
+        #register_impl
+
+        /// Generated typed client for the entity.
+        pub struct #client_name {
+            inner: #krate::entity_client::EntityClient,
+        }
+
+        impl #client_name {
+            /// Create a new typed client from a sharding instance.
+            pub fn new(sharding: ::std::sync::Arc<dyn #krate::sharding::Sharding>) -> Self {
+                Self {
+                    inner: #krate::entity_client::EntityClient::new(
+                        sharding,
+                        #krate::types::EntityType::new(#struct_name_str),
+                    ),
+                }
+            }
+
+            /// Access the underlying untyped [`EntityClient`].
+            pub fn inner(&self) -> &#krate::entity_client::EntityClient {
+                &self.inner
+            }
+
+            #(#client_methods)*
+        }
+
+        impl #krate::entity_client::EntityClientAccessor for #client_name {
+            fn entity_client(&self) -> &#krate::entity_client::EntityClient {
+                &self.inner
+            }
+        }
+
+        #(#rpc_group_handler_access_impls)*
+    })
+}
+
 /// always generated regardless of whether the entity has state.
 #[allow(clippy::too_many_arguments)]
 fn generate_entity(
@@ -1889,6 +2403,27 @@ fn generate_entity(
     let has_traits = !trait_infos.is_empty();
     let rpc_group_infos = rpc_group_infos_from_paths(rpc_groups);
     let has_rpc_groups = !rpc_group_infos.is_empty();
+
+    // An entity is "pure RPC" when it has no state, no traits, and all methods
+    // are plain #[rpc] (no #[workflow], #[activity], or &mut self).
+    // Pure-RPC entities use a simplified Handler without state, write locks,
+    // view structs, or workflow/activity infrastructure.
+    let is_pure_rpc =
+        !is_stateful && !has_traits && rpcs.iter().all(|r| matches!(r.kind, RpcKind::Rpc));
+
+    // For pure-RPC entities, delegate to a streamlined code path.
+    if is_pure_rpc {
+        return generate_pure_rpc_entity(
+            krate,
+            struct_name,
+            handler_name,
+            client_name,
+            &rpc_group_infos,
+            rpcs,
+            original_methods,
+        );
+    }
+
     let entity_impl = if has_traits || has_rpc_groups {
         quote! {}
     } else {

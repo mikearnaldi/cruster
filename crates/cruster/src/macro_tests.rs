@@ -3857,6 +3857,147 @@ mod tests {
     }
 
     // =============================================================================
+    // Pure-RPC Entity tests (stateless entities, new simplified codegen)
+    // =============================================================================
+
+    /// A pure-RPC entity: no #[state], no #[workflow], no #[activity].
+    /// Uses the simplified handler codegen without ArcSwap, write locks, or view structs.
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct PureRpcEntity {
+        prefix: String,
+    }
+
+    #[entity_impl(krate = "crate")]
+    impl PureRpcEntity {
+        #[rpc]
+        async fn greet(&self, name: String) -> Result<String, ClusterError> {
+            Ok(format!("{}: hello, {}", self.prefix, name))
+        }
+
+        #[rpc(persisted)]
+        async fn save_data(&self, data: String) -> Result<String, ClusterError> {
+            Ok(format!("{}: saved {}", self.prefix, data))
+        }
+
+        #[rpc]
+        async fn add(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
+            Ok(a + b)
+        }
+    }
+
+    #[test]
+    fn pure_rpc_entity_type_name() {
+        let e = PureRpcEntity {
+            prefix: "test".into(),
+        };
+        assert_eq!(e.entity_type().0, "PureRpcEntity");
+    }
+
+    #[tokio::test]
+    async fn pure_rpc_entity_dispatches() {
+        let e = PureRpcEntity {
+            prefix: "svc".into(),
+        };
+        let ctx = test_ctx("PureRpcEntity", "pure-1");
+        let handler = e.spawn(ctx).await.unwrap();
+
+        // Non-persisted RPC
+        let payload = rmp_serde::to_vec(&"world".to_string()).unwrap();
+        let result = handler
+            .handle_request("greet", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "svc: hello, world");
+
+        // Persisted RPC (dispatch is the same)
+        let payload = rmp_serde::to_vec(&"item".to_string()).unwrap();
+        let result = handler
+            .handle_request("save_data", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "svc: saved item");
+    }
+
+    #[tokio::test]
+    async fn pure_rpc_entity_multi_param() {
+        let e = PureRpcEntity {
+            prefix: "test".into(),
+        };
+        let ctx = test_ctx("PureRpcEntity", "pure-2");
+        let handler = e.spawn(ctx).await.unwrap();
+
+        let payload = rmp_serde::to_vec(&(3i32, 4i32)).unwrap();
+        let result = handler
+            .handle_request("add", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn pure_rpc_entity_unknown_tag_errors() {
+        let e = PureRpcEntity {
+            prefix: "test".into(),
+        };
+        let ctx = test_ctx("PureRpcEntity", "pure-3");
+        let handler = e.spawn(ctx).await.unwrap();
+
+        let result = handler
+            .handle_request("nonexistent", &[], &HashMap::new())
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ClusterError::MalformedMessage { reason, .. } => {
+                assert!(reason.contains("unknown RPC tag"));
+            }
+            other => panic!("expected MalformedMessage, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pure_rpc_entity_register_returns_client() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = PureRpcEntity::register(
+            PureRpcEntity {
+                prefix: "test".into(),
+            },
+            Arc::clone(&sharding),
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("pure-4");
+        // Client should have entity's own methods
+        let response: String = client.greet(&entity_id, &"alice".to_string()).await.unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    #[tokio::test]
+    async fn pure_rpc_entity_client_persisted_method_exists() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = PureRpcEntity::register(
+            PureRpcEntity {
+                prefix: "test".into(),
+            },
+            Arc::clone(&sharding),
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("pure-5");
+        // save_data uses persisted delivery
+        let response: String = client
+            .save_data(&entity_id, &"payload".to_string())
+            .await
+            .unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    // =============================================================================
     // RPC Group tests
     // =============================================================================
 

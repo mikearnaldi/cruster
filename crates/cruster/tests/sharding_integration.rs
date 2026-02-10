@@ -68,9 +68,9 @@ async fn make_sharding_with_storage(
         shards_per_group: 10,
         ..Default::default()
     });
-    let storage = Arc::new(SqlMessageStorage::new(pool).with_last_read_guard_interval(
-        std::time::Duration::ZERO,
-    ));
+    let storage = Arc::new(
+        SqlMessageStorage::new(pool).with_last_read_guard_interval(std::time::Duration::ZERO),
+    );
     let metrics = Arc::new(ClusterMetrics::unregistered());
     let s = ShardingImpl::new(
         config,
@@ -93,15 +93,7 @@ fn make_bare_sharding() -> Arc<ShardingImpl> {
         ..Default::default()
     });
     let metrics = Arc::new(ClusterMetrics::unregistered());
-    ShardingImpl::new(
-        config,
-        Arc::new(NoopRunners),
-        None,
-        None,
-        None,
-        metrics,
-    )
-    .unwrap()
+    ShardingImpl::new(config, Arc::new(NoopRunners), None, None, None, metrics).unwrap()
 }
 
 // ============================================================================
@@ -119,10 +111,7 @@ impl Entity for EchoEntity {
         EntityType::new("Echo")
     }
 
-    async fn spawn(
-        &self,
-        _ctx: EntityContext,
-    ) -> Result<Box<dyn EntityHandler>, ClusterError> {
+    async fn spawn(&self, _ctx: EntityContext) -> Result<Box<dyn EntityHandler>, ClusterError> {
         Ok(Box::new(EchoHandler))
     }
 }
@@ -163,10 +152,7 @@ impl Entity for CounterEntity {
         EntityType::new("Counter")
     }
 
-    async fn spawn(
-        &self,
-        _ctx: EntityContext,
-    ) -> Result<Box<dyn EntityHandler>, ClusterError> {
+    async fn spawn(&self, _ctx: EntityContext) -> Result<Box<dyn EntityHandler>, ClusterError> {
         Ok(Box::new(CounterHandler {
             count: AtomicUsize::new(0),
         }))
@@ -264,8 +250,13 @@ mod entity_lifecycle {
 
         // Increment by 3
         let env = make_envelope(
-            &s, 2000, "Counter", "c-1", "increment",
-            rmp_serde::to_vec(&3usize).unwrap(), false,
+            &s,
+            2000,
+            "Counter",
+            "c-1",
+            "increment",
+            rmp_serde::to_vec(&3usize).unwrap(),
+            false,
         );
         let mut rx = s.send(env).await.unwrap();
         let reply = rx.recv().await.unwrap();
@@ -280,8 +271,13 @@ mod entity_lifecycle {
 
         // Increment by 7 on the same entity
         let env = make_envelope(
-            &s, 2001, "Counter", "c-1", "increment",
-            rmp_serde::to_vec(&7usize).unwrap(), false,
+            &s,
+            2001,
+            "Counter",
+            "c-1",
+            "increment",
+            rmp_serde::to_vec(&7usize).unwrap(),
+            false,
         );
         let mut rx = s.send(env).await.unwrap();
         let reply = rx.recv().await.unwrap();
@@ -316,16 +312,26 @@ mod entity_lifecycle {
 
         // Increment entity A by 5
         let env = make_envelope(
-            &s, 3000, "Counter", "a", "increment",
-            rmp_serde::to_vec(&5usize).unwrap(), false,
+            &s,
+            3000,
+            "Counter",
+            "a",
+            "increment",
+            rmp_serde::to_vec(&5usize).unwrap(),
+            false,
         );
         let mut rx = s.send(env).await.unwrap();
         let _ = rx.recv().await.unwrap();
 
         // Increment entity B by 10
         let env = make_envelope(
-            &s, 3001, "Counter", "b", "increment",
-            rmp_serde::to_vec(&10usize).unwrap(), false,
+            &s,
+            3001,
+            "Counter",
+            "b",
+            "increment",
+            rmp_serde::to_vec(&10usize).unwrap(),
+            false,
         );
         let mut rx = s.send(env).await.unwrap();
         let _ = rx.recv().await.unwrap();
@@ -392,8 +398,13 @@ mod entity_lifecycle {
 
         // Counter entity
         let env = make_envelope(
-            &s, 5001, "Counter", "c-1", "increment",
-            rmp_serde::to_vec(&1usize).unwrap(), false,
+            &s,
+            5001,
+            "Counter",
+            "c-1",
+            "increment",
+            rmp_serde::to_vec(&1usize).unwrap(),
+            false,
         );
         let mut rx = s.send(env).await.unwrap();
         let reply = rx.recv().await.unwrap();
@@ -500,7 +511,15 @@ mod persisted_messages {
         let (s, storage) = make_sharding_with_storage(pool).await;
         // Don't register the entity — the message will be saved but not processed.
 
-        let env = make_envelope(&s, 22000, "Echo", "e-dup-no-reply", "echo", vec![1, 2, 3], true);
+        let env = make_envelope(
+            &s,
+            22000,
+            "Echo",
+            "e-dup-no-reply",
+            "echo",
+            vec![1, 2, 3],
+            true,
+        );
 
         // Save the request directly in storage (simulating another runner saving it)
         match storage.save_request(&env).await.unwrap() {
@@ -539,7 +558,18 @@ mod persisted_messages {
         s.notify(env).await.unwrap();
 
         // Verify the request was saved
-        let result = storage.save_request(&make_envelope(&s, 23000, "Echo", "e-notify", "ping", vec![], true)).await.unwrap();
+        let result = storage
+            .save_request(&make_envelope(
+                &s,
+                23000,
+                "Echo",
+                "e-notify",
+                "ping",
+                vec![],
+                true,
+            ))
+            .await
+            .unwrap();
         assert!(matches!(result, SaveResult::Duplicate { .. }));
     }
 
@@ -614,9 +644,9 @@ mod persisted_messages {
             entity_registration_timeout: std::time::Duration::from_millis(50),
             ..Default::default()
         });
-        let storage = Arc::new(SqlMessageStorage::new(pool).with_last_read_guard_interval(
-            std::time::Duration::ZERO,
-        ));
+        let storage = Arc::new(
+            SqlMessageStorage::new(pool).with_last_read_guard_interval(std::time::Duration::ZERO),
+        );
         let metrics = Arc::new(ClusterMetrics::unregistered());
         let s = ShardingImpl::new(
             config,
@@ -659,7 +689,11 @@ mod persisted_messages {
         // Second poll — timeout exceeded, failure reply should be saved
         s.poll_storage().await.unwrap();
         let replies = storage.replies_for(Snowflake(27000)).await.unwrap();
-        assert_eq!(replies.len(), 1, "failure reply should be saved after timeout");
+        assert_eq!(
+            replies.len(),
+            1,
+            "failure reply should be saved after timeout"
+        );
         match &replies[0] {
             Reply::WithExit(r) => match &r.exit {
                 ExitResult::Failure(msg) => {
@@ -699,10 +733,7 @@ mod resumption {
         fn mailbox_capacity(&self) -> Option<usize> {
             Some(1)
         }
-        async fn spawn(
-            &self,
-            _ctx: EntityContext,
-        ) -> Result<Box<dyn EntityHandler>, ClusterError> {
+        async fn spawn(&self, _ctx: EntityContext) -> Result<Box<dyn EntityHandler>, ClusterError> {
             Ok(Box::new(SlowHandler {
                 handled: Arc::clone(&self.handled),
             }))
@@ -729,8 +760,7 @@ mod resumption {
         let handled = Arc::new(AtomicU32::new(0));
 
         let storage = Arc::new(
-            SqlMessageStorage::new(pool)
-                .with_last_read_guard_interval(std::time::Duration::ZERO),
+            SqlMessageStorage::new(pool).with_last_read_guard_interval(std::time::Duration::ZERO),
         );
         let config = Arc::new(ShardingConfig {
             shard_groups: vec!["default".to_string()],
@@ -830,8 +860,7 @@ mod resumption {
         }
 
         let storage = Arc::new(
-            SqlMessageStorage::new(pool)
-                .with_last_read_guard_interval(std::time::Duration::ZERO),
+            SqlMessageStorage::new(pool).with_last_read_guard_interval(std::time::Duration::ZERO),
         );
         let config = Arc::new(ShardingConfig {
             shard_groups: vec!["default".to_string()],

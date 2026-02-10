@@ -68,10 +68,7 @@ impl<'c> sqlx::Executor<'c> for &'c ActivityTx {
         query: E,
     ) -> futures::stream::BoxStream<
         'e,
-        Result<
-            sqlx::Either<sqlx::postgres::PgQueryResult, sqlx::postgres::PgRow>,
-            sqlx::Error,
-        >,
+        Result<sqlx::Either<sqlx::postgres::PgQueryResult, sqlx::postgres::PgRow>, sqlx::Error>,
     >
     where
         'c: 'e,
@@ -93,10 +90,7 @@ impl<'c> sqlx::Executor<'c> for &'c ActivityTx {
     fn fetch_optional<'e, 'q: 'e, E>(
         self,
         query: E,
-    ) -> futures::future::BoxFuture<
-        'e,
-        Result<Option<sqlx::postgres::PgRow>, sqlx::Error>,
-    >
+    ) -> futures::future::BoxFuture<'e, Result<Option<sqlx::postgres::PgRow>, sqlx::Error>>
     where
         'c: 'e,
         E: sqlx::Execute<'q, sqlx::Postgres> + 'q,
@@ -127,10 +121,7 @@ impl<'c> sqlx::Executor<'c> for &'c ActivityTx {
     fn describe<'e, 'q: 'e>(
         self,
         sql: &'q str,
-    ) -> futures::future::BoxFuture<
-        'e,
-        Result<sqlx::Describe<sqlx::Postgres>, sqlx::Error>,
-    >
+    ) -> futures::future::BoxFuture<'e, Result<sqlx::Describe<sqlx::Postgres>, sqlx::Error>>
     where
         'c: 'e,
     {

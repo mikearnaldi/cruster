@@ -30,10 +30,7 @@ use testcontainers_modules::postgres::Postgres;
 // ============================================================================
 
 /// Start a Postgres container and return a connected `PgPool` with migrations applied.
-async fn setup_postgres() -> (
-    testcontainers::ContainerAsync<Postgres>,
-    sqlx::PgPool,
-) {
+async fn setup_postgres() -> (testcontainers::ContainerAsync<Postgres>, sqlx::PgPool) {
     let container = Postgres::default()
         .start()
         .await
@@ -45,10 +42,7 @@ async fn setup_postgres() -> (
         .await
         .expect("failed to get port");
 
-    let url = format!(
-        "postgres://postgres:postgres@{}:{}/postgres",
-        host, port
-    );
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
 
     let pool = sqlx::PgPool::connect(&url)
         .await
@@ -60,11 +54,7 @@ async fn setup_postgres() -> (
     (container, pool)
 }
 
-fn test_ctx(
-    pool: &sqlx::PgPool,
-    entity_type: &str,
-    entity_id: &str,
-) -> EntityContext {
+fn test_ctx(pool: &sqlx::PgPool, entity_type: &str, entity_id: &str) -> EntityContext {
     EntityContext {
         address: EntityAddress {
             shard_id: ShardId::new("default", 0),
@@ -74,10 +64,13 @@ fn test_ctx(
         runner_address: RunnerAddress::new("127.0.0.1", 9000),
         snowflake: Arc::new(SnowflakeGenerator::new()),
         cancellation: tokio_util::sync::CancellationToken::new(),
-        state_storage: Some(Arc::new(SqlWorkflowStorage::new(pool.clone())) as Arc<dyn WorkflowStorage>),
+        state_storage: Some(
+            Arc::new(SqlWorkflowStorage::new(pool.clone())) as Arc<dyn WorkflowStorage>
+        ),
         workflow_engine: Some(Arc::new(InstantWorkflowEngine) as Arc<dyn WorkflowEngine>),
         sharding: None,
-        message_storage: Some(Arc::new(SqlMessageStorage::new(pool.clone())) as Arc<dyn cruster::message_storage::MessageStorage>),
+        message_storage: Some(Arc::new(SqlMessageStorage::new(pool.clone()))
+            as Arc<dyn cruster::message_storage::MessageStorage>),
     }
 }
 

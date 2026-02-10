@@ -53,7 +53,10 @@ impl Entity for PingEntity {
         EntityType::new("PingEntity")
     }
 
-    async fn spawn(&self, _ctx: EntityContext) -> Result<Box<dyn EntityHandler>, cruster::error::ClusterError> {
+    async fn spawn(
+        &self,
+        _ctx: EntityContext,
+    ) -> Result<Box<dyn EntityHandler>, cruster::error::ClusterError> {
         Ok(Box::new(PingHandler))
     }
 }

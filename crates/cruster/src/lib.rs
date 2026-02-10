@@ -128,8 +128,8 @@ pub mod __internal {
     pub use crate::state_guard::ActivityScope;
     pub use crate::state_guard::ActivityTx;
     pub use crate::state_guard::SqlTransactionHandle;
-    pub use crate::storage::sql_workflow_engine::SqlWorkflowEngine;
     pub use crate::storage::sql_workflow::save_journal_entry;
+    pub use crate::storage::sql_workflow_engine::SqlWorkflowEngine;
 }
 #[cfg(test)]
 mod macro_tests;

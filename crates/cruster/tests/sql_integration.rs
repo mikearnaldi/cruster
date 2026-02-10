@@ -34,10 +34,7 @@ use testcontainers_modules::postgres::Postgres;
 // ============================================================================
 
 /// Start a Postgres container and return a connected `PgPool` with migrations applied.
-async fn setup_postgres() -> (
-    testcontainers::ContainerAsync<Postgres>,
-    sqlx::PgPool,
-) {
+async fn setup_postgres() -> (testcontainers::ContainerAsync<Postgres>, sqlx::PgPool) {
     let container = Postgres::default()
         .start()
         .await
@@ -49,10 +46,7 @@ async fn setup_postgres() -> (
         .await
         .expect("failed to get port");
 
-    let url = format!(
-        "postgres://postgres:postgres@{}:{}/postgres",
-        host, port
-    );
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
 
     let pool = sqlx::PgPool::connect(&url)
         .await
@@ -192,7 +186,10 @@ mod workflow_storage {
 
         // Cleanup with zero duration should remove it immediately
         let removed = storage.cleanup(Duration::ZERO).await.unwrap();
-        assert!(removed >= 1, "expected at least 1 cleaned up, got {removed}");
+        assert!(
+            removed >= 1,
+            "expected at least 1 cleaned up, got {removed}"
+        );
 
         let loaded = storage.load(key).await.unwrap();
         assert_eq!(loaded, None);
@@ -234,7 +231,9 @@ mod workflow_storage {
         let storage = SqlWorkflowStorage::new(pool);
 
         let mut tx = storage.begin_transaction().await.unwrap();
-        tx.save("test/tx/rollback", b"should-not-persist").await.unwrap();
+        tx.save("test/tx/rollback", b"should-not-persist")
+            .await
+            .unwrap();
         tx.rollback().await.unwrap();
 
         let loaded = storage.load("test/tx/rollback").await.unwrap();
@@ -454,7 +453,7 @@ mod message_storage {
                 (SELECT retry_count FROM updated) as new_retry_count,
                 (SELECT COUNT(*) FROM updated WHERE processed = TRUE) as dead_count,
                 (SELECT processed FROM updated WHERE request_id = 99999) as is_processed
-            "#
+            "#,
         )
         .fetch_one(&pool)
         .await
@@ -468,7 +467,11 @@ mod message_storage {
 
         assert_eq!(new_retry_count, Some(4));
         assert_eq!(dead_count, Some(1), "merged CTE should dead-letter 1 row");
-        assert_eq!(is_processed, Some(true), "message should be marked processed");
+        assert_eq!(
+            is_processed,
+            Some(true),
+            "message should be marked processed"
+        );
     }
 
     #[tokio::test]
@@ -508,7 +511,10 @@ mod message_storage {
         let (retry_count, processed) = row;
         eprintln!("final: retry_count={retry_count}, processed={processed}");
 
-        assert!(processed, "message should be dead-lettered (processed=TRUE)");
+        assert!(
+            processed,
+            "message should be dead-lettered (processed=TRUE)"
+        );
         assert!(
             retry_count > 2,
             "retry_count should have exceeded max_retries"
@@ -516,7 +522,10 @@ mod message_storage {
 
         // Verify a failure reply was inserted
         let replies = storage.replies_for(Snowflake(11000)).await.unwrap();
-        assert!(!replies.is_empty(), "should have a dead-letter failure reply");
+        assert!(
+            !replies.is_empty(),
+            "should have a dead-letter failure reply"
+        );
     }
 
     #[tokio::test]
@@ -646,12 +655,19 @@ mod message_storage {
         });
         storage.save_reply(&reply).await.unwrap();
 
-        assert_eq!(storage.replies_for(Snowflake(15000)).await.unwrap().len(), 1);
+        assert_eq!(
+            storage.replies_for(Snowflake(15000)).await.unwrap().len(),
+            1
+        );
 
         storage.clear_replies(Snowflake(15000)).await.unwrap();
 
         assert!(
-            storage.replies_for(Snowflake(15000)).await.unwrap().is_empty(),
+            storage
+                .replies_for(Snowflake(15000))
+                .await
+                .unwrap()
+                .is_empty(),
             "replies should be empty after clear"
         );
     }
@@ -699,8 +715,8 @@ mod message_storage {
     async fn last_read_guard_prevents_redelivery() {
         let (_container, pool) = setup_postgres().await;
         // Set a 10-second guard interval
-        let storage = SqlMessageStorage::new(pool)
-            .with_last_read_guard_interval(Duration::from_secs(10));
+        let storage =
+            SqlMessageStorage::new(pool).with_last_read_guard_interval(Duration::from_secs(10));
 
         let envelope = test_envelope(17000, "entity-guard");
         storage.save_request(&envelope).await.unwrap();
@@ -728,8 +744,8 @@ mod message_storage {
         use chrono::Utc;
 
         let (_container, pool) = setup_postgres().await;
-        let storage = SqlMessageStorage::new(pool.clone())
-            .with_last_read_guard_interval(Duration::ZERO);
+        let storage =
+            SqlMessageStorage::new(pool.clone()).with_last_read_guard_interval(Duration::ZERO);
 
         // Message with deliver_at in the future (1 hour from now)
         let mut future_env = test_envelope(18000, "entity-future");
@@ -751,10 +767,7 @@ mod message_storage {
             .unwrap();
 
         let ids: Vec<i64> = msgs.iter().map(|m| m.request_id.0).collect();
-        assert!(
-            !ids.contains(&18000),
-            "future message should be excluded"
-        );
+        assert!(!ids.contains(&18000), "future message should be excluded");
         assert!(ids.contains(&18001), "normal message should be included");
         assert!(ids.contains(&18002), "past message should be included");
     }
@@ -763,8 +776,8 @@ mod message_storage {
     async fn reset_shards_clears_last_read() {
         let (_container, pool) = setup_postgres().await;
         // Use a long guard interval so the message would normally be suppressed
-        let storage = SqlMessageStorage::new(pool)
-            .with_last_read_guard_interval(Duration::from_secs(3600));
+        let storage =
+            SqlMessageStorage::new(pool).with_last_read_guard_interval(Duration::from_secs(3600));
 
         let envelope = test_envelope(19000, "entity-reset-guard");
         storage.save_request(&envelope).await.unwrap();
@@ -881,7 +894,10 @@ mod workflow_engine {
             engine.await_deferred("test-wf", "exec-2", "deferred-2"),
         )
         .await;
-        assert!(result.is_ok(), "await_deferred should complete after resolve");
+        assert!(
+            result.is_ok(),
+            "await_deferred should complete after resolve"
+        );
         let fetched = result.unwrap().unwrap();
         let decoded: i32 = rmp_serde::from_slice(&fetched).unwrap();
         assert_eq!(decoded, 42);
@@ -907,7 +923,10 @@ mod workflow_engine {
 
         // Cleanup with zero duration
         let removed = engine.cleanup(Duration::ZERO).await.unwrap();
-        assert!(removed >= 1, "expected at least 1 cleaned up, got {removed}");
+        assert!(
+            removed >= 1,
+            "expected at least 1 cleaned up, got {removed}"
+        );
     }
 }
 
@@ -1000,7 +1019,7 @@ mod transaction_atomicity {
         // 2. Write journal entry into the transaction
         // 3. Commit
         let mut tx = pool.begin().await.unwrap();
-        save_journal_entry(&mut *tx, "test/atomicity/committed", b"journal-data")
+        save_journal_entry(&mut tx, "test/atomicity/committed", b"journal-data")
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -1017,7 +1036,7 @@ mod transaction_atomicity {
 
         // Begin transaction, write journal, then rollback
         let mut tx = pool.begin().await.unwrap();
-        save_journal_entry(&mut *tx, "test/atomicity/rolled-back", b"should-not-persist")
+        save_journal_entry(&mut tx, "test/atomicity/rolled-back", b"should-not-persist")
             .await
             .unwrap();
         tx.rollback().await.unwrap();
@@ -1048,7 +1067,7 @@ mod transaction_atomicity {
             .unwrap();
 
         // Journal entry
-        save_journal_entry(&mut *tx, "test/atomicity/user-sql", b"journal-ok")
+        save_journal_entry(&mut tx, "test/atomicity/user-sql", b"journal-ok")
             .await
             .unwrap();
 
@@ -1071,10 +1090,12 @@ mod transaction_atomicity {
         let storage = SqlWorkflowStorage::new(pool.clone());
 
         // Create a test table
-        sqlx::query("CREATE TABLE IF NOT EXISTS test_atomicity_rb (id TEXT PRIMARY KEY, value TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS test_atomicity_rb (id TEXT PRIMARY KEY, value TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // Simulate activity failure: user SQL + journal then rollback
         let mut tx = pool.begin().await.unwrap();
@@ -1084,7 +1105,7 @@ mod transaction_atomicity {
             .await
             .unwrap();
 
-        save_journal_entry(&mut *tx, "test/atomicity/user-sql-rb", b"should-vanish")
+        save_journal_entry(&mut tx, "test/atomicity/user-sql-rb", b"should-vanish")
             .await
             .unwrap();
 
@@ -1174,8 +1195,16 @@ mod workflow_resumption {
         }
         // ctx dropped — simulates node crash
 
-        assert_eq!(calls_a.load(Ordering::SeqCst), 1, "activity_a ran once in run 1");
-        assert_eq!(calls_b.load(Ordering::SeqCst), 1, "activity_b ran once in run 1");
+        assert_eq!(
+            calls_a.load(Ordering::SeqCst),
+            1,
+            "activity_a ran once in run 1"
+        );
+        assert_eq!(
+            calls_b.load(Ordering::SeqCst),
+            1,
+            "activity_b ran once in run 1"
+        );
 
         // === Run 2: new context, same identity — simulates restart ===
         {
@@ -1216,7 +1245,11 @@ mod workflow_resumption {
                 .await
                 .unwrap();
             assert_eq!(result_c, 200);
-            assert_eq!(calls_c.load(Ordering::SeqCst), 1, "new activity SHOULD execute");
+            assert_eq!(
+                calls_c.load(Ordering::SeqCst),
+                1,
+                "new activity SHOULD execute"
+            );
         }
     }
 
@@ -1396,7 +1429,11 @@ mod workflow_resumption {
                 .await
                 .unwrap();
             assert_eq!(r1, "intermediate-result", "step_one replays cached value");
-            assert_eq!(calls_a.load(Ordering::SeqCst), 1, "step_one NOT re-executed");
+            assert_eq!(
+                calls_a.load(Ordering::SeqCst),
+                1,
+                "step_one NOT re-executed"
+            );
 
             // step_two runs fresh (was never journaled)
             let cb = calls_b.clone();

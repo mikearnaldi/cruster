@@ -241,15 +241,8 @@ mod tests {
     async fn test_sharding() -> Arc<ShardingImpl> {
         let config = Arc::new(ShardingConfig::default());
         let metrics = Arc::new(ClusterMetrics::unregistered());
-        let s = ShardingImpl::new(
-            config,
-            Arc::new(NoopRunners),
-            None,
-            None,
-            None,
-            metrics,
-        )
-        .unwrap();
+        let s =
+            ShardingImpl::new(config, Arc::new(NoopRunners), None, None, None, metrics).unwrap();
         s.acquire_all_shards().await;
         s
     }

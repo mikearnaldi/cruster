@@ -15,7 +15,6 @@
 //! `&self.tx` provides a SQL transaction handle for executing arbitrary SQL
 //! within the same transaction as journal writes, ensuring atomicity.
 
-
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};

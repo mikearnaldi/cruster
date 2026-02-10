@@ -5,18 +5,17 @@
 //! ## Architecture
 //! - `SqlActivityTest` entity: pure-RPC for reading state from PG (`sql_activity_test_state` table)
 //! - `SqlTransferWorkflow`: standalone workflow with activity that writes to both
-//!   `sql_activity_test_state` and `sql_activity_test_transfers` atomically via
-//!   `ActivityScope::db()`
+//!   `sql_activity_test_state` and `sql_activity_test_transfers` atomically via `self.tx()`
 //! - `SqlFailingTransferWorkflow`: standalone workflow with activity that writes then fails,
 //!   testing that both state and transfer writes are rolled back
 //! - `SqlCountWorkflow`: standalone workflow with activity that queries the transfers table
-//!   via `ActivityScope::db()`
+//!   via `self.tx()`
 //!
 //! All state is stored in PostgreSQL. The key feature being tested is that
-//! `ActivityScope::db()` provides a SQL transaction handle for executing arbitrary SQL
+//! `self.tx()` provides a SQL transaction handle for executing arbitrary SQL
 //! within the same transaction as journal writes, ensuring atomicity.
 
-use cruster::__internal::ActivityScope;
+
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -108,7 +107,7 @@ pub struct TransferRequest {
     pub amount: i64,
 }
 
-/// Workflow that performs a transfer using `ActivityScope::db()`.
+/// Workflow that performs a transfer using `self.tx()`.
 ///
 /// The activity writes to both `sql_activity_test_state` and
 /// `sql_activity_test_transfers` in the same transaction, ensuring atomicity.
@@ -125,50 +124,53 @@ impl SqlTransferWorkflow {
 
     /// Activity that records a transfer in both the state table AND the transfers table.
     ///
-    /// Both operations happen in the same SQL transaction (via `ActivityScope::db()`):
+    /// Both operations happen in the same SQL transaction (via `self.tx()`):
     /// - UPSERT into `sql_activity_test_state` (transfer_count, total_transferred)
     /// - INSERT into `sql_activity_test_transfers`
     #[activity]
     async fn do_transfer(
-        &self,
+        &mut self,
         entity_id: String,
         to_entity: String,
         amount: i64,
     ) -> Result<i64, ClusterError> {
-        let db = ActivityScope::db().await;
-
         // Upsert state
         #[derive(sqlx::FromRow)]
         struct CountResult {
             transfer_count: i64,
         }
 
-        let result: CountResult = db
-            .fetch_one(
-                sqlx::query_as(
-                    "INSERT INTO sql_activity_test_state (entity_id, transfer_count, total_transferred)
-                     VALUES ($1, 1, $2)
-                     ON CONFLICT (entity_id) DO UPDATE SET
-                       transfer_count = sql_activity_test_state.transfer_count + 1,
-                       total_transferred = sql_activity_test_state.total_transferred + $2
-                     RETURNING transfer_count",
-                )
-                .bind(&entity_id)
-                .bind(amount),
-            )
-            .await?;
+        let result: CountResult = sqlx::query_as(
+            "INSERT INTO sql_activity_test_state (entity_id, transfer_count, total_transferred)
+             VALUES ($1, 1, $2)
+             ON CONFLICT (entity_id) DO UPDATE SET
+               transfer_count = sql_activity_test_state.transfer_count + 1,
+               total_transferred = sql_activity_test_state.total_transferred + $2
+             RETURNING transfer_count",
+        )
+        .bind(&entity_id)
+        .bind(amount)
+        .fetch_one(&mut *self.tx())
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("do_transfer upsert failed: {e}"),
+            source: None,
+        })?;
 
         // Insert transfer record
-        db.execute(
-            sqlx::query(
-                "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
-                 VALUES ($1, $2, $3, NOW())",
-            )
-            .bind(&entity_id)
-            .bind(&to_entity)
-            .bind(amount),
+        sqlx::query(
+            "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
+             VALUES ($1, $2, $3, NOW())",
         )
-        .await?;
+        .bind(&entity_id)
+        .bind(&to_entity)
+        .bind(amount)
+        .execute(self.tx())
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("do_transfer insert failed: {e}"),
+            source: None,
+        })?;
 
         Ok(result.transfer_count)
     }
@@ -205,38 +207,42 @@ impl SqlFailingTransferWorkflow {
     /// This tests that both state AND SQL changes are rolled back.
     #[activity]
     async fn do_failing_transfer(
-        &self,
+        &mut self,
         entity_id: String,
         to_entity: String,
         amount: i64,
     ) -> Result<i64, ClusterError> {
-        let db = ActivityScope::db().await;
-
         // Upsert state (should be rolled back)
-        db.execute(
-            sqlx::query(
-                "INSERT INTO sql_activity_test_state (entity_id, transfer_count, total_transferred)
-                 VALUES ($1, 1, $2)
-                 ON CONFLICT (entity_id) DO UPDATE SET
-                   transfer_count = sql_activity_test_state.transfer_count + 1,
-                   total_transferred = sql_activity_test_state.total_transferred + $2",
-            )
-            .bind(&entity_id)
-            .bind(amount),
+        sqlx::query(
+            "INSERT INTO sql_activity_test_state (entity_id, transfer_count, total_transferred)
+             VALUES ($1, 1, $2)
+             ON CONFLICT (entity_id) DO UPDATE SET
+               transfer_count = sql_activity_test_state.transfer_count + 1,
+               total_transferred = sql_activity_test_state.total_transferred + $2",
         )
-        .await?;
+        .bind(&entity_id)
+        .bind(amount)
+        .execute(&mut *self.tx())
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("do_failing_transfer upsert failed: {e}"),
+            source: None,
+        })?;
 
         // Insert transfer record (should also be rolled back)
-        db.execute(
-            sqlx::query(
-                "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
-                 VALUES ($1, $2, $3, NOW())",
-            )
-            .bind(&entity_id)
-            .bind(&to_entity)
-            .bind(amount),
+        sqlx::query(
+            "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
+             VALUES ($1, $2, $3, NOW())",
         )
-        .await?;
+        .bind(&entity_id)
+        .bind(&to_entity)
+        .bind(amount)
+        .execute(self.tx())
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("do_failing_transfer insert failed: {e}"),
+            source: None,
+        })?;
 
         // Now fail - both state and SQL should roll back
         Err(ClusterError::PersistenceError {
@@ -259,7 +265,7 @@ pub struct GetSqlCountRequest {
     pub query_id: String,
 }
 
-/// Workflow that queries the transfers table using `ActivityScope::db()`.
+/// Workflow that queries the transfers table using `self.tx()`.
 #[workflow]
 #[derive(Clone)]
 pub struct SqlCountWorkflow;
@@ -272,22 +278,22 @@ impl SqlCountWorkflow {
 
     /// Activity that queries the transfers table within a SQL transaction.
     #[activity]
-    async fn do_get_transfer_count(&self, entity_id: String) -> Result<i64, ClusterError> {
-        let db = ActivityScope::db().await;
-
+    async fn do_get_transfer_count(&mut self, entity_id: String) -> Result<i64, ClusterError> {
         #[derive(sqlx::FromRow)]
         struct CountResult {
             count: i64,
         }
 
-        let result: CountResult = db
-            .fetch_one(
-                sqlx::query_as(
-                    "SELECT COUNT(*) as count FROM sql_activity_test_transfers WHERE from_entity = $1",
-                )
-                .bind(&entity_id),
-            )
-            .await?;
+        let result: CountResult = sqlx::query_as(
+            "SELECT COUNT(*) as count FROM sql_activity_test_transfers WHERE from_entity = $1",
+        )
+        .bind(&entity_id)
+        .fetch_one(self.tx())
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("do_get_transfer_count failed: {e}"),
+            source: None,
+        })?;
 
         Ok(result.count)
     }

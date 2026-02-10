@@ -813,12 +813,12 @@ mod tests {
         }
 
         #[activity]
-        async fn validate(&self, order_id: String) -> Result<String, ClusterError> {
+        async fn validate(&mut self, order_id: String) -> Result<String, ClusterError> {
             Ok(format!("valid:{order_id}"))
         }
 
         #[activity]
-        async fn charge(&self, order_id: String, amount: i32) -> Result<String, ClusterError> {
+        async fn charge(&mut self, order_id: String, amount: i32) -> Result<String, ClusterError> {
             Ok(format!("charged:{order_id}:{amount}"))
         }
     }
@@ -858,7 +858,7 @@ mod tests {
         }
 
         #[activity]
-        async fn greet(&self, name: String) -> Result<String, ClusterError> {
+        async fn greet(&mut self, name: String) -> Result<String, ClusterError> {
             Ok(format!("{}: {name}", self.prefix))
         }
     }
@@ -1246,13 +1246,13 @@ mod tests {
     #[activity_group_impl(krate = "crate")]
     impl TestPayments {
         #[activity]
-        async fn charge(&self, amount: i32) -> Result<String, ClusterError> {
+        async fn charge(&mut self, amount: i32) -> Result<String, ClusterError> {
             let total = (amount as f64 * self.rate) as i32;
             Ok(format!("charged:{total}"))
         }
 
         #[activity]
-        async fn refund(&self, tx_id: String) -> Result<String, ClusterError> {
+        async fn refund(&mut self, tx_id: String) -> Result<String, ClusterError> {
             Ok(format!("refunded:{tx_id}"))
         }
 
@@ -1336,7 +1336,7 @@ mod tests {
     #[activity_group_impl(krate = "crate")]
     impl TestInventory {
         #[activity]
-        async fn reserve(&self, item_count: i32) -> Result<String, ClusterError> {
+        async fn reserve(&mut self, item_count: i32) -> Result<String, ClusterError> {
             Ok(format!("reserved:{item_count}"))
         }
     }
@@ -1416,7 +1416,7 @@ mod tests {
         }
 
         #[activity]
-        async fn validate(&self, order_id: String) -> Result<String, ClusterError> {
+        async fn validate(&mut self, order_id: String) -> Result<String, ClusterError> {
             Ok(format!("{}:valid:{order_id}", self.prefix))
         }
     }

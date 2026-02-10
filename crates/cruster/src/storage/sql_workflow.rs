@@ -230,6 +230,10 @@ impl WorkflowStorage for SqlWorkflowStorage {
         // which we override above. So this should never be called.
         panic!("SqlWorkflowStorage::as_arc() should not be called")
     }
+
+    fn sql_pool(&self) -> Option<&PgPool> {
+        Some(&self.pool)
+    }
 }
 
 /// A PostgreSQL transaction for workflow storage.
@@ -448,6 +452,32 @@ impl SqlTransaction {
                 source: Some(Box::new(e)),
             })
     }
+}
+
+/// Write a journal entry into an open SQL transaction.
+///
+/// This is used by the macro-generated activity dispatch code to write
+/// the journal entry atomically with activity SQL writes (`self.tx`).
+/// Both the journal entry and any user SQL execute in the same transaction.
+pub async fn save_journal_entry(
+    conn: &mut sqlx::PgConnection,
+    key: &str,
+    value: &[u8],
+) -> Result<(), ClusterError> {
+    sqlx::query(
+        "INSERT INTO cluster_workflow_journal (key, value, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(conn)
+    .await
+    .map_err(|e| ClusterError::PersistenceError {
+        reason: format!("journal entry save failed: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

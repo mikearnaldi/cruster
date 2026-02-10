@@ -27,7 +27,6 @@ pub mod schema;
 pub mod shard_assigner;
 pub mod sharding;
 pub mod sharding_impl;
-#[cfg(feature = "sql")]
 pub mod single_runner;
 pub mod singleton;
 pub mod snowflake;
@@ -115,7 +114,6 @@ pub mod prelude {
 
     // Activity scope for transactional activities
     pub use crate::state_guard::ActivityScope;
-    #[cfg(feature = "sql")]
     pub use crate::state_guard::SqlTransactionHandle;
 }
 mod durable;
@@ -129,10 +127,9 @@ pub mod __internal {
     pub use crate::envelope::REQUEST_ID_HEADER_KEY;
     pub use crate::message_storage::MessageStorage;
     pub use crate::state_guard::ActivityScope;
-    #[cfg(feature = "sql")]
     pub use crate::state_guard::SqlTransactionHandle;
-    #[cfg(feature = "sql")]
     pub use crate::storage::sql_workflow_engine::SqlWorkflowEngine;
+    pub use crate::storage::sql_workflow::save_journal_entry;
 }
 #[cfg(test)]
 mod macro_tests;

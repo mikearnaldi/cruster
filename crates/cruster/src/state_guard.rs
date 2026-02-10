@@ -4,20 +4,18 @@
 //! State mutations and journal writes are buffered and committed atomically.
 //!
 //! Activities can also execute arbitrary SQL within the same transaction using
-//! `ActivityScope::sql_transaction()` (requires the `sql` feature).
+//! `ActivityScope::sql_transaction()`.
 
 use std::cell::RefCell;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
-#[cfg(feature = "sql")]
 use crate::durable::StorageTransaction;
 use crate::durable::WorkflowStorage;
 use crate::error::ClusterError;
 
 // Type aliases to reduce complexity warnings
 type PendingWrites = Arc<parking_lot::Mutex<Vec<(String, Vec<u8>)>>>;
-#[cfg(feature = "sql")]
 type SharedTransaction = Arc<TokioMutex<Box<dyn StorageTransaction>>>;
 
 // Thread-local storage for the active transaction context.
@@ -34,7 +32,6 @@ struct ActiveTransaction {
     /// The underlying transaction, wrapped for shared access.
     /// This allows activities to execute SQL within the transaction via
     /// `ActivityScope::sql_transaction()`.
-    #[cfg(feature = "sql")]
     transaction: SharedTransaction,
 }
 
@@ -73,7 +70,6 @@ impl ActivityScope {
 
         let active = ActiveTransaction {
             pending_writes: pending_writes.clone(),
-            #[cfg(feature = "sql")]
             transaction: transaction.clone(),
         };
 
@@ -160,22 +156,10 @@ impl ActivityScope {
     /// Panics if called outside of an activity scope or if the storage
     /// backend does not support SQL transactions (e.g., memory storage).
     ///
-    /// # Example
+    /// # Note
     ///
-    /// ```text
-    /// #[activity]
-    /// async fn transfer(&self, to: String, amount: i64) -> Result<(), ClusterError> {
-    ///     let db = ActivityScope::db().await;
-    ///     db.execute(
-    ///         sqlx::query("INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)")
-    ///             .bind(&self.id)
-    ///             .bind(&to)
-    ///             .bind(amount)
-    ///     ).await?;
-    ///     Ok(())
-    /// }
-    /// ```
-    #[cfg(feature = "sql")]
+    /// Prefer using `self.tx()` in activity methods instead. `ActivityScope::db()`
+    /// is the legacy API retained for backward compatibility.
     pub async fn db() -> SqlTransactionHandle {
         Self::sql_transaction()
             .await
@@ -187,24 +171,6 @@ impl ActivityScope {
     /// Returns `None` if:
     /// - Not currently within an activity scope
     /// - The storage backend doesn't support SQL transactions (e.g., memory storage)
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// #[activity]
-    /// async fn transfer(&self, to: String, amount: i64) -> Result<(), ClusterError> {
-    ///     if let Some(tx) = ActivityScope::sql_transaction().await {
-    ///         tx.execute(
-    ///             sqlx::query("INSERT INTO transfers (from_id, to_id, amount) VALUES ($1, $2, $3)")
-    ///                 .bind(&self.id)
-    ///                 .bind(&to)
-    ///                 .bind(amount)
-    ///         ).await?;
-    ///     }
-    ///     Ok(())
-    /// }
-    /// ```
-    #[cfg(feature = "sql")]
     pub async fn sql_transaction() -> Option<SqlTransactionHandle> {
         let transaction = ACTIVE_TRANSACTION
             .try_with(|cell| cell.borrow().as_ref().map(|a| a.transaction.clone()))
@@ -232,26 +198,12 @@ impl ActivityScope {
 /// This handle provides methods to execute arbitrary SQL within the same
 /// transaction as journal writes. All SQL operations will be committed
 /// or rolled back together.
-#[cfg(feature = "sql")]
 pub struct SqlTransactionHandle {
     transaction: SharedTransaction,
 }
 
-#[cfg(feature = "sql")]
 impl SqlTransactionHandle {
     /// Execute a SQL query within the transaction.
-    ///
-    /// # Example
-    ///
-    /// ```text
-    /// if let Some(tx) = ActivityScope::sql_transaction().await {
-    ///     tx.execute(
-    ///         sqlx::query("INSERT INTO audit_log (entity_id, action) VALUES ($1, $2)")
-    ///             .bind(&entity_id)
-    ///             .bind("transfer")
-    ///     ).await?;
-    /// }
-    /// ```
     pub async fn execute<'q>(
         &self,
         query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
@@ -268,11 +220,6 @@ impl SqlTransactionHandle {
     }
 
     /// Fetch a single row from a SQL query within the transaction.
-    ///
-    /// Use with `sqlx::query_as`:
-    /// ```text
-    /// let user: User = tx.fetch_one(sqlx::query_as("SELECT * FROM users WHERE id = $1").bind(id)).await?;
-    /// ```
     pub async fn fetch_one<'q, O>(
         &self,
         query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
@@ -395,7 +342,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "sql")]
     async fn sql_transaction_returns_none_for_memory_storage() {
         let storage: Arc<dyn crate::durable::WorkflowStorage> =
             Arc::new(MemoryWorkflowStorage::new());
@@ -415,7 +361,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "sql")]
     #[should_panic(expected = "db() requires an active SQL transaction")]
     async fn db_panics_for_memory_storage() {
         let storage: Arc<dyn crate::durable::WorkflowStorage> =

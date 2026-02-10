@@ -10,7 +10,6 @@
 //!
 //! All execution state is stored in PostgreSQL `workflow_test_executions` table.
 
-use cruster::__internal::ActivityScope;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -135,7 +134,7 @@ pub struct RunSimpleWorkflowRequest {
 
 /// Simple workflow that creates an execution, runs 3 steps, and marks completed.
 ///
-/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
+/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct SimpleWorkflow;
@@ -168,20 +167,18 @@ impl SimpleWorkflow {
 
     #[activity]
     async fn create_execution(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
-                 VALUES ($1, $2, '{}', NULL)
-                 ON CONFLICT (entity_id, id) DO NOTHING",
-            )
-            .bind(&exec_id)
-            .bind(&entity_id),
+        sqlx::query(
+            "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
+             VALUES ($1, $2, '{}', NULL)
+             ON CONFLICT (entity_id, id) DO NOTHING",
         )
+        .bind(&exec_id)
+        .bind(&entity_id)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("create_execution failed: {e}"),
@@ -192,22 +189,20 @@ impl SimpleWorkflow {
 
     #[activity]
     async fn complete_step(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
         step_name: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "UPDATE workflow_test_executions
-                 SET steps_completed = array_append(steps_completed, $3)
-                 WHERE entity_id = $1 AND id = $2",
-            )
-            .bind(&entity_id)
-            .bind(&exec_id)
-            .bind(&step_name),
+        sqlx::query(
+            "UPDATE workflow_test_executions
+             SET steps_completed = array_append(steps_completed, $3)
+             WHERE entity_id = $1 AND id = $2",
         )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&step_name)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("complete_step failed: {e}"),
@@ -218,21 +213,19 @@ impl SimpleWorkflow {
 
     #[activity]
     async fn mark_completed(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
         result: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "UPDATE workflow_test_executions SET result = $3
-                 WHERE entity_id = $1 AND id = $2",
-            )
-            .bind(&entity_id)
-            .bind(&exec_id)
-            .bind(&result),
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
         )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&result)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_completed failed: {e}"),
@@ -259,7 +252,7 @@ pub struct RunFailingWorkflowRequest {
 
 /// Workflow that creates an execution, runs steps, and fails at a configurable point.
 ///
-/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
+/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct FailingWorkflow;
@@ -300,20 +293,18 @@ impl FailingWorkflow {
 
     #[activity]
     async fn create_execution(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
-                 VALUES ($1, $2, '{}', NULL)
-                 ON CONFLICT (entity_id, id) DO NOTHING",
-            )
-            .bind(&exec_id)
-            .bind(&entity_id),
+        sqlx::query(
+            "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
+             VALUES ($1, $2, '{}', NULL)
+             ON CONFLICT (entity_id, id) DO NOTHING",
         )
+        .bind(&exec_id)
+        .bind(&entity_id)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("create_execution failed: {e}"),
@@ -324,22 +315,20 @@ impl FailingWorkflow {
 
     #[activity]
     async fn complete_step(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
         step_name: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "UPDATE workflow_test_executions
-                 SET steps_completed = array_append(steps_completed, $3)
-                 WHERE entity_id = $1 AND id = $2",
-            )
-            .bind(&entity_id)
-            .bind(&exec_id)
-            .bind(&step_name),
+        sqlx::query(
+            "UPDATE workflow_test_executions
+             SET steps_completed = array_append(steps_completed, $3)
+             WHERE entity_id = $1 AND id = $2",
         )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&step_name)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("complete_step failed: {e}"),
@@ -350,21 +339,19 @@ impl FailingWorkflow {
 
     #[activity]
     async fn mark_completed(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
         result: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "UPDATE workflow_test_executions SET result = $3
-                 WHERE entity_id = $1 AND id = $2",
-            )
-            .bind(&entity_id)
-            .bind(&exec_id)
-            .bind(&result),
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
         )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&result)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_completed failed: {e}"),
@@ -375,21 +362,19 @@ impl FailingWorkflow {
 
     #[activity]
     async fn mark_failed(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
         step: usize,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "UPDATE workflow_test_executions SET result = $3
-                 WHERE entity_id = $1 AND id = $2",
-            )
-            .bind(&entity_id)
-            .bind(&exec_id)
-            .bind(format!("failed:step{}", step)),
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
         )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(format!("failed:step{}", step))
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_failed failed: {e}"),
@@ -416,7 +401,7 @@ pub struct RunLongWorkflowRequest {
 
 /// Workflow that creates an execution and runs a configurable number of steps.
 ///
-/// Activities use `ActivityScope::db()` for transactional DB writes — no `pool` field needed.
+/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct LongWorkflow;
@@ -448,20 +433,18 @@ impl LongWorkflow {
 
     #[activity]
     async fn create_execution(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
-                 VALUES ($1, $2, '{}', NULL)
-                 ON CONFLICT (entity_id, id) DO NOTHING",
-            )
-            .bind(&exec_id)
-            .bind(&entity_id),
+        sqlx::query(
+            "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
+             VALUES ($1, $2, '{}', NULL)
+             ON CONFLICT (entity_id, id) DO NOTHING",
         )
+        .bind(&exec_id)
+        .bind(&entity_id)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("create_execution failed: {e}"),
@@ -472,22 +455,20 @@ impl LongWorkflow {
 
     #[activity]
     async fn complete_step(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
         step_name: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "UPDATE workflow_test_executions
-                 SET steps_completed = array_append(steps_completed, $3)
-                 WHERE entity_id = $1 AND id = $2",
-            )
-            .bind(&entity_id)
-            .bind(&exec_id)
-            .bind(&step_name),
+        sqlx::query(
+            "UPDATE workflow_test_executions
+             SET steps_completed = array_append(steps_completed, $3)
+             WHERE entity_id = $1 AND id = $2",
         )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&step_name)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("complete_step failed: {e}"),
@@ -498,21 +479,19 @@ impl LongWorkflow {
 
     #[activity]
     async fn mark_completed(
-        &self,
+        &mut self,
         entity_id: String,
         exec_id: String,
         result: String,
     ) -> Result<(), ClusterError> {
-        let db = ActivityScope::db().await;
-        db.execute(
-            sqlx::query(
-                "UPDATE workflow_test_executions SET result = $3
-                 WHERE entity_id = $1 AND id = $2",
-            )
-            .bind(&entity_id)
-            .bind(&exec_id)
-            .bind(&result),
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
         )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&result)
+        .execute(self.tx())
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_completed failed: {e}"),

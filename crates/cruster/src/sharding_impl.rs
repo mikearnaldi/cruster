@@ -444,6 +444,16 @@ impl ShardingImpl {
         self.shard_assignments.read().await.get(shard_id).cloned()
     }
 
+    /// Returns the number of shards currently owned by this runner.
+    pub async fn owned_shard_count(&self) -> usize {
+        self.owned_shards.read().await.len()
+    }
+
+    /// Check whether this runner currently owns the given shard.
+    pub async fn owns_shard(&self, shard_id: &ShardId) -> bool {
+        self.owned_shards.read().await.contains(shard_id)
+    }
+
     // -------------------------------------------------------------------------
     // Detachment API
     // -------------------------------------------------------------------------

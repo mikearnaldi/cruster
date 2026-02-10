@@ -126,6 +126,15 @@ pub trait WorkflowStorage: Send + Sync {
     fn as_arc(&self) -> Arc<dyn WorkflowStorage> {
         panic!("WorkflowStorage::as_arc() must be implemented for default begin_transaction()")
     }
+
+    /// Get the underlying SQL connection pool, if this is a SQL-backed storage.
+    ///
+    /// Returns `Some(&PgPool)` for `SqlWorkflowStorage`, `None` for others.
+    /// Used by the framework to open transactions for activity execution
+    /// and to provide `self.db` in activity views.
+    fn sql_pool(&self) -> Option<&sqlx::PgPool> {
+        None
+    }
 }
 
 /// A transaction for batching storage operations.

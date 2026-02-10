@@ -1720,8 +1720,8 @@ mod storage_retry_exhaustion {
     #[tokio::test]
     async fn dead_letters_message_after_retries() {
         let (_container, pool) = setup_postgres().await;
-        let storage = SqlMessageStorage::new(pool.clone());
-        storage.set_max_retries(1);
+        let storage = SqlMessageStorage::with_max_retries(pool.clone(), 1)
+            .with_last_read_guard_interval(Duration::ZERO);
 
         let request_id_value = 9000;
         storage
@@ -1773,6 +1773,26 @@ mod streaming_replay_ordering {
         let (_container, pool) = setup_postgres().await;
         let storage = SqlMessageStorage::new(pool.clone());
         let request_id = Snowflake(1010);
+
+        // Save the parent message so replies can reference it (FK constraint).
+        let envelope = EnvelopeRequest {
+            request_id,
+            address: EntityAddress {
+                shard_id: ShardId::new("default", 0),
+                entity_type: EntityType::new("StreamTest"),
+                entity_id: EntityId::new("stream-1"),
+            },
+            tag: "stream".into(),
+            payload: Vec::new(),
+            headers: HashMap::new(),
+            span_id: None,
+            trace_id: None,
+            sampled: None,
+            persisted: true,
+            uninterruptible: Default::default(),
+            deliver_at: None,
+        };
+        storage.save_request(&envelope).await.unwrap();
 
         let chunk_two = Reply::Chunk(ReplyChunk {
             request_id,

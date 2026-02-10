@@ -2741,15 +2741,14 @@ fn activity_group_impl_inner(
                 }
             }
 
-            // Validate: no &mut self
             let is_activity = method.attrs.iter().any(|a| a.path().is_ident("activity"));
 
-            // Check for &mut self — allowed on #[activity] methods, not on helpers
+            // Check for &mut self — not allowed on any activity group methods
             if let Some(syn::FnArg::Receiver(r)) = method.sig.inputs.first() {
-                if r.mutability.is_some() && !is_activity {
+                if r.mutability.is_some() {
                     return Err(syn::Error::new(
                         r.span(),
-                        "activity group methods must use &self, not &mut self (activities may use &mut self)",
+                        "activity group methods must use &self, not &mut self",
                     ));
                 }
             }
@@ -2863,7 +2862,7 @@ fn activity_group_impl_inner(
         if is_activity {
             activity_view_methods.push(quote! {
                 #(#attrs)*
-                #vis async fn #name(&mut self, #(#params),*) #output
+                #vis async fn #name(&self, #(#params),*) #output
                     #block
             });
         } else {
@@ -2886,38 +2885,11 @@ fn activity_group_impl_inner(
         pub struct #activity_view_name<'a> {
             __group: &'a #struct_name,
             /// The activity's SQL transaction. Commits atomically with the journal entry.
-            __tx: ::std::option::Option<sqlx::Transaction<'static, sqlx::Postgres>>,
-            /// The raw database pool for reads outside the activity transaction.
-            __db: ::std::option::Option<sqlx::PgPool>,
-        }
-
-        impl #activity_view_name<'_> {
-            /// Get a mutable reference to the activity's SQL transaction.
-            ///
-            /// All SQL executed through this connection commits atomically with the journal entry.
-            ///
-            /// # Panics
-            ///
-            /// Panics if SQL storage is not configured (e.g., using MemoryWorkflowStorage).
-            #[inline]
-            pub fn tx(&mut self) -> &mut sqlx::PgConnection {
-                self.__tx.as_deref_mut()
-                    .expect("self.tx() requires SQL storage; configure SqlWorkflowStorage")
-            }
-
-            /// Get a reference to the raw database pool.
-            ///
-            /// Use for reads outside the activity transaction. Writes through `self.db()`
-            /// are NOT atomic with the journal entry.
-            ///
-            /// # Panics
-            ///
-            /// Panics if SQL storage is not configured.
-            #[inline]
-            pub fn db(&self) -> &sqlx::PgPool {
-                self.__db.as_ref()
-                    .expect("self.db() requires SQL storage; configure SqlWorkflowStorage")
-            }
+            /// Use as `&self.tx` with any sqlx query (implements `Executor`).
+            pub tx: #krate::__internal::ActivityTx,
+            /// The raw database pool.
+            /// Use as `&self.pool` for reads outside the activity transaction.
+            pub pool: sqlx::PgPool,
         }
 
         impl ::std::ops::Deref for #activity_view_name<'_> {
@@ -3027,61 +2999,38 @@ fn activity_group_impl_inner(
                     // Get pool from WorkflowStorage (if SQL-backed)
                     let __sql_pool = __wf_storage.sql_pool().cloned();
 
-                    if let ::std::option::Option::Some(__pool) = __sql_pool {
-                        // SQL path: open transaction, create view with tx+db, run activity
-                        let __sql_tx = __pool.begin().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
-                            reason: ::std::format!("failed to begin activity transaction: {e}"),
-                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                        })?;
-                        let mut __activity_view = #activity_view_name {
-                            __group: &self.__group,
-                            __tx: ::std::option::Option::Some(__sql_tx),
-                            __db: ::std::option::Option::Some(__pool),
-                        };
-                        let __act_result = __activity_view.#method_name(#(#param_list),*).await;
+                    let __pool = __sql_pool.expect("SQL storage is required for workflow activities");
+                    // Open transaction, create view with tx+pool, run activity
+                    let __sql_tx = __pool.begin().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
+                        reason: ::std::format!("failed to begin activity transaction: {e}"),
+                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                    })?;
+                    let __activity_view = #activity_view_name {
+                        __group: &self.__group,
+                        tx: #krate::__internal::ActivityTx::new(__sql_tx),
+                        pool: __pool,
+                    };
+                    let __act_result = __activity_view.#method_name(#(#param_list),*).await;
 
-                        // Write journal entry + commit in the same transaction
-                        let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
-                            #method_name_str,
-                            &#key_var,
-                            __journal_ctx.entity_type(),
-                            __journal_ctx.entity_id(),
-                        );
-                        let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
-                        #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
+                    // Write journal entry + commit in the same transaction
+                    let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
+                        #method_name_str,
+                        &#key_var,
+                        __journal_ctx.entity_type(),
+                        __journal_ctx.entity_id(),
+                    );
+                    let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
+                    #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
 
-                        // Take the transaction back out of the view to write journal + commit
-                        let mut __tx_back = __activity_view.__tx.take()
-                            .expect("activity transaction was consumed unexpectedly");
-                        #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
-                        __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
-                            reason: ::std::format!("activity transaction commit failed: {e}"),
-                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                        })?;
+                    // Get the transaction back from the view to write journal + commit
+                    let mut __tx_back = __activity_view.tx.into_inner().await;
+                    #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
+                    __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
+                        reason: ::std::format!("activity transaction commit failed: {e}"),
+                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                    })?;
 
-                        __act_result
-                    } else {
-                        // Non-SQL path: execute directly, write journal to storage
-                        let mut __activity_view = #activity_view_name {
-                            __group: &self.__group,
-                            __tx: ::std::option::Option::None,
-                            __db: ::std::option::Option::None,
-                        };
-                        let __act_result = __activity_view.#method_name(#(#param_list),*).await;
-
-                        // Write journal entry directly to WorkflowStorage
-                        let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
-                            #method_name_str,
-                            &#key_var,
-                            __journal_ctx.entity_type(),
-                            __journal_ctx.entity_id(),
-                        );
-                        let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
-                        #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
-                        __wf_storage.save(&__storage_key, &__journal_bytes).await?;
-
-                        __act_result
-                    }
+                    __act_result
                 }
             };
 
@@ -3204,13 +3153,7 @@ fn activity_group_impl_inner(
                         };
                         #journal_body
                     } else {
-                        // No journal — execute directly
-                        let mut __activity_view = #activity_view_name {
-                            __group: &self.__group,
-                            __tx: ::std::option::Option::None,
-                            __db: ::std::option::Option::None,
-                        };
-                        __activity_view.#method_name(#(#param_names),*).await
+                        panic!("SQL storage is required for workflow activities; configure SqlWorkflowStorage")
                     }
                 }
             }
@@ -4127,13 +4070,12 @@ fn workflow_impl_inner(
                 }
             }
 
-            // Check for &mut self — allowed on #[activity] methods, not on execute or helpers
-            let is_activity_method = method.attrs.iter().any(|a| a.path().is_ident("activity"));
+            // Check for &mut self — not allowed on any workflow methods
             if let Some(syn::FnArg::Receiver(r)) = method.sig.inputs.first() {
-                if r.mutability.is_some() && !is_activity_method {
+                if r.mutability.is_some() {
                     return Err(syn::Error::new(
                         r.span(),
-                        "workflow methods must use &self, not &mut self (activities may use &mut self)",
+                        "workflow methods must use &self, not &mut self",
                     ));
                 }
             }
@@ -4376,7 +4318,7 @@ fn workflow_impl_inner(
 
         activity_view_methods.push(quote! {
             #(#attrs)*
-            #vis async fn #name(&mut self, #(#params),*) #output
+            #vis async fn #name(&self, #(#params),*) #output
                 #block
         });
     }
@@ -4520,61 +4462,38 @@ fn workflow_impl_inner(
                     // Get pool from WorkflowStorage (if SQL-backed)
                     let __sql_pool = __wf_storage.sql_pool().cloned();
 
-                    if let ::std::option::Option::Some(__pool) = __sql_pool {
-                        // SQL path: open transaction, create view with tx+db, run activity
-                        let __sql_tx = __pool.begin().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
-                            reason: ::std::format!("failed to begin activity transaction: {e}"),
-                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                        })?;
-                        let mut __activity_view = #activity_view_name {
-                            __handler: self.__handler,
-                            __tx: ::std::option::Option::Some(__sql_tx),
-                            __db: ::std::option::Option::Some(__pool),
-                        };
-                        let __act_result = __activity_view.#method_name(#(#param_list),*).await;
+                    let __pool = __sql_pool.expect("SQL storage is required for workflow activities");
+                    // Open transaction, create view with tx+pool, run activity
+                    let __sql_tx = __pool.begin().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
+                        reason: ::std::format!("failed to begin activity transaction: {e}"),
+                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                    })?;
+                    let __activity_view = #activity_view_name {
+                        __handler: self.__handler,
+                        tx: #krate::__internal::ActivityTx::new(__sql_tx),
+                        pool: __pool,
+                    };
+                    let __act_result = __activity_view.#method_name(#(#param_list),*).await;
 
-                        // Write journal entry + commit in the same transaction
-                        let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
-                            #method_name_str,
-                            &#key_var,
-                            __journal_ctx.entity_type(),
-                            __journal_ctx.entity_id(),
-                        );
-                        let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
-                        #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
+                    // Write journal entry + commit in the same transaction
+                    let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
+                        #method_name_str,
+                        &#key_var,
+                        __journal_ctx.entity_type(),
+                        __journal_ctx.entity_id(),
+                    );
+                    let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
+                    #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
 
-                        // Take the transaction back out of the view to write journal + commit
-                        let mut __tx_back = __activity_view.__tx.take()
-                            .expect("activity transaction was consumed unexpectedly");
-                        #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
-                        __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
-                            reason: ::std::format!("activity transaction commit failed: {e}"),
-                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                        })?;
+                    // Get the transaction back from the view to write journal + commit
+                    let mut __tx_back = __activity_view.tx.into_inner().await;
+                    #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
+                    __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
+                        reason: ::std::format!("activity transaction commit failed: {e}"),
+                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                    })?;
 
-                        __act_result
-                    } else {
-                        // Non-SQL path: execute directly, write journal to storage
-                        let mut __activity_view = #activity_view_name {
-                            __handler: self.__handler,
-                            __tx: ::std::option::Option::None,
-                            __db: ::std::option::Option::None,
-                        };
-                        let __act_result = __activity_view.#method_name(#(#param_list),*).await;
-
-                        // Write journal entry directly to WorkflowStorage
-                        let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
-                            #method_name_str,
-                            &#key_var,
-                            __journal_ctx.entity_type(),
-                            __journal_ctx.entity_id(),
-                        );
-                        let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
-                        #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
-                        __wf_storage.save(&__storage_key, &__journal_bytes).await?;
-
-                        __act_result
-                    }
+                    __act_result
                 }
             };
 
@@ -4699,13 +4618,7 @@ fn workflow_impl_inner(
                         };
                         #journal_body
                     } else {
-                        // No journal — execute directly (no tx/db available)
-                        let mut __activity_view = #activity_view_name {
-                            __handler: self.__handler,
-                            __tx: ::std::option::Option::None,
-                            __db: ::std::option::Option::None,
-                        };
-                        __activity_view.#method_name(#(#param_names),*).await
+                        panic!("SQL storage is required for workflow activities; configure SqlWorkflowStorage")
                     }
                 }
             }
@@ -4900,48 +4813,20 @@ fn workflow_impl_inner(
             __handler: &'a #handler_name,
         }
 
-        /// View struct for activities — provides struct field access, `tx`, and `db`.
+        /// View struct for activities — provides `self.tx` and `self.pool`.
         ///
-        /// `self.tx()` provides the activity's SQL transaction (commits atomically with the
-        /// journal entry). `self.db()` provides the raw pool for reads outside the transaction.
+        /// `self.tx` is the activity's SQL transaction (commits atomically with the
+        /// journal entry). `self.pool` is the raw database pool.
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
         struct #activity_view_name<'a> {
             __handler: &'a #handler_name,
             /// The activity's SQL transaction. Commits atomically with the journal entry.
-            __tx: ::std::option::Option<sqlx::Transaction<'static, sqlx::Postgres>>,
-            /// The raw database pool for reads outside the activity transaction.
-            __db: ::std::option::Option<sqlx::PgPool>,
-        }
-
-        impl #activity_view_name<'_> {
-            /// Get a mutable reference to the activity's SQL transaction.
-            ///
-            /// All SQL executed through this connection commits atomically with the journal entry.
-            /// Use with `sqlx::query(...).execute(&mut *self.tx()).await?`.
-            ///
-            /// # Panics
-            ///
-            /// Panics if SQL storage is not configured (e.g., using MemoryWorkflowStorage).
-            #[inline]
-            pub fn tx(&mut self) -> &mut sqlx::PgConnection {
-                self.__tx.as_deref_mut()
-                    .expect("self.tx() requires SQL storage; configure SqlWorkflowStorage")
-            }
-
-            /// Get a reference to the raw database pool.
-            ///
-            /// Use for reads outside the activity transaction. Writes through `self.db()`
-            /// are NOT atomic with the journal entry.
-            ///
-            /// # Panics
-            ///
-            /// Panics if SQL storage is not configured.
-            #[inline]
-            pub fn db(&self) -> &sqlx::PgPool {
-                self.__db.as_ref()
-                    .expect("self.db() requires SQL storage; configure SqlWorkflowStorage")
-            }
+            /// Use as `&self.tx` with any sqlx query (implements `Executor`).
+            pub tx: #krate::__internal::ActivityTx,
+            /// The raw database pool.
+            /// Use as `&self.pool` for reads outside the activity transaction.
+            pub pool: sqlx::PgPool,
         }
 
         // Both views deref to the user's workflow struct

@@ -221,7 +221,7 @@ pub struct ScheduleTimerRequest {
 /// then checks if the timer was cancelled. If not cancelled, records
 /// the timer fire and removes the pending record.
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct ScheduleTimerWorkflow;
@@ -266,7 +266,7 @@ impl ScheduleTimerWorkflow {
 
     #[activity]
     async fn add_pending_timer(
-        &mut self,
+        &self,
         entity_id: String,
         timer_id: String,
         scheduled_at: DateTime<Utc>,
@@ -281,7 +281,7 @@ impl ScheduleTimerWorkflow {
         .bind(&timer_id)
         .bind(scheduled_at)
         .bind(delay_ms)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("add_pending_timer failed: {e}"),
@@ -292,7 +292,7 @@ impl ScheduleTimerWorkflow {
 
     #[activity]
     async fn check_cancelled(
-        &mut self,
+        &self,
         entity_id: String,
         timer_id: String,
     ) -> Result<bool, ClusterError> {
@@ -302,7 +302,7 @@ impl ScheduleTimerWorkflow {
         )
         .bind(&entity_id)
         .bind(&timer_id)
-        .fetch_optional(self.tx())
+        .fetch_optional(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("check_cancelled failed: {e}"),
@@ -314,7 +314,7 @@ impl ScheduleTimerWorkflow {
 
     #[activity]
     async fn record_timer_fire(
-        &mut self,
+        &self,
         entity_id: String,
         timer_id: String,
         scheduled_at: DateTime<Utc>,
@@ -330,7 +330,7 @@ impl ScheduleTimerWorkflow {
         .bind(&timer_id)
         .bind(scheduled_at)
         .bind(fired_at)
-        .execute(&mut *self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("record_timer_fire failed: {e}"),
@@ -341,7 +341,7 @@ impl ScheduleTimerWorkflow {
         sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
             .bind(&entity_id)
             .bind(&timer_id)
-            .execute(self.tx())
+            .execute(&self.tx)
             .await
             .map_err(|e| ClusterError::PersistenceError {
                 reason: format!("record_timer_fire (cleanup) failed: {e}"),
@@ -353,14 +353,14 @@ impl ScheduleTimerWorkflow {
 
     #[activity]
     async fn remove_pending_timer(
-        &mut self,
+        &self,
         entity_id: String,
         timer_id: String,
     ) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
             .bind(&entity_id)
             .bind(&timer_id)
-            .execute(self.tx())
+            .execute(&self.tx)
             .await
             .map_err(|e| ClusterError::PersistenceError {
                 reason: format!("remove_pending_timer failed: {e}"),

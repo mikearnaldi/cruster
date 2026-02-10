@@ -2,27 +2,21 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::config::ShardingConfig;
-    use crate::durable::{MemoryWorkflowStorage, WorkflowEngine};
     use crate::entity_client::EntityClient;
     use crate::envelope::{AckChunk, EnvelopeRequest, Interrupt};
     use crate::hash::shard_for_entity;
     use crate::message::ReplyReceiver;
-    use crate::metrics::ClusterMetrics;
     use crate::prelude::*;
     use crate::reply::{ExitResult, Reply, ReplyWithExit};
     use crate::sharding::{Sharding, ShardingRegistrationEvent};
-    use crate::sharding_impl::ShardingImpl;
     use crate::singleton::SingletonContext;
     use crate::snowflake::{Snowflake, SnowflakeGenerator};
-    use crate::storage::memory_message::MemoryMessageStorage;
-    use crate::storage::noop_runners::NoopRunners;
     use crate::types::{EntityAddress, EntityId, EntityType, RunnerAddress, ShardId};
     use async_trait::async_trait;
     use futures::future::BoxFuture;
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
     use tokio_stream::Stream;
@@ -251,85 +245,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mixed_entity_client_calls_persisted_and_regular() {
-        let config = Arc::new(ShardingConfig {
-            shard_groups: vec!["default".to_string()],
-            shards_per_group: 10,
-            ..Default::default()
-        });
-        let runners: Arc<dyn crate::runners::Runners> = Arc::new(NoopRunners);
-        let metrics = Arc::new(ClusterMetrics::unregistered());
-        let storage = Arc::new(MemoryMessageStorage::new());
-        let sharding_impl =
-            ShardingImpl::new(config, runners, None, None, Some(storage), metrics).unwrap();
-        sharding_impl.acquire_all_shards().await;
-
-        let sharding: Arc<dyn Sharding> = sharding_impl.clone();
-        let client = MixedEntity.register(Arc::clone(&sharding)).await.unwrap();
-        let entity_id = EntityId::new("mixed-1");
-
-        let persisted: String = client
-            .persisted_action(&entity_id, &"hello".to_string())
-            .await
-            .unwrap();
-        assert_eq!(persisted, "persisted:hello");
-
-        let regular: i32 = client.regular_action(&entity_id, &7).await.unwrap();
-        assert_eq!(regular, 14);
-
-        sharding.shutdown().await.unwrap();
-    }
-
-    // --- Persisted RPC idempotency replay ---
-
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct PersistedIdempotentEntity {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[entity_impl(krate = "crate")]
-    impl PersistedIdempotentEntity {
-        #[rpc(persisted)]
-        async fn process(&self, value: i32) -> Result<i32, ClusterError> {
-            let count = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(value + count as i32)
-        }
-    }
-
-    #[tokio::test]
-    async fn persisted_method_replay_returns_cached_reply() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let entity = PersistedIdempotentEntity {
-            calls: Arc::clone(&calls),
-        };
-
-        let config = Arc::new(ShardingConfig {
-            shard_groups: vec!["default".to_string()],
-            shards_per_group: 10,
-            ..Default::default()
-        });
-        let runners: Arc<dyn crate::runners::Runners> = Arc::new(NoopRunners);
-        let metrics = Arc::new(ClusterMetrics::unregistered());
-        let storage = Arc::new(MemoryMessageStorage::new());
-        let sharding_impl =
-            ShardingImpl::new(config, runners, None, None, Some(storage), metrics).unwrap();
-        sharding_impl.acquire_all_shards().await;
-
-        let sharding: Arc<dyn Sharding> = sharding_impl.clone();
-        let client = entity.register(Arc::clone(&sharding)).await.unwrap();
-        let entity_id = EntityId::new("idem-1");
-
-        let first: i32 = client.process(&entity_id, &5).await.unwrap();
-        let second: i32 = client.process(&entity_id, &5).await.unwrap();
-
-        assert_eq!(first, 6);
-        assert_eq!(second, 6);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        sharding.shutdown().await.unwrap();
-    }
+    // mixed_entity_client_calls_persisted_and_regular moved to tests/macro_integration.rs
+    // persisted_method_replay_returns_cached_reply moved to tests/macro_integration.rs
 
     // --- Workflow with custom key extraction (migrated from entity #[workflow(key(...))] to standalone workflow) ---
 
@@ -798,90 +715,7 @@ mod tests {
         amount: i32,
     }
 
-    #[workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct NewOrderWorkflow;
-
-    #[workflow_impl(krate = "crate")]
-    impl NewOrderWorkflow {
-        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
-            let validated = self.validate(request.order_id.clone()).await?;
-            let charged = self
-                .charge(request.order_id.clone(), request.amount)
-                .await?;
-            Ok(format!("{validated}+{charged}"))
-        }
-
-        #[activity]
-        async fn validate(&mut self, order_id: String) -> Result<String, ClusterError> {
-            Ok(format!("valid:{order_id}"))
-        }
-
-        #[activity]
-        async fn charge(&mut self, order_id: String, amount: i32) -> Result<String, ClusterError> {
-            Ok(format!("charged:{order_id}:{amount}"))
-        }
-    }
-
-    #[tokio::test]
-    async fn new_workflow_with_activities() {
-        let w = NewOrderWorkflow;
-        let ctx = test_ctx("Workflow/NewOrderWorkflow", "exec-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = NewOrderRequest {
-            order_id: "order-99".to_string(),
-            amount: 200,
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "valid:order-99+charged:order-99:200");
-    }
-
-    // --- Workflow with struct fields using new macros ---
-
-    #[workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct NewFieldWorkflow {
-        prefix: String,
-    }
-
-    #[workflow_impl(krate = "crate")]
-    impl NewFieldWorkflow {
-        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
-            let greeting = self.greet(request.name).await?;
-            Ok(greeting)
-        }
-
-        #[activity]
-        async fn greet(&mut self, name: String) -> Result<String, ClusterError> {
-            Ok(format!("{}: {name}", self.prefix))
-        }
-    }
-
-    #[tokio::test]
-    async fn new_workflow_with_fields() {
-        let w = NewFieldWorkflow {
-            prefix: "Hey".to_string(),
-        };
-        let ctx = test_ctx("Workflow/NewFieldWorkflow", "exec-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = NewWfRequest {
-            name: "Bob".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "Hey: Bob");
-    }
+    // Workflow activity dispatch tests moved to tests/macro_integration.rs
 
     // --- Client generation with new macros ---
 
@@ -1246,13 +1080,13 @@ mod tests {
     #[activity_group_impl(krate = "crate")]
     impl TestPayments {
         #[activity]
-        async fn charge(&mut self, amount: i32) -> Result<String, ClusterError> {
+        async fn charge(&self, amount: i32) -> Result<String, ClusterError> {
             let total = (amount as f64 * self.rate) as i32;
             Ok(format!("charged:{total}"))
         }
 
         #[activity]
-        async fn refund(&mut self, tx_id: String) -> Result<String, ClusterError> {
+        async fn refund(&self, tx_id: String) -> Result<String, ClusterError> {
             Ok(format!("refunded:{tx_id}"))
         }
 
@@ -1277,30 +1111,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn activity_group_workflow_dispatch() {
-        let payments = TestPayments { rate: 1.5 };
-        let workflow = PaymentWorkflow;
-        let ctx = test_ctx("Workflow/PaymentWorkflow", "exec-1");
-        // To test dispatch, we need to create the WithGroups wrapper and spawn
-        let bundle = __PaymentWorkflowWithGroups {
-            __workflow: workflow,
-            __group_test_payments: payments,
-        };
-        let handler = bundle.spawn(ctx).await.unwrap();
-
-        let req = NewOrderRequest {
-            order_id: "order-1".to_string(),
-            amount: 100,
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "charged:150|refunded:order-1");
-    }
+    // activity_group_workflow_dispatch moved to tests/macro_integration.rs
 
     #[tokio::test]
     async fn activity_group_workflow_register() {
@@ -1336,7 +1147,7 @@ mod tests {
     #[activity_group_impl(krate = "crate")]
     impl TestInventory {
         #[activity]
-        async fn reserve(&mut self, item_count: i32) -> Result<String, ClusterError> {
+        async fn reserve(&self, item_count: i32) -> Result<String, ClusterError> {
             Ok(format!("reserved:{item_count}"))
         }
     }
@@ -1354,31 +1165,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn multi_activity_group_workflow_dispatch() {
-        let payments = TestPayments { rate: 1.0 };
-        let inventory = TestInventory;
-        let workflow = MultiGroupWorkflow;
-        let ctx = test_ctx("Workflow/MultiGroupWorkflow", "exec-1");
-        let bundle = __MultiGroupWorkflowWithGroups {
-            __workflow: workflow,
-            __group_test_payments: payments,
-            __group_test_inventory: inventory,
-        };
-        let handler = bundle.spawn(ctx).await.unwrap();
-
-        let req = NewOrderRequest {
-            order_id: "order-3".to_string(),
-            amount: 10,
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "reserved:10|charged:10");
-    }
+    // multi_activity_group_workflow_dispatch moved to tests/macro_integration.rs
 
     #[tokio::test]
     async fn multi_activity_group_workflow_register() {
@@ -1399,53 +1186,7 @@ mod tests {
         let _: String = client.execute(&req).await.unwrap();
     }
 
-    // --- Workflow with both local activities and activity groups ---
-
-    #[workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct MixedActivitiesWorkflow {
-        prefix: String,
-    }
-
-    #[workflow_impl(krate = "crate", activity_groups(TestPayments))]
-    impl MixedActivitiesWorkflow {
-        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
-            let validated = self.validate(request.order_id.clone()).await?;
-            let charged = self.charge(request.amount).await?;
-            Ok(format!("{validated}|{charged}"))
-        }
-
-        #[activity]
-        async fn validate(&mut self, order_id: String) -> Result<String, ClusterError> {
-            Ok(format!("{}:valid:{order_id}", self.prefix))
-        }
-    }
-
-    #[tokio::test]
-    async fn mixed_activities_workflow_dispatch() {
-        let payments = TestPayments { rate: 3.0 };
-        let workflow = MixedActivitiesWorkflow {
-            prefix: "test".to_string(),
-        };
-        let ctx = test_ctx("Workflow/MixedActivitiesWorkflow", "exec-1");
-        let bundle = __MixedActivitiesWorkflowWithGroups {
-            __workflow: workflow,
-            __group_test_payments: payments,
-        };
-        let handler = bundle.spawn(ctx).await.unwrap();
-
-        let req = NewOrderRequest {
-            order_id: "order-5".to_string(),
-            amount: 10,
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "test:valid:order-5|charged:30");
-    }
+    // MixedActivitiesWorkflow + test moved to tests/macro_integration.rs
 
     // ==========================================================================
     // Activity Retry Support Tests (#[activity(retries = N, backoff = "...")])
@@ -1454,69 +1195,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
-    /// Workflow engine that returns immediately from sleep (for retry tests).
-    struct InstantWorkflowEngine;
-
-    #[async_trait]
-    impl WorkflowEngine for InstantWorkflowEngine {
-        async fn sleep(
-            &self,
-            _workflow_name: &str,
-            _execution_id: &str,
-            _name: &str,
-            _duration: Duration,
-        ) -> Result<(), ClusterError> {
-            // No-op — instant return for fast tests
-            Ok(())
-        }
-
-        async fn await_deferred(
-            &self,
-            _workflow_name: &str,
-            _execution_id: &str,
-            _name: &str,
-        ) -> Result<Vec<u8>, ClusterError> {
-            Err(ClusterError::PersistenceError {
-                reason: "not supported".to_string(),
-                source: None,
-            })
-        }
-
-        async fn resolve_deferred(
-            &self,
-            _workflow_name: &str,
-            _execution_id: &str,
-            _name: &str,
-            _value: Vec<u8>,
-        ) -> Result<(), ClusterError> {
-            Ok(())
-        }
-
-        async fn on_interrupt(
-            &self,
-            _workflow_name: &str,
-            _execution_id: &str,
-        ) -> Result<(), ClusterError> {
-            Ok(())
-        }
-    }
-
-    fn test_ctx_with_instant_engine(entity_type: &str, entity_id: &str) -> EntityContext {
-        EntityContext {
-            address: EntityAddress {
-                shard_id: ShardId::new("default", 0),
-                entity_type: EntityType::new(entity_type),
-                entity_id: EntityId::new(entity_id),
-            },
-            runner_address: RunnerAddress::new("127.0.0.1", 9000),
-            snowflake: Arc::new(SnowflakeGenerator::new()),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            state_storage: Some(Arc::new(MemoryWorkflowStorage::new())),
-            workflow_engine: Some(Arc::new(InstantWorkflowEngine)),
-            sharding: None,
-            message_storage: Some(Arc::new(MemoryMessageStorage::new())),
-        }
-    }
+    // InstantWorkflowEngine + test_ctx_with_instant_engine moved to tests/macro_integration.rs
 
     // --- Workflow with retries (no backoff specified = exponential default) ---
 
@@ -1555,223 +1234,23 @@ mod tests {
         assert_eq!(w.entity_type().0, "Workflow/RetryWorkflow");
     }
 
-    #[tokio::test]
-    async fn retry_workflow_activity_succeeds_after_retries() {
-        let call_count = Arc::new(AtomicU32::new(0));
-        let w = RetryWorkflow {
-            call_count: call_count.clone(),
-        };
-        let ctx = test_ctx_with_instant_engine("Workflow/RetryWorkflow", "exec-retry-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = NewWfRequest {
-            name: "retry-test".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        // Succeeds on attempt #2 (0-indexed), after 2 failures
-        assert_eq!(value, "success:retry-test:attempt-2");
-        // Total calls: attempts 0, 1, 2 = 3 calls
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
-    }
+    // retry_workflow_activity_succeeds_after_retries moved to tests/macro_integration.rs
 
     // --- Workflow with constant backoff ---
 
-    #[workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct ConstantBackoffWorkflow {
-        call_count: Arc<AtomicU32>,
-    }
-
-    #[workflow_impl(krate = "crate")]
-    impl ConstantBackoffWorkflow {
-        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
-            self.retryable(request.name).await
-        }
-
-        #[activity(retries = 2, backoff = "constant")]
-        async fn retryable(&self, name: String) -> Result<String, ClusterError> {
-            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if count < 1 {
-                Err(ClusterError::PersistenceError {
-                    reason: "constant-fail".to_string(),
-                    source: None,
-                })
-            } else {
-                Ok(format!("const-ok:{name}"))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn constant_backoff_workflow_succeeds() {
-        let call_count = Arc::new(AtomicU32::new(0));
-        let w = ConstantBackoffWorkflow {
-            call_count: call_count.clone(),
-        };
-        let ctx = test_ctx_with_instant_engine("Workflow/ConstantBackoffWorkflow", "exec-const-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = NewWfRequest {
-            name: "const-test".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "const-ok:const-test");
-        assert_eq!(call_count.load(Ordering::SeqCst), 2);
-    }
+    // ConstantBackoffWorkflow + test moved to tests/macro_integration.rs
 
     // --- Workflow where all retries fail ---
 
-    #[workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct AlwaysFailWorkflow {
-        call_count: Arc<AtomicU32>,
-    }
-
-    #[workflow_impl(krate = "crate")]
-    impl AlwaysFailWorkflow {
-        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
-            self.always_fail(request.name).await
-        }
-
-        #[activity(retries = 2, backoff = "exponential")]
-        async fn always_fail(&self, _name: String) -> Result<String, ClusterError> {
-            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
-            Err(ClusterError::PersistenceError {
-                reason: format!("always-fail-{count}"),
-                source: None,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn retry_workflow_exhaustion_returns_last_error() {
-        let call_count = Arc::new(AtomicU32::new(0));
-        let w = AlwaysFailWorkflow {
-            call_count: call_count.clone(),
-        };
-        let ctx = test_ctx_with_instant_engine("Workflow/AlwaysFailWorkflow", "exec-fail-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = NewWfRequest {
-            name: "fail-test".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await;
-        assert!(result.is_err());
-        // 1 initial + 2 retries = 3 total calls
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
-    }
+    // AlwaysFailWorkflow + test moved to tests/macro_integration.rs
 
     // --- Activity with retries = 0 (same as no retries) ---
 
-    #[workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct NoRetryWorkflow;
-
-    #[workflow_impl(krate = "crate")]
-    impl NoRetryWorkflow {
-        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
-            self.no_retry(request.name).await
-        }
-
-        #[activity(retries = 0)]
-        async fn no_retry(&self, name: String) -> Result<String, ClusterError> {
-            Ok(format!("no-retry:{name}"))
-        }
-    }
-
-    #[tokio::test]
-    async fn no_retry_workflow_succeeds() {
-        let w = NoRetryWorkflow;
-        let ctx = test_ctx("Workflow/NoRetryWorkflow", "exec-noretry-1");
-        let handler = w.spawn(ctx).await.unwrap();
-
-        let req = NewWfRequest {
-            name: "no-retry-test".to_string(),
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "no-retry:no-retry-test");
-    }
+    // NoRetryWorkflow + test moved to tests/macro_integration.rs
 
     // --- Activity group with retries ---
 
-    #[activity_group(krate = "crate")]
-    #[derive(Clone)]
-    pub struct RetryPayments {
-        call_count: Arc<AtomicU32>,
-    }
-
-    #[activity_group_impl(krate = "crate")]
-    impl RetryPayments {
-        #[activity(retries = 3, backoff = "exponential")]
-        async fn charge_with_retry(&self, amount: i32) -> Result<String, ClusterError> {
-            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if count < 2 {
-                Err(ClusterError::PersistenceError {
-                    reason: format!("payment-fail-{count}"),
-                    source: None,
-                })
-            } else {
-                Ok(format!("charged:{amount}"))
-            }
-        }
-    }
-
-    #[workflow(krate = "crate")]
-    #[derive(Clone)]
-    struct GroupRetryWorkflow;
-
-    #[workflow_impl(krate = "crate", activity_groups(RetryPayments))]
-    impl GroupRetryWorkflow {
-        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
-            self.charge_with_retry(request.amount).await
-        }
-    }
-
-    #[tokio::test]
-    async fn activity_group_retry_succeeds() {
-        let call_count = Arc::new(AtomicU32::new(0));
-        let payments = RetryPayments {
-            call_count: call_count.clone(),
-        };
-        let workflow = GroupRetryWorkflow;
-        let ctx = test_ctx_with_instant_engine("Workflow/GroupRetryWorkflow", "exec-group-retry-1");
-        let bundle = __GroupRetryWorkflowWithGroups {
-            __workflow: workflow,
-            __group_retry_payments: payments,
-        };
-        let handler = bundle.spawn(ctx).await.unwrap();
-
-        let req = NewOrderRequest {
-            order_id: "order-retry".to_string(),
-            amount: 42,
-        };
-        let payload = rmp_serde::to_vec(&req).unwrap();
-        let result = handler
-            .handle_request("execute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "charged:42");
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
-    }
+    // RetryPayments + GroupRetryWorkflow + test moved to tests/macro_integration.rs
 
     // --- Test compute_retry_backoff utility ---
 

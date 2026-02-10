@@ -14,6 +14,133 @@ use crate::durable::StorageTransaction;
 use crate::durable::WorkflowStorage;
 use crate::error::ClusterError;
 
+// ---------------------------------------------------------------------------
+// ActivityTx — sqlx Executor wrapper for activity transactions
+// ---------------------------------------------------------------------------
+
+/// A transaction handle exposed to `#[activity]` methods as `self.tx`.
+///
+/// Wraps an active SQL transaction and implements [`sqlx::Executor`] for `&ActivityTx`,
+/// so activities can write `&self.tx` anywhere sqlx expects an executor — just like
+/// `&self.pool` works for [`sqlx::PgPool`].
+///
+/// ```ignore
+/// #[activity]
+/// pub async fn transfer(&self, amount: i64) -> Result<(), ClusterError> {
+///     sqlx::query("UPDATE accounts SET balance = balance - $1")
+///         .bind(amount)
+///         .execute(&self.tx)
+///         .await?;
+///     Ok(())
+/// }
+/// ```
+///
+/// The transaction is opened by the activity wrapper before the method runs
+/// and committed (with the journal entry) after the method returns.
+pub struct ActivityTx(TokioMutex<sqlx::Transaction<'static, sqlx::Postgres>>);
+
+impl ActivityTx {
+    /// Create a new `ActivityTx` wrapping an open transaction.
+    pub fn new(tx: sqlx::Transaction<'static, sqlx::Postgres>) -> Self {
+        Self(TokioMutex::new(tx))
+    }
+
+    /// Consume this wrapper and return the inner transaction.
+    ///
+    /// Used by the activity wrapper after the method returns to save
+    /// the journal entry and commit.
+    pub async fn into_inner(self) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        self.0.into_inner()
+    }
+}
+
+impl std::fmt::Debug for ActivityTx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivityTx").finish()
+    }
+}
+
+impl<'c> sqlx::Executor<'c> for &'c ActivityTx {
+    type Database = sqlx::Postgres;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures::stream::BoxStream<
+        'e,
+        Result<
+            sqlx::Either<sqlx::postgres::PgQueryResult, sqlx::postgres::PgRow>,
+            sqlx::Error,
+        >,
+    >
+    where
+        'c: 'e,
+        E: sqlx::Execute<'q, sqlx::Postgres> + 'q,
+    {
+        use futures::{FutureExt, StreamExt};
+        // Lock the transaction, collect all results, then stream them.
+        // The lock is held only for the duration of the query execution.
+        async move {
+            let mut guard = self.0.lock().await;
+            let results: Vec<_> = (&mut **guard).fetch_many(query).collect().await;
+            futures::stream::iter(results)
+        }
+        .into_stream()
+        .flatten()
+        .boxed()
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures::future::BoxFuture<
+        'e,
+        Result<Option<sqlx::postgres::PgRow>, sqlx::Error>,
+    >
+    where
+        'c: 'e,
+        E: sqlx::Execute<'q, sqlx::Postgres> + 'q,
+    {
+        Box::pin(async move {
+            let mut guard = self.0.lock().await;
+            (&mut **guard).fetch_optional(query).await
+        })
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [<sqlx::Postgres as sqlx::Database>::TypeInfo],
+    ) -> futures::future::BoxFuture<
+        'e,
+        Result<<sqlx::Postgres as sqlx::Database>::Statement<'q>, sqlx::Error>,
+    >
+    where
+        'c: 'e,
+    {
+        Box::pin(async move {
+            let mut guard = self.0.lock().await;
+            (&mut **guard).prepare_with(sql, parameters).await
+        })
+    }
+
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> futures::future::BoxFuture<
+        'e,
+        Result<sqlx::Describe<sqlx::Postgres>, sqlx::Error>,
+    >
+    where
+        'c: 'e,
+    {
+        Box::pin(async move {
+            let mut guard = self.0.lock().await;
+            (&mut **guard).describe(sql).await
+        })
+    }
+}
+
 // Type aliases to reduce complexity warnings
 type PendingWrites = Arc<parking_lot::Mutex<Vec<(String, Vec<u8>)>>>;
 type SharedTransaction = Arc<TokioMutex<Box<dyn StorageTransaction>>>;
@@ -277,100 +404,5 @@ impl SqlTransactionHandle {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::durable::MemoryWorkflowStorage;
-
-    #[tokio::test]
-    async fn activity_scope_commits_writes_on_success() {
-        let storage: Arc<dyn crate::durable::WorkflowStorage> =
-            Arc::new(MemoryWorkflowStorage::new());
-
-        // Verify is_active is false before running
-        assert!(!ActivityScope::is_active());
-
-        let result = ActivityScope::run(&storage, || {
-            async move {
-                // Verify is_active is true inside the scope
-                assert!(
-                    ActivityScope::is_active(),
-                    "ActivityScope should be active inside run()"
-                );
-
-                ActivityScope::buffer_write("test/key".to_string(), b"hello".to_vec());
-
-                Ok::<_, crate::error::ClusterError>(())
-            }
-        })
-        .await;
-
-        assert!(result.is_ok());
-
-        // Write should be persisted to storage
-        let stored = storage.load("test/key").await.unwrap();
-        assert!(
-            stored.is_some(),
-            "Write should be persisted after ActivityScope::run() completes"
-        );
-        assert_eq!(stored.unwrap(), b"hello");
-    }
-
-    #[tokio::test]
-    async fn activity_scope_rolls_back_on_error() {
-        let storage: Arc<dyn crate::durable::WorkflowStorage> =
-            Arc::new(MemoryWorkflowStorage::new());
-
-        let result = ActivityScope::run(&storage, || {
-            async move {
-                ActivityScope::buffer_write("test/key".to_string(), b"hello".to_vec());
-
-                // Return an error - should rollback
-                Err::<(), _>(crate::error::ClusterError::PersistenceError {
-                    reason: "test error".to_string(),
-                    source: None,
-                })
-            }
-        })
-        .await;
-
-        assert!(result.is_err());
-
-        // Write should NOT be persisted
-        let stored = storage.load("test/key").await.unwrap();
-        assert!(stored.is_none(), "Write should NOT be persisted on error");
-    }
-
-    #[tokio::test]
-    async fn sql_transaction_returns_none_for_memory_storage() {
-        let storage: Arc<dyn crate::durable::WorkflowStorage> =
-            Arc::new(MemoryWorkflowStorage::new());
-
-        let result = ActivityScope::run(&storage, || async {
-            // sql_transaction() should return None when using memory storage
-            let tx = ActivityScope::sql_transaction().await;
-            assert!(
-                tx.is_none(),
-                "sql_transaction() should return None for memory storage"
-            );
-            Ok::<_, crate::error::ClusterError>(())
-        })
-        .await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "db() requires an active SQL transaction")]
-    async fn db_panics_for_memory_storage() {
-        let storage: Arc<dyn crate::durable::WorkflowStorage> =
-            Arc::new(MemoryWorkflowStorage::new());
-
-        let _ = ActivityScope::run(&storage, || async {
-            // db() should panic when using memory storage (no SQL transaction)
-            let _db = ActivityScope::db().await;
-            Ok::<_, crate::error::ClusterError>(())
-        })
-        .await;
-    }
-}
+// Tests for ActivityScope have been moved to tests/sql_integration.rs
+// (module `activity_scope`) to use real PostgreSQL via testcontainers.

@@ -116,7 +116,7 @@ pub struct ExternalCallRequest {
 
 /// Workflow that runs multiple activities to test journaling and replay.
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct ActivityWorkflow;
@@ -182,7 +182,7 @@ impl ActivityWorkflow {
     /// Writes the activity record to PostgreSQL via the framework transaction.
     /// On replay, this should be journaled and not re-executed.
     #[activity]
-    async fn log_activity(&mut self, request: LogActivityRequest) -> Result<(), ClusterError> {
+    async fn log_activity(&self, request: LogActivityRequest) -> Result<(), ClusterError> {
         sqlx::query(
             "INSERT INTO activity_test_logs (id, entity_id, action, timestamp)
              VALUES ($1, $2, $3, NOW())
@@ -191,7 +191,7 @@ impl ActivityWorkflow {
         .bind(&request.id)
         .bind(&request.entity_id)
         .bind(&request.action)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("log_activity failed: {e}"),
@@ -204,7 +204,7 @@ impl ActivityWorkflow {
     ///
     /// On replay, the result should be replayed from the journal rather than re-executing.
     #[activity]
-    async fn external_call(&mut self, request: ExternalCallRequest) -> Result<String, ClusterError> {
+    async fn external_call(&self, request: ExternalCallRequest) -> Result<String, ClusterError> {
         // Simulate the external call by returning a deterministic result
         // In a real scenario, this would make an HTTP request
         Ok(format!("response_from_{}", request.url.replace('/', "_")))

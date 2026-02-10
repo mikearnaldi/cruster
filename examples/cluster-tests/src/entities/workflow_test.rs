@@ -134,7 +134,7 @@ pub struct RunSimpleWorkflowRequest {
 
 /// Simple workflow that creates an execution, runs 3 steps, and marks completed.
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct SimpleWorkflow;
@@ -167,7 +167,7 @@ impl SimpleWorkflow {
 
     #[activity]
     async fn create_execution(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
@@ -178,7 +178,7 @@ impl SimpleWorkflow {
         )
         .bind(&exec_id)
         .bind(&entity_id)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("create_execution failed: {e}"),
@@ -189,7 +189,7 @@ impl SimpleWorkflow {
 
     #[activity]
     async fn complete_step(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
         step_name: String,
@@ -202,7 +202,7 @@ impl SimpleWorkflow {
         .bind(&entity_id)
         .bind(&exec_id)
         .bind(&step_name)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("complete_step failed: {e}"),
@@ -213,7 +213,7 @@ impl SimpleWorkflow {
 
     #[activity]
     async fn mark_completed(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
         result: String,
@@ -225,7 +225,7 @@ impl SimpleWorkflow {
         .bind(&entity_id)
         .bind(&exec_id)
         .bind(&result)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_completed failed: {e}"),
@@ -252,7 +252,7 @@ pub struct RunFailingWorkflowRequest {
 
 /// Workflow that creates an execution, runs steps, and fails at a configurable point.
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct FailingWorkflow;
@@ -293,7 +293,7 @@ impl FailingWorkflow {
 
     #[activity]
     async fn create_execution(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
@@ -304,7 +304,7 @@ impl FailingWorkflow {
         )
         .bind(&exec_id)
         .bind(&entity_id)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("create_execution failed: {e}"),
@@ -315,7 +315,7 @@ impl FailingWorkflow {
 
     #[activity]
     async fn complete_step(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
         step_name: String,
@@ -328,7 +328,7 @@ impl FailingWorkflow {
         .bind(&entity_id)
         .bind(&exec_id)
         .bind(&step_name)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("complete_step failed: {e}"),
@@ -339,7 +339,7 @@ impl FailingWorkflow {
 
     #[activity]
     async fn mark_completed(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
         result: String,
@@ -351,7 +351,7 @@ impl FailingWorkflow {
         .bind(&entity_id)
         .bind(&exec_id)
         .bind(&result)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_completed failed: {e}"),
@@ -362,7 +362,7 @@ impl FailingWorkflow {
 
     #[activity]
     async fn mark_failed(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
         step: usize,
@@ -374,7 +374,7 @@ impl FailingWorkflow {
         .bind(&entity_id)
         .bind(&exec_id)
         .bind(format!("failed:step{}", step))
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_failed failed: {e}"),
@@ -401,7 +401,7 @@ pub struct RunLongWorkflowRequest {
 
 /// Workflow that creates an execution and runs a configurable number of steps.
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct LongWorkflow;
@@ -433,7 +433,7 @@ impl LongWorkflow {
 
     #[activity]
     async fn create_execution(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
@@ -444,7 +444,7 @@ impl LongWorkflow {
         )
         .bind(&exec_id)
         .bind(&entity_id)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("create_execution failed: {e}"),
@@ -455,7 +455,7 @@ impl LongWorkflow {
 
     #[activity]
     async fn complete_step(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
         step_name: String,
@@ -468,7 +468,7 @@ impl LongWorkflow {
         .bind(&entity_id)
         .bind(&exec_id)
         .bind(&step_name)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("complete_step failed: {e}"),
@@ -479,7 +479,7 @@ impl LongWorkflow {
 
     #[activity]
     async fn mark_completed(
-        &mut self,
+        &self,
         entity_id: String,
         exec_id: String,
         result: String,
@@ -491,7 +491,7 @@ impl LongWorkflow {
         .bind(&entity_id)
         .bind(&exec_id)
         .bind(&result)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("mark_completed failed: {e}"),

@@ -5,14 +5,14 @@
 //! ## Architecture
 //! - `SqlActivityTest` entity: pure-RPC for reading state from PG (`sql_activity_test_state` table)
 //! - `SqlTransferWorkflow`: standalone workflow with activity that writes to both
-//!   `sql_activity_test_state` and `sql_activity_test_transfers` atomically via `self.tx()`
+//!   `sql_activity_test_state` and `sql_activity_test_transfers` atomically via `&self.tx`
 //! - `SqlFailingTransferWorkflow`: standalone workflow with activity that writes then fails,
 //!   testing that both state and transfer writes are rolled back
 //! - `SqlCountWorkflow`: standalone workflow with activity that queries the transfers table
-//!   via `self.tx()`
+//!   via `&self.tx`
 //!
 //! All state is stored in PostgreSQL. The key feature being tested is that
-//! `self.tx()` provides a SQL transaction handle for executing arbitrary SQL
+//! `&self.tx` provides a SQL transaction handle for executing arbitrary SQL
 //! within the same transaction as journal writes, ensuring atomicity.
 
 
@@ -107,7 +107,7 @@ pub struct TransferRequest {
     pub amount: i64,
 }
 
-/// Workflow that performs a transfer using `self.tx()`.
+/// Workflow that performs a transfer using `&self.tx`.
 ///
 /// The activity writes to both `sql_activity_test_state` and
 /// `sql_activity_test_transfers` in the same transaction, ensuring atomicity.
@@ -124,12 +124,12 @@ impl SqlTransferWorkflow {
 
     /// Activity that records a transfer in both the state table AND the transfers table.
     ///
-    /// Both operations happen in the same SQL transaction (via `self.tx()`):
+    /// Both operations happen in the same SQL transaction (via `&self.tx`):
     /// - UPSERT into `sql_activity_test_state` (transfer_count, total_transferred)
     /// - INSERT into `sql_activity_test_transfers`
     #[activity]
     async fn do_transfer(
-        &mut self,
+        &self,
         entity_id: String,
         to_entity: String,
         amount: i64,
@@ -150,7 +150,7 @@ impl SqlTransferWorkflow {
         )
         .bind(&entity_id)
         .bind(amount)
-        .fetch_one(&mut *self.tx())
+        .fetch_one(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("do_transfer upsert failed: {e}"),
@@ -165,7 +165,7 @@ impl SqlTransferWorkflow {
         .bind(&entity_id)
         .bind(&to_entity)
         .bind(amount)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("do_transfer insert failed: {e}"),
@@ -207,7 +207,7 @@ impl SqlFailingTransferWorkflow {
     /// This tests that both state AND SQL changes are rolled back.
     #[activity]
     async fn do_failing_transfer(
-        &mut self,
+        &self,
         entity_id: String,
         to_entity: String,
         amount: i64,
@@ -222,7 +222,7 @@ impl SqlFailingTransferWorkflow {
         )
         .bind(&entity_id)
         .bind(amount)
-        .execute(&mut *self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("do_failing_transfer upsert failed: {e}"),
@@ -237,7 +237,7 @@ impl SqlFailingTransferWorkflow {
         .bind(&entity_id)
         .bind(&to_entity)
         .bind(amount)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("do_failing_transfer insert failed: {e}"),
@@ -265,7 +265,7 @@ pub struct GetSqlCountRequest {
     pub query_id: String,
 }
 
-/// Workflow that queries the transfers table using `self.tx()`.
+/// Workflow that queries the transfers table using `&self.tx`.
 #[workflow]
 #[derive(Clone)]
 pub struct SqlCountWorkflow;
@@ -278,7 +278,7 @@ impl SqlCountWorkflow {
 
     /// Activity that queries the transfers table within a SQL transaction.
     #[activity]
-    async fn do_get_transfer_count(&mut self, entity_id: String) -> Result<i64, ClusterError> {
+    async fn do_get_transfer_count(&self, entity_id: String) -> Result<i64, ClusterError> {
         #[derive(sqlx::FromRow)]
         struct CountResult {
             count: i64,
@@ -288,7 +288,7 @@ impl SqlCountWorkflow {
             "SELECT COUNT(*) as count FROM sql_activity_test_transfers WHERE from_entity = $1",
         )
         .bind(&entity_id)
-        .fetch_one(self.tx())
+        .fetch_one(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("do_get_transfer_count failed: {e}"),

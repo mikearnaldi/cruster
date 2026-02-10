@@ -21,7 +21,7 @@ use sqlx::PgPool;
 
 /// Reusable activity group for inventory operations.
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[activity_group]
 #[derive(Clone)]
 pub struct Inventory;
@@ -48,7 +48,7 @@ pub struct ConfirmReservationRequest {
 impl Inventory {
     /// Reserve inventory items. Returns a reservation ID.
     #[activity]
-    async fn reserve_items(&mut self, request: ReserveItemsRequest) -> Result<String, ClusterError> {
+    async fn reserve_items(&self, request: ReserveItemsRequest) -> Result<String, ClusterError> {
         let reservation_id = format!("res-{}-{}", request.order_id, request.item_count);
 
         // Record the reservation in the database via framework transaction
@@ -59,7 +59,7 @@ impl Inventory {
         )
         .bind(&request.order_id)
         .bind(&reservation_id)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("reserve_items failed: {e}"),
@@ -72,7 +72,7 @@ impl Inventory {
     /// Confirm a previously made reservation.
     #[activity]
     async fn confirm_reservation(
-        &mut self,
+        &self,
         request: ConfirmReservationRequest,
     ) -> Result<String, ClusterError> {
         let confirmation = format!("confirmed-{}", request.reservation_id);
@@ -84,7 +84,7 @@ impl Inventory {
         )
         .bind(&request.order_id)
         .bind(&confirmation)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("confirm_reservation failed: {e}"),
@@ -101,7 +101,7 @@ impl Inventory {
 
 /// Reusable activity group for payment operations.
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[activity_group]
 #[derive(Clone)]
 pub struct Payments;
@@ -119,7 +119,7 @@ pub struct ChargePaymentRequest {
 impl Payments {
     /// Charge a payment. Returns a transaction ID.
     #[activity]
-    async fn charge_payment(&mut self, request: ChargePaymentRequest) -> Result<String, ClusterError> {
+    async fn charge_payment(&self, request: ChargePaymentRequest) -> Result<String, ClusterError> {
         let tx_id = format!("tx-{}-{}", request.order_id, request.amount);
 
         sqlx::query(
@@ -129,7 +129,7 @@ impl Payments {
         )
         .bind(&request.order_id)
         .bind(&tx_id)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("charge_payment failed: {e}"),
@@ -177,7 +177,7 @@ pub struct OrderResult {
 /// - Local `#[activity]` methods alongside group activities
 /// - Sequential orchestration of group and local activities
 ///
-/// Activities use `self.tx()` for transactional DB writes — no `pool` field needed.
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
 #[workflow]
 #[derive(Clone)]
 pub struct OrderWorkflow;
@@ -235,7 +235,7 @@ impl OrderWorkflow {
 
     /// Local activity: summarize the order processing and write to DB.
     #[activity]
-    async fn summarize(&mut self, request: SummarizeRequest) -> Result<String, ClusterError> {
+    async fn summarize(&self, request: SummarizeRequest) -> Result<String, ClusterError> {
         let summary = format!(
             "order={},res={},tx={}",
             request.order_id, request.reservation_id, request.transaction_id
@@ -248,7 +248,7 @@ impl OrderWorkflow {
         )
         .bind(&request.order_id)
         .bind(&summary)
-        .execute(self.tx())
+        .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
             reason: format!("summarize failed: {e}"),

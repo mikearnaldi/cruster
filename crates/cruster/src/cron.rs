@@ -245,8 +245,28 @@ async fn cron_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TestCluster;
+    use crate::config::ShardingConfig;
+    use crate::metrics::ClusterMetrics;
+    use crate::sharding_impl::ShardingImpl;
+    use crate::storage::noop_runners::NoopRunners;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Create a minimal ShardingImpl with NoopRunners for unit tests.
+    async fn test_sharding() -> Arc<ShardingImpl> {
+        let config = Arc::new(ShardingConfig::default());
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s = ShardingImpl::new(
+            config,
+            Arc::new(NoopRunners),
+            None,
+            None,
+            None,
+            metrics,
+        )
+        .unwrap();
+        s.acquire_all_shards().await;
+        s
+    }
 
     #[test]
     fn parse_valid_cron_expression() {
@@ -302,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn cron_registers_as_singleton() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
 
         let cron = ClusterCron::new(
             "register-test",
@@ -311,12 +331,12 @@ mod tests {
         );
 
         // Should register without error
-        cron.register(cluster.sharding().as_ref()).await.unwrap();
+        cron.register(sharding.as_ref()).await.unwrap();
     }
 
     #[tokio::test]
     async fn cron_executes_handler() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
         let count = Arc::new(AtomicU32::new(0));
         let count_clone = count.clone();
 
@@ -333,7 +353,7 @@ mod tests {
             },
         );
 
-        cron.register(cluster.sharding().as_ref()).await.unwrap();
+        cron.register(sharding.as_ref()).await.unwrap();
 
         // Wait for at least one execution (cron fires every second)
         tokio::time::sleep(Duration::from_millis(1500)).await;

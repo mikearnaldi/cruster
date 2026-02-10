@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cruster::__internal::{DurableContext, MemoryWorkflowEngine, WorkflowEngine, WorkflowStorage};
+use cruster::__internal::{DurableContext, WorkflowEngine, WorkflowStorage};
 use cruster::envelope::EnvelopeRequest;
 use cruster::message_storage::{MessageStorage, SaveResult};
 use cruster::reply::{ExitResult, Reply, ReplyChunk, ReplyWithExit};
@@ -518,6 +518,288 @@ mod message_storage {
         let replies = storage.replies_for(Snowflake(11000)).await.unwrap();
         assert!(!replies.is_empty(), "should have a dead-letter failure reply");
     }
+
+    #[tokio::test]
+    async fn save_envelope_success_then_duplicate() {
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool);
+
+        let envelope = test_envelope(12000, "entity-env-dup");
+        let result = storage.save_envelope(&envelope).await.unwrap();
+        assert!(matches!(result, SaveResult::Success));
+
+        // Second save with same request_id should return Duplicate
+        let result2 = storage.save_envelope(&envelope).await.unwrap();
+        assert!(
+            matches!(result2, SaveResult::Duplicate { .. }),
+            "expected Duplicate, got {:?}",
+            result2
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_returns_existing_reply() {
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool);
+
+        let envelope = test_envelope(13000, "entity-dup-reply");
+        storage.save_request(&envelope).await.unwrap();
+
+        // Save a reply for the request
+        let reply = Reply::WithExit(ReplyWithExit {
+            request_id: Snowflake(13000),
+            id: Snowflake(13001),
+            exit: ExitResult::Success(vec![42, 43]),
+        });
+        storage.save_reply(&reply).await.unwrap();
+
+        // Duplicate save_request should return the existing reply
+        let result = storage.save_request(&envelope).await.unwrap();
+        match result {
+            SaveResult::Duplicate { existing_reply } => {
+                assert!(
+                    existing_reply.is_some(),
+                    "duplicate should include the existing reply"
+                );
+                let reply = existing_reply.unwrap();
+                match &reply {
+                    Reply::WithExit(r) => {
+                        assert!(matches!(&r.exit, ExitResult::Success(data) if data == &[42, 43]));
+                    }
+                    _ => panic!("expected WithExit reply"),
+                }
+            }
+            other => panic!("expected Duplicate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn replies_for_orders_exit_last() {
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool);
+
+        let envelope = test_envelope(14000, "entity-chunk-order");
+        storage.save_request(&envelope).await.unwrap();
+
+        // Save chunks in reverse sequence order, then an exit reply
+        let chunk2 = Reply::Chunk(ReplyChunk {
+            request_id: Snowflake(14000),
+            id: Snowflake(14003),
+            sequence: 2,
+            values: vec![vec![3]],
+        });
+        storage.save_reply(&chunk2).await.unwrap();
+
+        let chunk0 = Reply::Chunk(ReplyChunk {
+            request_id: Snowflake(14000),
+            id: Snowflake(14001),
+            sequence: 0,
+            values: vec![vec![1]],
+        });
+        storage.save_reply(&chunk0).await.unwrap();
+
+        let chunk1 = Reply::Chunk(ReplyChunk {
+            request_id: Snowflake(14000),
+            id: Snowflake(14002),
+            sequence: 1,
+            values: vec![vec![2]],
+        });
+        storage.save_reply(&chunk1).await.unwrap();
+
+        let exit = Reply::WithExit(ReplyWithExit {
+            request_id: Snowflake(14000),
+            id: Snowflake(14004),
+            exit: ExitResult::Success(vec![99]),
+        });
+        storage.save_reply(&exit).await.unwrap();
+
+        let replies = storage.replies_for(Snowflake(14000)).await.unwrap();
+        assert_eq!(replies.len(), 4, "should have 3 chunks + 1 exit");
+
+        // Chunks should be ordered by sequence ascending
+        for (i, reply) in replies[..3].iter().enumerate() {
+            match reply {
+                Reply::Chunk(c) => assert_eq!(c.sequence, i as i32, "chunk {i} out of order"),
+                _ => panic!("expected Chunk at position {i}"),
+            }
+        }
+
+        // Exit should be last
+        assert!(
+            matches!(&replies[3], Reply::WithExit(_)),
+            "exit reply should be last"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_replies() {
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool);
+
+        let envelope = test_envelope(15000, "entity-clear");
+        storage.save_request(&envelope).await.unwrap();
+
+        let reply = Reply::WithExit(ReplyWithExit {
+            request_id: Snowflake(15000),
+            id: Snowflake(15001),
+            exit: ExitResult::Success(vec![1]),
+        });
+        storage.save_reply(&reply).await.unwrap();
+
+        assert_eq!(storage.replies_for(Snowflake(15000)).await.unwrap().len(), 1);
+
+        storage.clear_replies(Snowflake(15000)).await.unwrap();
+
+        assert!(
+            storage.replies_for(Snowflake(15000)).await.unwrap().is_empty(),
+            "replies should be empty after clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_chunk_removes_chunk_reply() {
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool);
+
+        let envelope = test_envelope(16000, "entity-ack");
+        storage.save_request(&envelope).await.unwrap();
+
+        let chunk = Reply::Chunk(ReplyChunk {
+            request_id: Snowflake(16000),
+            id: Snowflake(16001),
+            sequence: 0,
+            values: vec![vec![1, 2]],
+        });
+        storage.save_reply(&chunk).await.unwrap();
+
+        let exit = Reply::WithExit(ReplyWithExit {
+            request_id: Snowflake(16000),
+            id: Snowflake(16002),
+            exit: ExitResult::Success(vec![]),
+        });
+        storage.save_reply(&exit).await.unwrap();
+
+        // Ack the chunk
+        storage
+            .ack_chunk(&cruster::envelope::AckChunk {
+                request_id: Snowflake(16000),
+                id: Snowflake(16001),
+                sequence: 0,
+            })
+            .await
+            .unwrap();
+
+        // Only the exit reply should remain
+        let replies = storage.replies_for(Snowflake(16000)).await.unwrap();
+        assert_eq!(replies.len(), 1, "only exit reply should remain after ack");
+        assert!(matches!(&replies[0], Reply::WithExit(_)));
+    }
+
+    #[tokio::test]
+    async fn last_read_guard_prevents_redelivery() {
+        let (_container, pool) = setup_postgres().await;
+        // Set a 10-second guard interval
+        let storage = SqlMessageStorage::new(pool)
+            .with_last_read_guard_interval(Duration::from_secs(10));
+
+        let envelope = test_envelope(17000, "entity-guard");
+        storage.save_request(&envelope).await.unwrap();
+
+        // First poll should return the message
+        let msgs = storage
+            .unprocessed_messages(&[ShardId::new("default", 0)])
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1, "first poll should return the message");
+
+        // Second poll within guard interval should return nothing
+        let msgs = storage
+            .unprocessed_messages(&[ShardId::new("default", 0)])
+            .await
+            .unwrap();
+        assert!(
+            msgs.is_empty(),
+            "second poll within guard interval should return nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn unprocessed_messages_filters_by_deliver_at() {
+        use chrono::Utc;
+
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool.clone())
+            .with_last_read_guard_interval(Duration::ZERO);
+
+        // Message with deliver_at in the future (1 hour from now)
+        let mut future_env = test_envelope(18000, "entity-future");
+        future_env.deliver_at = Some(Utc::now() + chrono::Duration::hours(1));
+        storage.save_request(&future_env).await.unwrap();
+
+        // Message with no deliver_at
+        let normal_env = test_envelope(18001, "entity-normal");
+        storage.save_request(&normal_env).await.unwrap();
+
+        // Message with deliver_at in the past
+        let mut past_env = test_envelope(18002, "entity-past");
+        past_env.deliver_at = Some(Utc::now() - chrono::Duration::hours(1));
+        storage.save_request(&past_env).await.unwrap();
+
+        let msgs = storage
+            .unprocessed_messages(&[ShardId::new("default", 0)])
+            .await
+            .unwrap();
+
+        let ids: Vec<i64> = msgs.iter().map(|m| m.request_id.0).collect();
+        assert!(
+            !ids.contains(&18000),
+            "future message should be excluded"
+        );
+        assert!(ids.contains(&18001), "normal message should be included");
+        assert!(ids.contains(&18002), "past message should be included");
+    }
+
+    #[tokio::test]
+    async fn reset_shards_clears_last_read() {
+        let (_container, pool) = setup_postgres().await;
+        // Use a long guard interval so the message would normally be suppressed
+        let storage = SqlMessageStorage::new(pool)
+            .with_last_read_guard_interval(Duration::from_secs(3600));
+
+        let envelope = test_envelope(19000, "entity-reset-guard");
+        storage.save_request(&envelope).await.unwrap();
+
+        // First poll reads the message and sets last_read
+        let msgs = storage
+            .unprocessed_messages(&[ShardId::new("default", 0)])
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 1);
+
+        // Second poll within guard should return nothing
+        let msgs = storage
+            .unprocessed_messages(&[ShardId::new("default", 0)])
+            .await
+            .unwrap();
+        assert!(msgs.is_empty(), "guard should suppress re-read");
+
+        // Reset shards should clear last_read
+        storage
+            .reset_shards(&[ShardId::new("default", 0)])
+            .await
+            .unwrap();
+
+        // Now the message should be readable again
+        let msgs = storage
+            .unprocessed_messages(&[ShardId::new("default", 0)])
+            .await
+            .unwrap();
+        assert_eq!(
+            msgs.len(),
+            1,
+            "message should be readable after reset_shards clears last_read"
+        );
+    }
 }
 
 // ============================================================================
@@ -845,10 +1127,11 @@ mod workflow_resumption {
     fn make_ctx(
         workflow_name: &str,
         execution_id: &str,
+        pool: &sqlx::PgPool,
         msg: Arc<dyn MessageStorage>,
         wf: Arc<dyn WorkflowStorage>,
     ) -> DurableContext {
-        let engine: Arc<dyn WorkflowEngine> = Arc::new(MemoryWorkflowEngine::new());
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(SqlWorkflowEngine::new(pool.clone()));
         DurableContext::with_journal_storage(engine, workflow_name, execution_id, msg, wf)
     }
 
@@ -867,7 +1150,7 @@ mod workflow_resumption {
 
         // === Run 1: execute two activities, journal their results ===
         {
-            let ctx = make_ctx("OrderWorkflow", "order-42", msg.clone(), wf.clone());
+            let ctx = make_ctx("OrderWorkflow", "order-42", &pool, msg.clone(), wf.clone());
 
             let ca = calls_a.clone();
             let result_a: i32 = ctx
@@ -896,7 +1179,7 @@ mod workflow_resumption {
 
         // === Run 2: new context, same identity — simulates restart ===
         {
-            let ctx = make_ctx("OrderWorkflow", "order-42", msg.clone(), wf.clone());
+            let ctx = make_ctx("OrderWorkflow", "order-42", &pool, msg.clone(), wf.clone());
 
             // Replay activity_a — should return cached value, NOT re-execute
             let ca = calls_a.clone();
@@ -949,7 +1232,7 @@ mod workflow_resumption {
 
         // Run 1: activity fails
         {
-            let ctx = make_ctx("FailWorkflow", "fail-1", msg.clone(), wf.clone());
+            let ctx = make_ctx("FailWorkflow", "fail-1", &pool, msg.clone(), wf.clone());
             let c = calls.clone();
             let result: Result<i32, _> = ctx
                 .run("flaky_step", b"attempt-1", || async move {
@@ -967,7 +1250,7 @@ mod workflow_resumption {
 
         // Run 2: restart — should return the cached error
         {
-            let ctx = make_ctx("FailWorkflow", "fail-1", msg.clone(), wf.clone());
+            let ctx = make_ctx("FailWorkflow", "fail-1", &pool, msg.clone(), wf.clone());
             let c = calls.clone();
             let result: Result<i32, _> = ctx
                 .run("flaky_step", b"attempt-1", || async move {
@@ -990,7 +1273,7 @@ mod workflow_resumption {
 
         // Run 1: same activity name, two different arg keys
         {
-            let ctx = make_ctx("BatchWorkflow", "batch-1", msg.clone(), wf.clone());
+            let ctx = make_ctx("BatchWorkflow", "batch-1", &pool, msg.clone(), wf.clone());
 
             let r1: i32 = ctx
                 .run("process_item", b"item-A", || async { Ok(10) })
@@ -1007,7 +1290,7 @@ mod workflow_resumption {
 
         // Run 2: restart — each key returns its own cached value
         {
-            let ctx = make_ctx("BatchWorkflow", "batch-1", msg.clone(), wf.clone());
+            let ctx = make_ctx("BatchWorkflow", "batch-1", &pool, msg.clone(), wf.clone());
 
             let r1: i32 = ctx
                 .run("process_item", b"item-A", || async { Ok(999) })
@@ -1033,7 +1316,7 @@ mod workflow_resumption {
 
         // Execution A: journals result = 100
         {
-            let ctx = make_ctx("TransferWorkflow", "exec-A", msg.clone(), wf.clone());
+            let ctx = make_ctx("TransferWorkflow", "exec-A", &pool, msg.clone(), wf.clone());
             let r: i32 = ctx
                 .run("compute", b"args", || async { Ok(100) })
                 .await
@@ -1044,7 +1327,7 @@ mod workflow_resumption {
         // Execution B: same workflow type, different execution_id — should NOT
         // see exec-A's journal
         {
-            let ctx = make_ctx("TransferWorkflow", "exec-B", msg.clone(), wf.clone());
+            let ctx = make_ctx("TransferWorkflow", "exec-B", &pool, msg.clone(), wf.clone());
             let calls = Arc::new(AtomicU32::new(0));
             let c = calls.clone();
             let r: i32 = ctx
@@ -1060,7 +1343,7 @@ mod workflow_resumption {
 
         // Restart exec-A — should still return cached 100
         {
-            let ctx = make_ctx("TransferWorkflow", "exec-A", msg.clone(), wf.clone());
+            let ctx = make_ctx("TransferWorkflow", "exec-A", &pool, msg.clone(), wf.clone());
             let r: i32 = ctx
                 .run("compute", b"args", || async { Ok(999) })
                 .await
@@ -1083,7 +1366,7 @@ mod workflow_resumption {
 
         // Run 1: only activity_a executes, then "crash" before activity_b
         {
-            let ctx = make_ctx("PipelineWorkflow", "pipe-1", msg.clone(), wf.clone());
+            let ctx = make_ctx("PipelineWorkflow", "pipe-1", &pool, msg.clone(), wf.clone());
             let ca = calls_a.clone();
             let r: String = ctx
                 .run("step_one", b"input", || async move {
@@ -1101,7 +1384,7 @@ mod workflow_resumption {
 
         // Run 2: restart — re-execute the full workflow
         {
-            let ctx = make_ctx("PipelineWorkflow", "pipe-1", msg.clone(), wf.clone());
+            let ctx = make_ctx("PipelineWorkflow", "pipe-1", &pool, msg.clone(), wf.clone());
 
             // step_one replays from journal
             let ca = calls_a.clone();
@@ -1127,5 +1410,435 @@ mod workflow_resumption {
             assert_eq!(r2, 42);
             assert_eq!(calls_b.load(Ordering::SeqCst), 1, "step_two SHOULD execute");
         }
+    }
+}
+
+// ============================================================================
+// DurableContext unit tests (migrated from durable.rs — were using MemoryWorkflowStorage)
+// ============================================================================
+
+mod durable_context {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn make_ctx(
+        pool: &sqlx::PgPool,
+        msg_storage: Arc<dyn MessageStorage>,
+        wf_storage: Arc<dyn WorkflowStorage>,
+    ) -> DurableContext {
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(SqlWorkflowEngine::new(pool.clone()));
+        DurableContext::with_journal_storage(engine, "TestEntity", "e-1", msg_storage, wf_storage)
+    }
+
+    fn make_ctx_no_storage(pool: &sqlx::PgPool) -> DurableContext {
+        let engine: Arc<dyn WorkflowEngine> = Arc::new(SqlWorkflowEngine::new(pool.clone()));
+        DurableContext::new(engine, "TestEntity", "e-1")
+    }
+
+    #[tokio::test]
+    async fn run_without_storage_executes_directly() {
+        let (_container, pool) = setup_postgres().await;
+        let ctx = make_ctx_no_storage(&pool);
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: i32 = ctx
+            .run("my_activity", b"key1", || async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_without_storage_always_re_executes() {
+        let (_container, pool) = setup_postgres().await;
+        let ctx = make_ctx_no_storage(&pool);
+
+        let call_count = Arc::new(AtomicU32::new(0));
+
+        for _ in 0..3 {
+            let cc = call_count.clone();
+            let _: i32 = ctx
+                .run("my_activity", b"key1", || async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok(42)
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "without storage, every call should execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_caches_result_on_first_execution() {
+        let (_container, pool) = setup_postgres().await;
+        let msg: Arc<dyn MessageStorage> = Arc::new(SqlMessageStorage::new(pool.clone()));
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+        let ctx = make_ctx(&pool, msg, wf);
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: i32 = ctx
+            .run("my_activity", b"key1", || async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_returns_cached_on_replay() {
+        let (_container, pool) = setup_postgres().await;
+        let msg: Arc<dyn MessageStorage> = Arc::new(SqlMessageStorage::new(pool.clone()));
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+
+        // First execution — caches the result
+        {
+            let ctx = make_ctx(&pool, msg.clone(), wf.clone());
+            let result: i32 = ctx
+                .run("my_activity", b"key1", || async { Ok(42) })
+                .await
+                .unwrap();
+            assert_eq!(result, 42);
+        }
+
+        // Second execution (simulates replay) — should return cached result
+        {
+            let ctx = make_ctx(&pool, msg.clone(), wf.clone());
+            let call_count = Arc::new(AtomicU32::new(0));
+            let cc = call_count.clone();
+
+            let result: i32 = ctx
+                .run("my_activity", b"key1", || async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok(99) // Would return 99 if actually executed
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(result, 42, "should return cached result, not re-execute");
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                0,
+                "closure should not have been called"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_different_keys_execute_independently() {
+        let (_container, pool) = setup_postgres().await;
+        let msg: Arc<dyn MessageStorage> = Arc::new(SqlMessageStorage::new(pool.clone()));
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+        let ctx = make_ctx(&pool, msg.clone(), wf.clone());
+
+        let a: i32 = ctx
+            .run("activity_a", b"k1", || async { Ok(1) })
+            .await
+            .unwrap();
+        let b: i32 = ctx
+            .run("activity_b", b"k2", || async { Ok(2) })
+            .await
+            .unwrap();
+
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+
+        // Replay — both should return cached values
+        let ctx2 = make_ctx(&pool, msg.clone(), wf.clone());
+        let a2: i32 = ctx2
+            .run("activity_a", b"k1", || async { Ok(99) })
+            .await
+            .unwrap();
+        let b2: i32 = ctx2
+            .run("activity_b", b"k2", || async { Ok(99) })
+            .await
+            .unwrap();
+
+        assert_eq!(a2, 1, "activity_a should return cached value");
+        assert_eq!(b2, 2, "activity_b should return cached value");
+    }
+
+    #[tokio::test]
+    async fn run_same_name_different_args_execute_independently() {
+        let (_container, pool) = setup_postgres().await;
+        let msg: Arc<dyn MessageStorage> = Arc::new(SqlMessageStorage::new(pool.clone()));
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+        let ctx = make_ctx(&pool, msg.clone(), wf.clone());
+
+        // Same activity name but different key bytes (different arguments)
+        let a: i32 = ctx
+            .run("do_work", b"arg-1", || async { Ok(10) })
+            .await
+            .unwrap();
+        let b: i32 = ctx
+            .run("do_work", b"arg-2", || async { Ok(20) })
+            .await
+            .unwrap();
+
+        assert_eq!(a, 10);
+        assert_eq!(b, 20);
+
+        // Replay — each should return its own cached value
+        let ctx2 = make_ctx(&pool, msg.clone(), wf.clone());
+        let a2: i32 = ctx2
+            .run("do_work", b"arg-1", || async { Ok(99) })
+            .await
+            .unwrap();
+        let b2: i32 = ctx2
+            .run("do_work", b"arg-2", || async { Ok(99) })
+            .await
+            .unwrap();
+
+        assert_eq!(a2, 10, "arg-1 should return its cached value");
+        assert_eq!(b2, 20, "arg-2 should return its cached value");
+    }
+
+    #[tokio::test]
+    async fn run_caches_error_result() {
+        let (_container, pool) = setup_postgres().await;
+        let msg: Arc<dyn MessageStorage> = Arc::new(SqlMessageStorage::new(pool.clone()));
+        let wf: Arc<dyn WorkflowStorage> = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+
+        // First execution — fails
+        {
+            let ctx = make_ctx(&pool, msg.clone(), wf.clone());
+            let result: Result<i32, cruster::error::ClusterError> = ctx
+                .run("failing_activity", b"key1", || async {
+                    Err(cruster::error::ClusterError::PersistenceError {
+                        reason: "activity failed".into(),
+                        source: None,
+                    })
+                })
+                .await;
+            assert!(result.is_err());
+        }
+
+        // Replay — should return the cached failure
+        {
+            let ctx = make_ctx(&pool, msg.clone(), wf.clone());
+            let call_count = Arc::new(AtomicU32::new(0));
+            let cc = call_count.clone();
+
+            let result: Result<i32, cruster::error::ClusterError> = ctx
+                .run("failing_activity", b"key1", || async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok(99) // Would succeed if actually executed
+                })
+                .await;
+
+            assert!(result.is_err(), "should return cached failure");
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                0,
+                "closure should not have been called"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Storage retry exhaustion (migrated from tests/storage_retry_exhaustion.rs)
+// ============================================================================
+
+mod storage_retry_exhaustion {
+    use super::*;
+
+    fn make_envelope(request_id: i64, shard_id: i32) -> EnvelopeRequest {
+        EnvelopeRequest {
+            request_id: Snowflake(request_id),
+            address: EntityAddress {
+                shard_id: ShardId::new("default", shard_id),
+                entity_type: EntityType::new("Test"),
+                entity_id: EntityId::new("e-1"),
+            },
+            tag: "test".into(),
+            payload: Vec::new(),
+            headers: HashMap::new(),
+            span_id: None,
+            trace_id: None,
+            sampled: None,
+            persisted: false,
+            uninterruptible: Default::default(),
+            deliver_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_letters_message_after_retries() {
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool.clone());
+        storage.set_max_retries(1);
+
+        let request_id_value = 9000;
+        storage
+            .save_request(&make_envelope(request_id_value, 1))
+            .await
+            .unwrap();
+        let request_id = Snowflake(request_id_value);
+        let shard = ShardId::new("default", 1);
+
+        for _ in 0..2 {
+            let messages = storage
+                .unprocessed_messages(std::slice::from_ref(&shard))
+                .await
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].request_id, request_id);
+        }
+
+        let messages = storage
+            .unprocessed_messages(std::slice::from_ref(&shard))
+            .await
+            .unwrap();
+        assert!(messages.is_empty());
+
+        let replies = storage.replies_for(request_id).await.unwrap();
+        assert_eq!(replies.len(), 1);
+        match &replies[0] {
+            Reply::WithExit(reply) => {
+                assert_eq!(reply.id, cruster::reply::dead_letter_reply_id(request_id));
+                match &reply.exit {
+                    ExitResult::Failure(reason) => assert_eq!(reason, "max retries exceeded"),
+                    _ => panic!("expected failure exit"),
+                }
+            }
+            _ => panic!("expected exit reply"),
+        }
+    }
+}
+
+// ============================================================================
+// Streaming replay ordering (migrated from tests/streaming_replay_ordering.rs)
+// ============================================================================
+
+mod streaming_replay_ordering {
+    use super::*;
+
+    #[tokio::test]
+    async fn persisted_chunk_replay_orders_by_sequence() {
+        let (_container, pool) = setup_postgres().await;
+        let storage = SqlMessageStorage::new(pool.clone());
+        let request_id = Snowflake(1010);
+
+        let chunk_two = Reply::Chunk(ReplyChunk {
+            request_id,
+            id: Snowflake(20),
+            sequence: 2,
+            values: vec![rmp_serde::to_vec(&2i32).unwrap()],
+        });
+        let chunk_one = Reply::Chunk(ReplyChunk {
+            request_id,
+            id: Snowflake(21),
+            sequence: 1,
+            values: vec![rmp_serde::to_vec(&1i32).unwrap()],
+        });
+        let exit = Reply::WithExit(ReplyWithExit {
+            request_id,
+            id: Snowflake(22),
+            exit: ExitResult::Success(rmp_serde::to_vec(&()).unwrap()),
+        });
+
+        storage.save_reply(&chunk_two).await.unwrap();
+        storage.save_reply(&exit).await.unwrap();
+        storage.save_reply(&chunk_one).await.unwrap();
+
+        let replies = storage.replies_for(request_id).await.unwrap();
+        let sequences: Vec<i32> = replies
+            .iter()
+            .filter_map(|reply| match reply {
+                Reply::Chunk(chunk) => Some(chunk.sequence),
+                Reply::WithExit(_) => None,
+            })
+            .collect();
+
+        assert!(replies
+            .iter()
+            .any(|reply| matches!(reply, Reply::WithExit(_))));
+        assert_eq!(sequences, vec![1, 2]);
+    }
+}
+
+// ============================================================================
+// ActivityScope tests (migrated from state_guard.rs — were using MemoryWorkflowStorage)
+// ============================================================================
+
+mod activity_scope {
+    use super::*;
+    use cruster::__internal::ActivityScope;
+
+    #[tokio::test]
+    async fn commits_writes_on_success() {
+        let (_container, pool) = setup_postgres().await;
+        let storage: Arc<dyn WorkflowStorage> = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+
+        // Verify is_active is false before running
+        assert!(!ActivityScope::is_active());
+
+        let result = ActivityScope::run(&storage, || {
+            async move {
+                // Verify is_active is true inside the scope
+                assert!(
+                    ActivityScope::is_active(),
+                    "ActivityScope should be active inside run()"
+                );
+
+                ActivityScope::buffer_write("test/key".to_string(), b"hello".to_vec());
+
+                Ok::<_, cruster::error::ClusterError>(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+
+        // Write should be persisted to storage
+        let stored = storage.load("test/key").await.unwrap();
+        assert!(
+            stored.is_some(),
+            "Write should be persisted after ActivityScope::run() completes"
+        );
+        assert_eq!(stored.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn rolls_back_on_error() {
+        let (_container, pool) = setup_postgres().await;
+        let storage: Arc<dyn WorkflowStorage> = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+
+        let result = ActivityScope::run(&storage, || {
+            async move {
+                ActivityScope::buffer_write("test/key".to_string(), b"hello".to_vec());
+
+                // Return an error - should rollback
+                Err::<(), _>(cruster::error::ClusterError::PersistenceError {
+                    reason: "test error".to_string(),
+                    source: None,
+                })
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+
+        // Write should NOT be persisted
+        let stored = storage.load("test/key").await.unwrap();
+        assert!(stored.is_none(), "Write should NOT be persisted on error");
     }
 }

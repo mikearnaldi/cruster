@@ -1,8 +1,3 @@
----
-description: "Changeset creation guidelines for releases"
-globs: [".changeset/**/*", "knope.toml", "CHANGELOG.md"]
----
-
 # Changesets
 
 This project uses [knope](https://knope.tech) with changesets for versioning and releases.

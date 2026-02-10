@@ -3012,6 +3012,13 @@ fn activity_group_impl_inner(
                     };
                     let __act_result = __activity_view.#method_name(#(#param_list),*).await;
 
+                    // On error, drop the transaction (auto-rollback) and return error.
+                    // SQL writes via self.tx are rolled back along with the transaction.
+                    if __act_result.is_err() {
+                        drop(__activity_view);
+                        return __act_result;
+                    }
+
                     // Write journal entry + commit in the same transaction
                     let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
                         #method_name_str,
@@ -4474,6 +4481,13 @@ fn workflow_impl_inner(
                         pool: __pool,
                     };
                     let __act_result = __activity_view.#method_name(#(#param_list),*).await;
+
+                    // On error, drop the transaction (auto-rollback) and return error.
+                    // SQL writes via self.tx are rolled back along with the transaction.
+                    if __act_result.is_err() {
+                        drop(__activity_view);
+                        return __act_result;
+                    }
 
                     // Write journal entry + commit in the same transaction
                     let __storage_key = #krate::__internal::DurableContext::journal_storage_key(

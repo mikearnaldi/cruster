@@ -2993,8 +2993,27 @@ fn activity_group_impl_inner(
 
             // Helper: generate code to execute activity + journal in a transaction
             // `key_bytes_var` is the identifier for the key bytes variable in scope
-            let gen_execute_and_journal = |key_bytes_var: &str, param_list: &[proc_macro2::TokenStream]| -> proc_macro2::TokenStream {
+            // `in_retry` controls error handling: when true, errors become the block value
+            // (for the retry match); when false, errors use `return` (single-shot).
+            let gen_execute_and_journal = |key_bytes_var: &str, param_list: &[proc_macro2::TokenStream], in_retry: bool| -> proc_macro2::TokenStream {
                 let key_var = format_ident!("{}", key_bytes_var);
+                let error_handling = if in_retry {
+                    // In retry context: let the error flow as the block's value into `match`
+                    quote! {
+                        if __act_result.is_err() {
+                            drop(__activity_view);
+                            __act_result
+                        }
+                    }
+                } else {
+                    // Single-shot: return immediately
+                    quote! {
+                        if __act_result.is_err() {
+                            drop(__activity_view);
+                            return __act_result;
+                        }
+                    }
+                };
                 quote! {
                     // Get pool from WorkflowStorage (if SQL-backed)
                     let __sql_pool = __wf_storage.sql_pool().cloned();
@@ -3012,32 +3031,30 @@ fn activity_group_impl_inner(
                     };
                     let __act_result = __activity_view.#method_name(#(#param_list),*).await;
 
-                    // On error, drop the transaction (auto-rollback) and return error.
+                    // On error, drop the transaction (auto-rollback).
                     // SQL writes via self.tx are rolled back along with the transaction.
-                    if __act_result.is_err() {
-                        drop(__activity_view);
-                        return __act_result;
+                    #error_handling
+                    else {
+                        // Write journal entry + commit in the same transaction
+                        let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
+                            #method_name_str,
+                            &#key_var,
+                            __journal_ctx.entity_type(),
+                            __journal_ctx.entity_id(),
+                        );
+                        let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
+                        #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
+
+                        // Get the transaction back from the view to write journal + commit
+                        let mut __tx_back = __activity_view.tx.into_inner().await;
+                        #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
+                        __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
+                            reason: ::std::format!("activity transaction commit failed: {e}"),
+                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                        })?;
+
+                        __act_result
                     }
-
-                    // Write journal entry + commit in the same transaction
-                    let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
-                        #method_name_str,
-                        &#key_var,
-                        __journal_ctx.entity_type(),
-                        __journal_ctx.entity_id(),
-                    );
-                    let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
-                    #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
-
-                    // Get the transaction back from the view to write journal + commit
-                    let mut __tx_back = __activity_view.tx.into_inner().await;
-                    #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
-                    __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
-                        reason: ::std::format!("activity transaction commit failed: {e}"),
-                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                    })?;
-
-                    __act_result
                 }
             };
 
@@ -3051,7 +3068,7 @@ fn activity_group_impl_inner(
             let max_retries = act.retries.unwrap_or(0);
             let journal_body = if max_retries == 0 {
                 // No retry — single shot
-                let exec_body = gen_execute_and_journal("__journal_key_bytes", &param_tokens);
+                let exec_body = gen_execute_and_journal("__journal_key_bytes", &param_tokens, false);
                 quote! {
                     // 1. Check journal for cached result
                     let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
@@ -3085,7 +3102,7 @@ fn activity_group_impl_inner(
 
                 let exec_body = gen_execute_and_journal("__retry_key_bytes", &{
                     cloned_param_names.iter().map(|n| quote! { #n.clone() }).collect::<Vec<_>>()
-                });
+                }, true);
 
                 quote! {
                     let mut __attempt = 0u32;
@@ -4463,8 +4480,27 @@ fn workflow_impl_inner(
 
             // Helper: generate code to execute activity + journal in a transaction
             // `key_bytes_var` is the identifier for the key bytes variable in scope
-            let gen_execute_and_journal = |key_bytes_var: &str, param_list: &[proc_macro2::TokenStream]| -> proc_macro2::TokenStream {
+            // `in_retry` controls error handling: when true, errors become the block value
+            // (for the retry match); when false, errors use `return` (single-shot).
+            let gen_execute_and_journal = |key_bytes_var: &str, param_list: &[proc_macro2::TokenStream], in_retry: bool| -> proc_macro2::TokenStream {
                 let key_var = format_ident!("{}", key_bytes_var);
+                let error_handling = if in_retry {
+                    // In retry context: let the error flow as the block's value into `match`
+                    quote! {
+                        if __act_result.is_err() {
+                            drop(__activity_view);
+                            __act_result
+                        }
+                    }
+                } else {
+                    // Single-shot: return immediately
+                    quote! {
+                        if __act_result.is_err() {
+                            drop(__activity_view);
+                            return __act_result;
+                        }
+                    }
+                };
                 quote! {
                     // Get pool from WorkflowStorage (if SQL-backed)
                     let __sql_pool = __wf_storage.sql_pool().cloned();
@@ -4482,32 +4518,30 @@ fn workflow_impl_inner(
                     };
                     let __act_result = __activity_view.#method_name(#(#param_list),*).await;
 
-                    // On error, drop the transaction (auto-rollback) and return error.
+                    // On error, drop the transaction (auto-rollback).
                     // SQL writes via self.tx are rolled back along with the transaction.
-                    if __act_result.is_err() {
-                        drop(__activity_view);
-                        return __act_result;
+                    #error_handling
+                    else {
+                        // Write journal entry + commit in the same transaction
+                        let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
+                            #method_name_str,
+                            &#key_var,
+                            __journal_ctx.entity_type(),
+                            __journal_ctx.entity_id(),
+                        );
+                        let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
+                        #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
+
+                        // Get the transaction back from the view to write journal + commit
+                        let mut __tx_back = __activity_view.tx.into_inner().await;
+                        #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
+                        __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
+                            reason: ::std::format!("activity transaction commit failed: {e}"),
+                            source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
+                        })?;
+
+                        __act_result
                     }
-
-                    // Write journal entry + commit in the same transaction
-                    let __storage_key = #krate::__internal::DurableContext::journal_storage_key(
-                        #method_name_str,
-                        &#key_var,
-                        __journal_ctx.entity_type(),
-                        __journal_ctx.entity_id(),
-                    );
-                    let __journal_bytes = #krate::__internal::DurableContext::serialize_journal_result(&__act_result)?;
-                    #krate::__internal::WorkflowScope::register_journal_key(__storage_key.clone());
-
-                    // Get the transaction back from the view to write journal + commit
-                    let mut __tx_back = __activity_view.tx.into_inner().await;
-                    #krate::__internal::save_journal_entry(&mut *__tx_back, &__storage_key, &__journal_bytes).await?;
-                    __tx_back.commit().await.map_err(|e| #krate::error::ClusterError::PersistenceError {
-                        reason: ::std::format!("activity transaction commit failed: {e}"),
-                        source: ::std::option::Option::Some(::std::boxed::Box::new(e)),
-                    })?;
-
-                    __act_result
                 }
             };
 
@@ -4521,7 +4555,7 @@ fn workflow_impl_inner(
             let max_retries = act.retries.unwrap_or(0);
             let journal_body = if max_retries == 0 {
                 // No retry — single shot
-                let exec_body = gen_execute_and_journal("__journal_key_bytes", &param_tokens);
+                let exec_body = gen_execute_and_journal("__journal_key_bytes", &param_tokens, false);
                 quote! {
                     // 1. Check journal for cached result
                     let __journal_ctx = #krate::__internal::DurableContext::with_journal_storage(
@@ -4555,7 +4589,7 @@ fn workflow_impl_inner(
 
                 let exec_body = gen_execute_and_journal("__retry_key_bytes", &{
                     cloned_param_names.iter().map(|n| quote! { #n.clone() }).collect::<Vec<_>>()
-                });
+                }, true);
 
                 quote! {
                     let mut __attempt = 0u32;

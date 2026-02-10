@@ -767,3 +767,296 @@ async fn persisted_method_replay_returns_cached_reply() {
 
     sharding.shutdown().await.unwrap();
 }
+
+// ============================================================================
+// Activity self.tx rollback on error — standalone workflow
+// ============================================================================
+
+#[workflow]
+#[derive(Clone)]
+struct TxRollbackWorkflow;
+
+#[workflow_impl(key = |req: &TxRollbackRequest| format!("{}/{}", req.entity_id, req.run_id), hash = false)]
+impl TxRollbackWorkflow {
+    async fn execute(&self, request: TxRollbackRequest) -> Result<i64, ClusterError> {
+        self.do_write(request.entity_id, request.should_fail).await
+    }
+
+    #[activity]
+    async fn do_write(&self, entity_id: String, should_fail: bool) -> Result<i64, ClusterError> {
+        // Write via self.tx — should be rolled back if we return Err
+        let result: (i64,) = sqlx::query_as(
+            "INSERT INTO tx_rollback_test (entity_id, counter)
+             VALUES ($1, 1)
+             ON CONFLICT (entity_id) DO UPDATE SET counter = tx_rollback_test.counter + 1
+             RETURNING counter",
+        )
+        .bind(&entity_id)
+        .fetch_one(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("do_write failed: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+        if should_fail {
+            return Err(ClusterError::PersistenceError {
+                reason: "intentional failure".to_string(),
+                source: None,
+            });
+        }
+
+        Ok(result.0)
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct TxRollbackRequest {
+    entity_id: String,
+    run_id: String,
+    should_fail: bool,
+}
+
+#[tokio::test]
+async fn activity_tx_rolls_back_on_error() {
+    let (_container, pool) = setup_postgres().await;
+
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tx_rollback_test (
+            entity_id TEXT PRIMARY KEY,
+            counter BIGINT NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let w = TxRollbackWorkflow;
+    let ctx = test_ctx(&pool, "Workflow/TxRollbackWorkflow", "rollback-test-1");
+    let handler = w.spawn(ctx).await.unwrap();
+
+    // 1. Successful write — counter should be 1
+    let req = TxRollbackRequest {
+        entity_id: "rb-entity-1".to_string(),
+        run_id: "run-1".to_string(),
+        should_fail: false,
+    };
+    let payload = rmp_serde::to_vec(&req).unwrap();
+    let result = handler
+        .handle_request("execute", &payload, &HashMap::new())
+        .await
+        .unwrap();
+    let value: i64 = rmp_serde::from_slice(&result).unwrap();
+    assert_eq!(value, 1, "first successful write should set counter to 1");
+
+    // Verify in DB
+    let row: (i64,) =
+        sqlx::query_as("SELECT counter FROM tx_rollback_test WHERE entity_id = 'rb-entity-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, 1);
+
+    // 2. Failing write — counter should NOT change (rolled back)
+    // Each workflow execution needs a fresh entity context to avoid journal cache collisions.
+    let ctx2 = test_ctx(&pool, "Workflow/TxRollbackWorkflow", "rollback-test-2");
+    let handler2 = TxRollbackWorkflow.spawn(ctx2).await.unwrap();
+    let req = TxRollbackRequest {
+        entity_id: "rb-entity-1".to_string(),
+        run_id: "run-2".to_string(),
+        should_fail: true,
+    };
+    let payload = rmp_serde::to_vec(&req).unwrap();
+    let result = handler2
+        .handle_request("execute", &payload, &HashMap::new())
+        .await;
+    assert!(result.is_err(), "failing activity should propagate error");
+
+    // Counter should still be 1 — the UPSERT was rolled back
+    let row: (i64,) =
+        sqlx::query_as("SELECT counter FROM tx_rollback_test WHERE entity_id = 'rb-entity-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row.0, 1,
+        "counter should still be 1 after failed activity (tx rolled back)"
+    );
+
+    // 3. Another successful write — counter should be 2 (not 3)
+    let ctx3 = test_ctx(&pool, "Workflow/TxRollbackWorkflow", "rollback-test-3");
+    let handler3 = TxRollbackWorkflow.spawn(ctx3).await.unwrap();
+    let req = TxRollbackRequest {
+        entity_id: "rb-entity-1".to_string(),
+        run_id: "run-3".to_string(),
+        should_fail: false,
+    };
+    let payload = rmp_serde::to_vec(&req).unwrap();
+    let result = handler3
+        .handle_request("execute", &payload, &HashMap::new())
+        .await
+        .unwrap();
+    let value: i64 = rmp_serde::from_slice(&result).unwrap();
+    assert_eq!(
+        value, 2,
+        "second successful write should set counter to 2 (failed write was rolled back)"
+    );
+}
+
+// ============================================================================
+// Activity group self.tx rollback on error
+// ============================================================================
+
+#[activity_group]
+#[derive(Clone)]
+pub struct TxRollbackGroup;
+
+#[activity_group_impl]
+impl TxRollbackGroup {
+    #[activity]
+    async fn write_and_maybe_fail(
+        &self,
+        entity_id: String,
+        should_fail: bool,
+    ) -> Result<i64, ClusterError> {
+        let result: (i64,) = sqlx::query_as(
+            "INSERT INTO tx_rollback_group_test (entity_id, counter)
+             VALUES ($1, 1)
+             ON CONFLICT (entity_id) DO UPDATE SET counter = tx_rollback_group_test.counter + 1
+             RETURNING counter",
+        )
+        .bind(&entity_id)
+        .fetch_one(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("group write failed: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+        if should_fail {
+            return Err(ClusterError::PersistenceError {
+                reason: "intentional group failure".to_string(),
+                source: None,
+            });
+        }
+
+        Ok(result.0)
+    }
+}
+
+#[workflow]
+#[derive(Clone)]
+struct GroupTxRollbackWorkflow;
+
+#[workflow_impl(
+    key = |req: &TxRollbackRequest| format!("{}/{}", req.entity_id, req.run_id),
+    hash = false,
+    activity_groups(TxRollbackGroup)
+)]
+impl GroupTxRollbackWorkflow {
+    async fn execute(&self, request: TxRollbackRequest) -> Result<i64, ClusterError> {
+        self.write_and_maybe_fail(request.entity_id, request.should_fail)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn activity_group_tx_rolls_back_on_error() {
+    let (_container, pool) = setup_postgres().await;
+
+    // Create test table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tx_rollback_group_test (
+            entity_id TEXT PRIMARY KEY,
+            counter BIGINT NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ctx = test_ctx(
+        &pool,
+        "Workflow/GroupTxRollbackWorkflow",
+        "group-rollback-1",
+    );
+    let bundle = __GroupTxRollbackWorkflowWithGroups {
+        __workflow: GroupTxRollbackWorkflow,
+        __group_tx_rollback_group: TxRollbackGroup,
+    };
+    let handler = bundle.spawn(ctx).await.unwrap();
+
+    // 1. Successful write
+    let req = TxRollbackRequest {
+        entity_id: "grb-entity-1".to_string(),
+        run_id: "run-1".to_string(),
+        should_fail: false,
+    };
+    let payload = rmp_serde::to_vec(&req).unwrap();
+    let result = handler
+        .handle_request("execute", &payload, &HashMap::new())
+        .await
+        .unwrap();
+    let value: i64 = rmp_serde::from_slice(&result).unwrap();
+    assert_eq!(value, 1);
+
+    // 2. Failing write — should be rolled back
+    // Each workflow execution needs a fresh entity context to avoid journal cache collisions.
+    let ctx2 = test_ctx(
+        &pool,
+        "Workflow/GroupTxRollbackWorkflow",
+        "group-rollback-2",
+    );
+    let bundle2 = __GroupTxRollbackWorkflowWithGroups {
+        __workflow: GroupTxRollbackWorkflow,
+        __group_tx_rollback_group: TxRollbackGroup,
+    };
+    let handler2 = bundle2.spawn(ctx2).await.unwrap();
+    let req = TxRollbackRequest {
+        entity_id: "grb-entity-1".to_string(),
+        run_id: "run-2".to_string(),
+        should_fail: true,
+    };
+    let payload = rmp_serde::to_vec(&req).unwrap();
+    let result = handler2
+        .handle_request("execute", &payload, &HashMap::new())
+        .await;
+    assert!(result.is_err());
+
+    // Counter should still be 1
+    let row: (i64,) = sqlx::query_as(
+        "SELECT counter FROM tx_rollback_group_test WHERE entity_id = 'grb-entity-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.0, 1,
+        "activity group: counter should still be 1 after failed activity (tx rolled back)"
+    );
+
+    // 3. Successful write after failure — counter should be 2
+    let ctx3 = test_ctx(
+        &pool,
+        "Workflow/GroupTxRollbackWorkflow",
+        "group-rollback-3",
+    );
+    let bundle3 = __GroupTxRollbackWorkflowWithGroups {
+        __workflow: GroupTxRollbackWorkflow,
+        __group_tx_rollback_group: TxRollbackGroup,
+    };
+    let handler3 = bundle3.spawn(ctx3).await.unwrap();
+    let req = TxRollbackRequest {
+        entity_id: "grb-entity-1".to_string(),
+        run_id: "run-3".to_string(),
+        should_fail: false,
+    };
+    let payload = rmp_serde::to_vec(&req).unwrap();
+    let result = handler3
+        .handle_request("execute", &payload, &HashMap::new())
+        .await
+        .unwrap();
+    let value: i64 = rmp_serde::from_slice(&result).unwrap();
+    assert_eq!(value, 2);
+}

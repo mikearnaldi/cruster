@@ -442,7 +442,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "cluster-tests"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -619,7 +619,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cruster"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "async-trait",
  "chrono",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "cruster-macros"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "proc-macro2",
  "quote",

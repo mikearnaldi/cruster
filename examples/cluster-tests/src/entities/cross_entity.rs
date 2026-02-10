@@ -154,8 +154,10 @@ impl CrossEntity {
 
     /// Clear all received messages.
     ///
-    /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
-    #[rpc(persisted)]
+    /// Uses `#[rpc]` (non-persisted) because clear is non-idempotent — calling it
+    /// twice should clear any messages that arrived between calls. Persisted RPCs
+    /// deduplicate by payload hash, which would skip the second clear.
+    #[rpc]
     pub async fn clear_messages(&self, request: ClearMessagesRequest) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM cross_entity_messages WHERE entity_id = $1")
             .bind(&request.entity_id)

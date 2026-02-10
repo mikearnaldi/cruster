@@ -1,15 +1,19 @@
-//! WorkflowTest entity - entity for testing durable workflow execution and replay.
+//! WorkflowTest - tests durable workflow execution and replay.
 //!
-//! This entity provides workflow operations to test:
-//! - Workflow completes all steps
-//! - Workflow replays correctly after runner restart
-//! - Failed workflow can be retried
-//! - Steps are idempotent on replay
+//! Migrated from old stateful entity API to new pure-RPC entity + standalone workflows.
+//!
+//! ## Architecture
+//! - `WorkflowTest` entity: pure-RPC for read queries (get_execution, list_executions)
+//! - `SimpleWorkflow`: standalone workflow with 3 sequential activities
+//! - `FailingWorkflow`: standalone workflow that fails at a configurable step
+//! - `LongWorkflow`: standalone workflow with N steps
+//!
+//! All execution state is stored in PostgreSQL `workflow_test_executions` table.
 
-use cruster::entity::EntityContext;
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
 /// Record of a single workflow execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,218 +26,478 @@ pub struct WorkflowExecution {
     pub result: Option<String>,
 }
 
-/// State for a WorkflowTest entity.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct WorkflowTestState {
-    /// All workflow executions for this entity.
-    pub executions: Vec<WorkflowExecution>,
-}
+// ============================================================================
+// WorkflowTest entity - pure-RPC for reading execution data
+// ============================================================================
 
-/// WorkflowTest entity for testing durable workflow execution.
+/// WorkflowTest entity for querying workflow execution data.
 ///
-/// ## State (Persisted)
-/// - executions: `Vec<WorkflowExecution>` - all workflow executions
-///
-/// ## Workflows
-/// - `run_simple_workflow(exec_id)` - Execute 3 steps, return result
-/// - `run_failing_workflow(exec_id, fail_at)` - Fail at specific step
-/// - `run_long_workflow(exec_id, steps)` - Execute N steps
+/// Uses the new stateless entity API - state is stored directly in PostgreSQL
+/// via the `workflow_test_executions` table.
 ///
 /// ## RPCs
-/// - `get_execution(exec_id)` - Get a specific execution
-/// - `list_executions()` - List all executions
+/// - `get_execution(entity_id, exec_id)` - Get a specific execution
+/// - `list_executions(entity_id)` - List all executions for an entity
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
-pub struct WorkflowTest;
-
-/// Request to run a simple workflow.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RunSimpleWorkflowRequest {
-    /// Unique execution ID.
-    pub exec_id: String,
-}
-
-/// Request to run a workflow that fails at a specific step.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RunFailingWorkflowRequest {
-    /// Unique execution ID.
-    pub exec_id: String,
-    /// Step number to fail at (0-indexed).
-    pub fail_at: usize,
-}
-
-/// Request to run a long workflow with N steps.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RunLongWorkflowRequest {
-    /// Unique execution ID.
-    pub exec_id: String,
-    /// Number of steps to execute.
-    pub steps: usize,
+pub struct WorkflowTest {
+    /// Database pool for direct state queries.
+    pub pool: PgPool,
 }
 
 /// Request to get a specific execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetExecutionRequest {
+    /// Entity ID that owns the execution.
+    pub entity_id: String,
     /// Execution ID to retrieve.
     pub exec_id: String,
 }
 
+/// Request to list all executions for an entity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListExecutionsRequest {
+    /// Entity ID to list executions for.
+    pub entity_id: String,
+}
+
 #[entity_impl]
-#[state(WorkflowTestState)]
 impl WorkflowTest {
-    fn init(&self, _ctx: &EntityContext) -> Result<WorkflowTestState, ClusterError> {
-        Ok(WorkflowTestState::default())
-    }
-
-    #[activity]
-    async fn create_execution(&mut self, exec_id: String) -> Result<(), ClusterError> {
-        let execution = WorkflowExecution {
-            id: exec_id,
-            steps_completed: Vec::new(),
-            result: None,
-        };
-        self.state.executions.push(execution);
-        Ok(())
-    }
-
-    #[activity]
-    async fn complete_step(
-        &mut self,
-        exec_id: String,
-        step_name: String,
-    ) -> Result<(), ClusterError> {
-        if let Some(exec) = self.state.executions.iter_mut().find(|e| e.id == exec_id) {
-            exec.steps_completed.push(step_name);
-        }
-        Ok(())
-    }
-
-    #[activity]
-    async fn mark_completed(
-        &mut self,
-        exec_id: String,
-        result: String,
-    ) -> Result<(), ClusterError> {
-        if let Some(exec) = self.state.executions.iter_mut().find(|e| e.id == exec_id) {
-            exec.result = Some(result);
-        }
-        Ok(())
-    }
-
-    #[activity]
-    async fn mark_failed(&mut self, exec_id: String, step: usize) -> Result<(), ClusterError> {
-        if let Some(exec) = self.state.executions.iter_mut().find(|e| e.id == exec_id) {
-            exec.result = Some(format!("failed:step{}", step));
-        }
-        Ok(())
-    }
-
-    /// Execute a simple workflow with 3 steps.
-    #[workflow]
-    pub async fn run_simple_workflow(
-        &self,
-        request: RunSimpleWorkflowRequest,
-    ) -> Result<String, ClusterError> {
-        let exec_id = request.exec_id;
-
-        // Create execution record
-        self.create_execution(exec_id.clone()).await?;
-
-        // Execute step 1
-        self.complete_step(exec_id.clone(), "step1".to_string())
-            .await?;
-
-        // Execute step 2
-        self.complete_step(exec_id.clone(), "step2".to_string())
-            .await?;
-
-        // Execute step 3
-        self.complete_step(exec_id.clone(), "step3".to_string())
-            .await?;
-
-        // Mark as completed
-        let result = format!("completed:{}", exec_id);
-        self.mark_completed(exec_id, result.clone()).await?;
-
-        Ok(result)
-    }
-
-    /// Execute a workflow that fails at a specific step.
-    #[workflow]
-    pub async fn run_failing_workflow(
-        &self,
-        request: RunFailingWorkflowRequest,
-    ) -> Result<String, ClusterError> {
-        let exec_id = request.exec_id;
-        let fail_at = request.fail_at;
-
-        // Create execution record
-        self.create_execution(exec_id.clone()).await?;
-
-        // Execute steps until failure
-        for i in 0..3 {
-            if i == fail_at {
-                // Mark as failed
-                self.mark_failed(exec_id.clone(), i).await?;
-                return Err(ClusterError::MalformedMessage {
-                    reason: format!("Intentional failure at step {}", i),
-                    source: None,
-                });
-            }
-            self.complete_step(exec_id.clone(), format!("step{}", i))
-                .await?;
-        }
-
-        // Mark as completed
-        let result = format!("completed:{}", exec_id);
-        self.mark_completed(exec_id, result.clone()).await?;
-
-        Ok(result)
-    }
-
-    /// Execute a workflow with N steps.
-    #[workflow]
-    pub async fn run_long_workflow(
-        &self,
-        request: RunLongWorkflowRequest,
-    ) -> Result<String, ClusterError> {
-        let exec_id = request.exec_id;
-        let steps = request.steps;
-
-        // Create execution record
-        self.create_execution(exec_id.clone()).await?;
-
-        // Execute all steps
-        for i in 0..steps {
-            self.complete_step(exec_id.clone(), format!("step{}", i))
-                .await?;
-        }
-
-        // Mark as completed
-        let result = format!("completed:{}", exec_id);
-        self.mark_completed(exec_id, result.clone()).await?;
-
-        Ok(result)
-    }
-
     /// Get a specific workflow execution.
     #[rpc]
     pub async fn get_execution(
         &self,
         request: GetExecutionRequest,
     ) -> Result<Option<WorkflowExecution>, ClusterError> {
-        Ok(self
-            .state
-            .executions
-            .iter()
-            .find(|e| e.id == request.exec_id)
-            .cloned())
+        let row: Option<(String, Vec<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, steps_completed, result FROM workflow_test_executions
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&request.entity_id)
+        .bind(&request.exec_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("get_execution failed: {e}"),
+            source: None,
+        })?;
+
+        Ok(row.map(|(id, steps_completed, result)| WorkflowExecution {
+            id,
+            steps_completed,
+            result,
+        }))
     }
 
-    /// List all workflow executions.
+    /// List all workflow executions for this entity.
     #[rpc]
-    pub async fn list_executions(&self) -> Result<Vec<WorkflowExecution>, ClusterError> {
-        Ok(self.state.executions.clone())
+    pub async fn list_executions(
+        &self,
+        request: ListExecutionsRequest,
+    ) -> Result<Vec<WorkflowExecution>, ClusterError> {
+        let rows: Vec<(String, Vec<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, steps_completed, result FROM workflow_test_executions
+             WHERE entity_id = $1
+             ORDER BY id",
+        )
+        .bind(&request.entity_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("list_executions failed: {e}"),
+            source: None,
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, steps_completed, result)| WorkflowExecution {
+                id,
+                steps_completed,
+                result,
+            })
+            .collect())
+    }
+}
+
+// ============================================================================
+// SimpleWorkflow - standalone workflow with 3 sequential activities
+// ============================================================================
+
+/// Request to run a simple workflow.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunSimpleWorkflowRequest {
+    /// Entity ID (scoping key for executions).
+    pub entity_id: String,
+    /// Unique execution ID.
+    pub exec_id: String,
+}
+
+/// Simple workflow that creates an execution, runs 3 steps, and marks completed.
+///
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
+#[workflow]
+#[derive(Clone)]
+pub struct SimpleWorkflow;
+
+#[workflow_impl(key = |req: &RunSimpleWorkflowRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+impl SimpleWorkflow {
+    async fn execute(&self, request: RunSimpleWorkflowRequest) -> Result<String, ClusterError> {
+        let entity_id = request.entity_id.clone();
+        let exec_id = request.exec_id.clone();
+
+        // Create execution record
+        self.create_execution(entity_id.clone(), exec_id.clone())
+            .await?;
+
+        // Execute steps 1-3
+        self.complete_step(entity_id.clone(), exec_id.clone(), "step1".to_string())
+            .await?;
+        self.complete_step(entity_id.clone(), exec_id.clone(), "step2".to_string())
+            .await?;
+        self.complete_step(entity_id.clone(), exec_id.clone(), "step3".to_string())
+            .await?;
+
+        // Mark as completed
+        let result = format!("completed:{}", exec_id);
+        self.mark_completed(entity_id, exec_id, result.clone())
+            .await?;
+
+        Ok(result)
+    }
+
+    #[activity]
+    async fn create_execution(
+        &self,
+        entity_id: String,
+        exec_id: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
+             VALUES ($1, $2, '{}', NULL)
+             ON CONFLICT (entity_id, id) DO NOTHING",
+        )
+        .bind(&exec_id)
+        .bind(&entity_id)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("create_execution failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+
+    #[activity]
+    async fn complete_step(
+        &self,
+        entity_id: String,
+        exec_id: String,
+        step_name: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "UPDATE workflow_test_executions
+             SET steps_completed = array_append(steps_completed, $3)
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&step_name)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("complete_step failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+
+    #[activity]
+    async fn mark_completed(
+        &self,
+        entity_id: String,
+        exec_id: String,
+        result: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&result)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("mark_completed failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// FailingWorkflow - standalone workflow that fails at a configurable step
+// ============================================================================
+
+/// Request to run a workflow that fails at a specific step.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunFailingWorkflowRequest {
+    /// Entity ID (scoping key for executions).
+    pub entity_id: String,
+    /// Unique execution ID.
+    pub exec_id: String,
+    /// Step number to fail at (0-indexed).
+    pub fail_at: usize,
+}
+
+/// Workflow that creates an execution, runs steps, and fails at a configurable point.
+///
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
+#[workflow]
+#[derive(Clone)]
+pub struct FailingWorkflow;
+
+#[workflow_impl(key = |req: &RunFailingWorkflowRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+impl FailingWorkflow {
+    async fn execute(&self, request: RunFailingWorkflowRequest) -> Result<String, ClusterError> {
+        let entity_id = request.entity_id.clone();
+        let exec_id = request.exec_id.clone();
+        let fail_at = request.fail_at;
+
+        // Create execution record
+        self.create_execution(entity_id.clone(), exec_id.clone())
+            .await?;
+
+        // Execute steps until failure
+        for i in 0..3 {
+            if i == fail_at {
+                // Mark as failed
+                self.mark_failed(entity_id.clone(), exec_id.clone(), i)
+                    .await?;
+                return Err(ClusterError::MalformedMessage {
+                    reason: format!("Intentional failure at step {}", i),
+                    source: None,
+                });
+            }
+            self.complete_step(entity_id.clone(), exec_id.clone(), format!("step{}", i))
+                .await?;
+        }
+
+        // Mark as completed
+        let result = format!("completed:{}", exec_id);
+        self.mark_completed(entity_id, exec_id, result.clone())
+            .await?;
+
+        Ok(result)
+    }
+
+    #[activity]
+    async fn create_execution(
+        &self,
+        entity_id: String,
+        exec_id: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
+             VALUES ($1, $2, '{}', NULL)
+             ON CONFLICT (entity_id, id) DO NOTHING",
+        )
+        .bind(&exec_id)
+        .bind(&entity_id)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("create_execution failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+
+    #[activity]
+    async fn complete_step(
+        &self,
+        entity_id: String,
+        exec_id: String,
+        step_name: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "UPDATE workflow_test_executions
+             SET steps_completed = array_append(steps_completed, $3)
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&step_name)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("complete_step failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+
+    #[activity]
+    async fn mark_completed(
+        &self,
+        entity_id: String,
+        exec_id: String,
+        result: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&result)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("mark_completed failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+
+    #[activity]
+    async fn mark_failed(
+        &self,
+        entity_id: String,
+        exec_id: String,
+        step: usize,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(format!("failed:step{}", step))
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("mark_failed failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// LongWorkflow - standalone workflow with N steps
+// ============================================================================
+
+/// Request to run a long workflow with N steps.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunLongWorkflowRequest {
+    /// Entity ID (scoping key for executions).
+    pub entity_id: String,
+    /// Unique execution ID.
+    pub exec_id: String,
+    /// Number of steps to execute.
+    pub steps: usize,
+}
+
+/// Workflow that creates an execution and runs a configurable number of steps.
+///
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
+#[workflow]
+#[derive(Clone)]
+pub struct LongWorkflow;
+
+#[workflow_impl(key = |req: &RunLongWorkflowRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+impl LongWorkflow {
+    async fn execute(&self, request: RunLongWorkflowRequest) -> Result<String, ClusterError> {
+        let entity_id = request.entity_id.clone();
+        let exec_id = request.exec_id.clone();
+        let steps = request.steps;
+
+        // Create execution record
+        self.create_execution(entity_id.clone(), exec_id.clone())
+            .await?;
+
+        // Execute all steps
+        for i in 0..steps {
+            self.complete_step(entity_id.clone(), exec_id.clone(), format!("step{}", i))
+                .await?;
+        }
+
+        // Mark as completed
+        let result = format!("completed:{}", exec_id);
+        self.mark_completed(entity_id, exec_id, result.clone())
+            .await?;
+
+        Ok(result)
+    }
+
+    #[activity]
+    async fn create_execution(
+        &self,
+        entity_id: String,
+        exec_id: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "INSERT INTO workflow_test_executions (id, entity_id, steps_completed, result)
+             VALUES ($1, $2, '{}', NULL)
+             ON CONFLICT (entity_id, id) DO NOTHING",
+        )
+        .bind(&exec_id)
+        .bind(&entity_id)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("create_execution failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+
+    #[activity]
+    async fn complete_step(
+        &self,
+        entity_id: String,
+        exec_id: String,
+        step_name: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "UPDATE workflow_test_executions
+             SET steps_completed = array_append(steps_completed, $3)
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&step_name)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("complete_step failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
+    }
+
+    #[activity]
+    async fn mark_completed(
+        &self,
+        entity_id: String,
+        exec_id: String,
+        result: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "UPDATE workflow_test_executions SET result = $3
+             WHERE entity_id = $1 AND id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&exec_id)
+        .bind(&result)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("mark_completed failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
     }
 }
 
@@ -258,24 +522,42 @@ mod tests {
     }
 
     #[test]
-    fn test_workflow_test_state_default() {
-        let state = WorkflowTestState::default();
-        assert!(state.executions.is_empty());
+    fn test_run_simple_workflow_request_serialization() {
+        let req = RunSimpleWorkflowRequest {
+            entity_id: "wf-1".to_string(),
+            exec_id: "exec-1".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RunSimpleWorkflowRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "wf-1");
+        assert_eq!(parsed.exec_id, "exec-1");
     }
 
     #[test]
-    fn test_workflow_test_state_serialization() {
-        let mut state = WorkflowTestState::default();
-        state.executions.push(WorkflowExecution {
-            id: "exec1".to_string(),
-            steps_completed: vec!["step1".to_string()],
-            result: None,
-        });
+    fn test_run_failing_workflow_request_serialization() {
+        let req = RunFailingWorkflowRequest {
+            entity_id: "wf-1".to_string(),
+            exec_id: "exec-1".to_string(),
+            fail_at: 2,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RunFailingWorkflowRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "wf-1");
+        assert_eq!(parsed.exec_id, "exec-1");
+        assert_eq!(parsed.fail_at, 2);
+    }
 
-        let json = serde_json::to_string(&state).unwrap();
-        let parsed: WorkflowTestState = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed.executions.len(), 1);
-        assert_eq!(parsed.executions[0].id, "exec1");
+    #[test]
+    fn test_run_long_workflow_request_serialization() {
+        let req = RunLongWorkflowRequest {
+            entity_id: "wf-1".to_string(),
+            exec_id: "exec-1".to_string(),
+            steps: 10,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RunLongWorkflowRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "wf-1");
+        assert_eq!(parsed.exec_id, "exec-1");
+        assert_eq!(parsed.steps, 10);
     }
 }

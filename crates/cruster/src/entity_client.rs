@@ -37,6 +37,19 @@ impl EntityClientAccessor for EntityClient {
     }
 }
 
+/// Factory trait for creating typed workflow/entity clients.
+///
+/// Automatically implemented by `#[workflow]` macros.
+/// Used by the `self.client::<T>()` method inside workflow execute bodies
+/// to get a typed client for another workflow or entity.
+pub trait WorkflowClientFactory {
+    /// The typed client type produced by this factory.
+    type Client;
+
+    /// Create a new typed client from a sharding interface.
+    fn workflow_client(sharding: Arc<dyn Sharding>) -> Self::Client;
+}
+
 pub(crate) fn persisted_request_id(
     entity_type: &EntityType,
     entity_id: &EntityId,
@@ -417,6 +430,51 @@ impl EntityClient {
         envelope.persisted = true;
         envelope.deliver_at = Some(deliver_at);
         self.sharding.notify(envelope).await
+    }
+
+    /// Poll for a persisted reply without sending a new message.
+    ///
+    /// Computes the deterministic request ID from the entity address and tag/key,
+    /// then queries `MessageStorage` for any stored exit reply. Returns `Ok(Some(result))`
+    /// if the workflow has completed, `Ok(None)` if it is still running or no reply exists.
+    ///
+    /// The `key_bytes` are the same bytes used by `send_persisted`/`notify_persisted`
+    /// for deterministic request ID derivation (typically the serialized request payload).
+    #[instrument(skip(self, key_bytes), fields(entity_type = %self.entity_type, entity_id = %entity_id))]
+    pub async fn poll_reply<Res>(
+        &self,
+        entity_id: &EntityId,
+        tag: &str,
+        key_bytes: &[u8],
+    ) -> Result<Option<Res>, ClusterError>
+    where
+        Res: DeserializeOwned,
+    {
+        let request_id = persisted_request_id(&self.entity_type, entity_id, tag, key_bytes);
+        let replies = self.sharding.replies_for(request_id).await?;
+
+        // Look for an exit reply
+        for reply in replies {
+            if let Reply::WithExit(r) = reply {
+                return match r.exit {
+                    ExitResult::Success(bytes) => {
+                        let result = rmp_serde::from_slice(&bytes).map_err(|e| {
+                            ClusterError::MalformedMessage {
+                                reason: format!("failed to deserialize poll response: {e}"),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                        Ok(Some(result))
+                    }
+                    ExitResult::Failure(msg) => Err(ClusterError::MalformedMessage {
+                        reason: msg,
+                        source: None,
+                    }),
+                };
+            }
+        }
+
+        Ok(None)
     }
 
     /// Get the entity type this client targets.

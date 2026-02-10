@@ -1,22 +1,24 @@
+error: entity traits have been replaced by #[rpc_group]; use #[entity_impl(rpc_groups(...))] instead
+ --> tests/ui/missing_trait_with.rs:9:1
+  |
+9 | #[entity_impl(traits(SomeGroup))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `entity_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+
 error[E0277]: the trait bound `LoggingEntity: Entity` is not satisfied
-  --> tests/ui/missing_trait_with.rs:32:21
+  --> tests/ui/missing_trait_with.rs:20:21
    |
-32 |     assert_entity::<LoggingEntity>();
+20 |     assert_entity::<LoggingEntity>();
    |                     ^^^^^^^^^^^^^ unsatisfied trait bound
    |
 help: the trait `Entity` is not implemented for `LoggingEntity`
-  --> tests/ui/missing_trait_with.rs:19:1
+  --> tests/ui/missing_trait_with.rs:6:1
    |
-19 | struct LoggingEntity;
+ 6 | struct LoggingEntity;
    | ^^^^^^^^^^^^^^^^^^^^
-help: the trait `Entity` is implemented for `LoggingEntityWithTraits`
-  --> tests/ui/missing_trait_with.rs:21:1
-   |
-21 | #[entity_impl(traits(LoggerTrait))]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 note: required by a bound in `assert_entity`
-  --> tests/ui/missing_trait_with.rs:29:21
+  --> tests/ui/missing_trait_with.rs:17:21
    |
-29 | fn assert_entity<T: Entity>() {}
+17 | fn assert_entity<T: Entity>() {}
    |                     ^^^^^^ required by this bound in `assert_entity`
-   = note: this error originates in the attribute macro `entity_impl` (in Nightly builds, run with -Z macro-backtrace for more info)

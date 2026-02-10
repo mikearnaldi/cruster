@@ -346,17 +346,17 @@ impl MessageStorage for SqlMessageStorage {
             ),
             updated AS (
                 UPDATE cluster_messages
-                SET retry_count = retry_count + 1, last_read = NOW()
+                SET retry_count = retry_count + 1,
+                    last_read = NOW(),
+                    processed = CASE
+                        WHEN $3::int > 0 AND retry_count > $3::int THEN TRUE
+                        ELSE processed
+                    END
                 WHERE request_id IN (SELECT request_id FROM to_process)
-                RETURNING request_id, retry_count
+                RETURNING request_id, retry_count, processed
             ),
             dead_lettered AS (
-                UPDATE cluster_messages
-                SET processed = TRUE
-                WHERE request_id IN (
-                    SELECT request_id FROM updated WHERE $3 > 0 AND retry_count - 1 > $3
-                )
-                RETURNING request_id
+                SELECT request_id FROM updated WHERE processed = TRUE
             ),
             dead_letter_replies AS (
                 INSERT INTO cluster_replies (id, request_id, sequence, payload, is_exit)

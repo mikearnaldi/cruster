@@ -1,15 +1,19 @@
-//! ActivityTest entity - entity for testing activity journaling and transactional state.
+//! ActivityTest - tests activity journaling and transactional state.
 //!
-//! This entity provides activity operations to test:
-//! - Activities are journaled
-//! - Activities replay correctly (not re-executed)
-//! - Activity state mutations are transactional
+//! Migrated from old stateful entity API to new pure-RPC entity + standalone workflow.
+//!
+//! ## Architecture
+//! - `ActivityTest` entity: pure-RPC for reading activity logs (get_activity_log)
+//! - `ActivityWorkflow`: standalone workflow with multiple activities that write to PG
+//!
+//! All activity state is stored in PostgreSQL `activity_test_logs` table.
 
 use chrono::{DateTime, Utc};
-use cruster::entity::EntityContext;
+
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
 /// Record of a single activity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,34 +26,72 @@ pub struct ActivityRecord {
     pub timestamp: DateTime<Utc>,
 }
 
-/// State for an ActivityTest entity.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ActivityTestState {
-    /// Log of all activities.
-    pub activity_log: Vec<ActivityRecord>,
-}
+// ============================================================================
+// ActivityTest entity - pure-RPC for reading activity log data
+// ============================================================================
 
-/// ActivityTest entity for testing activity journaling.
+/// ActivityTest entity for querying activity log data.
 ///
-/// ## State (Persisted)
-/// - activity_log: `Vec<ActivityRecord>` - all logged activities
-///
-/// ## Workflows
-/// - `run_with_activities(exec_id)` - Run workflow with multiple activities
-///
-/// ## Activities
-/// - `log_activity(id, action)` - Log an activity (mutates state)
-/// - `external_call(url)` - Simulate external side effect
+/// Uses the new stateless entity API - state is stored directly in PostgreSQL
+/// via the `activity_test_logs` table.
 ///
 /// ## RPCs
-/// - `get_activity_log()` - Get the activity log
+/// - `get_activity_log(entity_id)` - Get the activity log for an entity
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
-pub struct ActivityTest;
+pub struct ActivityTest {
+    /// Database pool for direct state queries.
+    pub pool: PgPool,
+}
+
+/// Request to get the activity log for an entity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetActivityLogRequest {
+    /// Entity ID to get logs for.
+    pub entity_id: String,
+}
+
+#[entity_impl]
+impl ActivityTest {
+    /// Get the activity log.
+    #[rpc]
+    pub async fn get_activity_log(
+        &self,
+        request: GetActivityLogRequest,
+    ) -> Result<Vec<ActivityRecord>, ClusterError> {
+        let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT id, action, timestamp FROM activity_test_logs
+             WHERE entity_id = $1
+             ORDER BY timestamp ASC",
+        )
+        .bind(&request.entity_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("get_activity_log failed: {e}"),
+            source: None,
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, action, timestamp)| ActivityRecord {
+                id,
+                action,
+                timestamp,
+            })
+            .collect())
+    }
+}
+
+// ============================================================================
+// ActivityWorkflow - standalone workflow with multiple activities
+// ============================================================================
 
 /// Request to run a workflow with activities.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunWithActivitiesRequest {
+    /// Entity ID (scoping key for activity logs).
+    pub entity_id: String,
     /// Unique execution ID.
     pub exec_id: String,
 }
@@ -57,6 +99,8 @@ pub struct RunWithActivitiesRequest {
 /// Request to log an activity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogActivityRequest {
+    /// Entity ID to log activity for.
+    pub entity_id: String,
     /// Activity ID.
     pub id: String,
     /// Action performed.
@@ -70,27 +114,26 @@ pub struct ExternalCallRequest {
     pub url: String,
 }
 
-#[entity_impl]
-#[state(ActivityTestState)]
-impl ActivityTest {
-    fn init(&self, _ctx: &EntityContext) -> Result<ActivityTestState, ClusterError> {
-        Ok(ActivityTestState::default())
-    }
+/// Workflow that runs multiple activities to test journaling and replay.
+///
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
+#[workflow]
+#[derive(Clone)]
+pub struct ActivityWorkflow;
 
-    /// Run a workflow with multiple activities.
-    ///
-    /// This workflow logs several activities and makes simulated external calls
-    /// to test activity journaling and replay behavior.
-    #[workflow]
-    pub async fn run_with_activities(
+#[workflow_impl(key = |req: &RunWithActivitiesRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+impl ActivityWorkflow {
+    async fn execute(
         &self,
         request: RunWithActivitiesRequest,
     ) -> Result<Vec<String>, ClusterError> {
-        let exec_id = request.exec_id;
+        let entity_id = request.entity_id.clone();
+        let exec_id = request.exec_id.clone();
         let mut results = Vec::new();
 
         // Activity 1: Log the start of the workflow
         self.log_activity(LogActivityRequest {
+            entity_id: entity_id.clone(),
             id: format!("{}-start", exec_id),
             action: "workflow_started".to_string(),
         })
@@ -107,6 +150,7 @@ impl ActivityTest {
 
         // Activity 3: Log a processing step
         self.log_activity(LogActivityRequest {
+            entity_id: entity_id.clone(),
             id: format!("{}-process", exec_id),
             action: "data_processed".to_string(),
         })
@@ -123,6 +167,7 @@ impl ActivityTest {
 
         // Activity 5: Log the completion
         self.log_activity(LogActivityRequest {
+            entity_id: entity_id.clone(),
             id: format!("{}-complete", exec_id),
             action: "workflow_completed".to_string(),
         })
@@ -134,37 +179,35 @@ impl ActivityTest {
 
     /// Log an activity to the activity log.
     ///
-    /// This activity mutates the entity state by appending to the activity log.
-    /// On replay, this should be deterministic and not re-execute.
+    /// Writes the activity record to PostgreSQL via the framework transaction.
+    /// On replay, this should be journaled and not re-executed.
     #[activity]
-    async fn log_activity(&mut self, request: LogActivityRequest) -> Result<(), ClusterError> {
-        let record = ActivityRecord {
-            id: request.id,
-            action: request.action,
-            timestamp: Utc::now(),
-        };
-        self.state.activity_log.push(record);
+    async fn log_activity(&self, request: LogActivityRequest) -> Result<(), ClusterError> {
+        sqlx::query(
+            "INSERT INTO activity_test_logs (id, entity_id, action, timestamp)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (entity_id, id) DO NOTHING",
+        )
+        .bind(&request.id)
+        .bind(&request.entity_id)
+        .bind(&request.action)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("log_activity failed: {e}"),
+            source: None,
+        })?;
         Ok(())
     }
 
     /// Simulate an external call (side effect).
     ///
-    /// This activity simulates calling an external service. On replay, the
-    /// result should be replayed from the journal rather than re-executing.
+    /// On replay, the result should be replayed from the journal rather than re-executing.
     #[activity]
-    async fn external_call(
-        &mut self,
-        request: ExternalCallRequest,
-    ) -> Result<String, ClusterError> {
+    async fn external_call(&self, request: ExternalCallRequest) -> Result<String, ClusterError> {
         // Simulate the external call by returning a deterministic result
         // In a real scenario, this would make an HTTP request
         Ok(format!("response_from_{}", request.url.replace('/', "_")))
-    }
-
-    /// Get the activity log.
-    #[rpc]
-    pub async fn get_activity_log(&self) -> Result<Vec<ActivityRecord>, ClusterError> {
-        Ok(self.state.activity_log.clone())
     }
 }
 
@@ -188,24 +231,14 @@ mod tests {
     }
 
     #[test]
-    fn test_activity_test_state_default() {
-        let state = ActivityTestState::default();
-        assert!(state.activity_log.is_empty());
-    }
-
-    #[test]
-    fn test_activity_test_state_serialization() {
-        let mut state = ActivityTestState::default();
-        state.activity_log.push(ActivityRecord {
-            id: "act1".to_string(),
-            action: "action1".to_string(),
-            timestamp: Utc::now(),
-        });
-
-        let json = serde_json::to_string(&state).unwrap();
-        let parsed: ActivityTestState = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed.activity_log.len(), 1);
-        assert_eq!(parsed.activity_log[0].id, "act1");
+    fn test_run_with_activities_request_serialization() {
+        let req = RunWithActivitiesRequest {
+            entity_id: "act-1".to_string(),
+            exec_id: "exec-1".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RunWithActivitiesRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "act-1");
+        assert_eq!(parsed.exec_id, "exec-1");
     }
 }

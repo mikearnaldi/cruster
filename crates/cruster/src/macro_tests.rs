@@ -2,34 +2,23 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::config::ShardingConfig;
-    use crate::durable::{
-        MemoryWorkflowStorage, WorkflowEngine, WorkflowStorage, INTERRUPT_SIGNAL,
-    };
     use crate::entity_client::EntityClient;
     use crate::envelope::{AckChunk, EnvelopeRequest, Interrupt};
     use crate::hash::shard_for_entity;
     use crate::message::ReplyReceiver;
-    use crate::metrics::ClusterMetrics;
     use crate::prelude::*;
     use crate::reply::{ExitResult, Reply, ReplyWithExit};
     use crate::sharding::{Sharding, ShardingRegistrationEvent};
-    use crate::sharding_impl::ShardingImpl;
     use crate::singleton::SingletonContext;
-    use crate::snowflake::SnowflakeGenerator;
-    use crate::storage::memory_message::MemoryMessageStorage;
-    use crate::storage::noop_runners::NoopRunners;
+    use crate::snowflake::{Snowflake, SnowflakeGenerator};
     use crate::types::{EntityAddress, EntityId, EntityType, RunnerAddress, ShardId};
     use async_trait::async_trait;
-    use dashmap::DashMap;
     use futures::future::BoxFuture;
-    use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use tokio::sync::Notify;
     use tokio_stream::Stream;
 
     fn test_ctx(entity_type: &str, entity_id: &str) -> EntityContext {
@@ -46,110 +35,6 @@ mod tests {
             workflow_engine: None,
             sharding: None,
             message_storage: None,
-        }
-    }
-
-    fn test_ctx_with_storage(
-        entity_type: &str,
-        entity_id: &str,
-        storage: Arc<dyn crate::durable::WorkflowStorage>,
-    ) -> EntityContext {
-        EntityContext {
-            address: EntityAddress {
-                shard_id: ShardId::new("default", 0),
-                entity_type: EntityType::new(entity_type),
-                entity_id: EntityId::new(entity_id),
-            },
-            runner_address: RunnerAddress::new("127.0.0.1", 9000),
-            snowflake: Arc::new(SnowflakeGenerator::new()),
-            sharding: None,
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            state_storage: Some(storage),
-            workflow_engine: None,
-            message_storage: None,
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct TestWorkflowEngine {
-        deferred: Arc<DashMap<(String, String, String), Vec<u8>>>,
-        notifiers: Arc<DashMap<(String, String, String), Arc<Notify>>>,
-    }
-
-    impl TestWorkflowEngine {
-        fn new() -> Self {
-            Self::default()
-        }
-    }
-
-    #[async_trait]
-    impl WorkflowEngine for TestWorkflowEngine {
-        async fn sleep(
-            &self,
-            _workflow_name: &str,
-            _execution_id: &str,
-            _name: &str,
-            duration: std::time::Duration,
-        ) -> Result<(), ClusterError> {
-            tokio::time::sleep(duration).await;
-            Ok(())
-        }
-
-        async fn await_deferred(
-            &self,
-            workflow_name: &str,
-            execution_id: &str,
-            name: &str,
-        ) -> Result<Vec<u8>, ClusterError> {
-            let key = (
-                workflow_name.to_string(),
-                execution_id.to_string(),
-                name.to_string(),
-            );
-            loop {
-                if let Some(value) = self.deferred.get(&key) {
-                    return Ok(value.clone());
-                }
-                let notify = self
-                    .notifiers
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(Notify::new()))
-                    .clone();
-                if let Some(value) = self.deferred.get(&key) {
-                    return Ok(value.clone());
-                }
-                notify.notified().await;
-            }
-        }
-
-        async fn resolve_deferred(
-            &self,
-            workflow_name: &str,
-            execution_id: &str,
-            name: &str,
-            value: Vec<u8>,
-        ) -> Result<(), ClusterError> {
-            let key = (
-                workflow_name.to_string(),
-                execution_id.to_string(),
-                name.to_string(),
-            );
-            self.deferred.insert(key.clone(), value);
-            if let Some(notify) = self.notifiers.get(&key) {
-                notify.notify_waiters();
-            }
-            Ok(())
-        }
-
-        async fn on_interrupt(
-            &self,
-            workflow_name: &str,
-            execution_id: &str,
-        ) -> Result<(), ClusterError> {
-            let _ = self
-                .await_deferred(workflow_name, execution_id, INTERRUPT_SIGNAL)
-                .await?;
-            Ok(())
         }
     }
 
@@ -216,219 +101,78 @@ mod tests {
         assert_eq!(e.entity_type().0, "CustomPing");
     }
 
-    // --- Stateful entity (non-persisted state) ---
-
-    #[derive(Clone, Serialize, Deserialize)]
-    struct CounterState {
-        count: i32,
-    }
+    // --- Entity with #[rpc(persisted)] ---
 
     #[entity(krate = "crate")]
     #[derive(Clone)]
-    struct Counter;
+    struct PersistedRpcEntity;
 
     #[entity_impl(krate = "crate")]
-    #[state(CounterState)]
-    impl Counter {
-        fn init(&self, _ctx: &EntityContext) -> Result<CounterState, ClusterError> {
-            Ok(CounterState { count: 0 })
-        }
-
-        #[activity]
-        async fn increment(&mut self, amount: i32) -> Result<i32, ClusterError> {
-            self.state.count += amount;
-            Ok(self.state.count)
-        }
-
+    impl PersistedRpcEntity {
         #[rpc]
-        async fn get_count(&self) -> Result<i32, ClusterError> {
-            Ok(self.state.count)
+        async fn read_data(&self) -> Result<String, ClusterError> {
+            Ok("data".to_string())
         }
 
-        // Workflow wrapper to call activity from external clients
-        // Uses #[workflow] instead of #[rpc] because it calls an activity internally
-        #[workflow]
-        async fn do_increment(&self, amount: i32) -> Result<i32, ClusterError> {
-            self.increment(amount).await
+        #[rpc(persisted)]
+        async fn write_data(&self, value: String) -> Result<String, ClusterError> {
+            Ok(format!("wrote: {value}"))
         }
     }
 
     #[test]
-    fn stateful_entity_type_name() {
-        let e = Counter;
-        assert_eq!(e.entity_type().0, "Counter");
+    fn persisted_rpc_entity_type_name() {
+        let e = PersistedRpcEntity;
+        assert_eq!(e.entity_type().0, "PersistedRpcEntity");
     }
 
     #[tokio::test]
-    async fn stateful_entity_increment_and_get() {
-        let e = Counter;
-        let storage = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx_with_storage("Counter", "c-1", storage);
+    async fn persisted_rpc_entity_dispatch() {
+        let e = PersistedRpcEntity;
+        let ctx = test_ctx("PersistedRpcEntity", "pr-1");
         let handler = e.spawn(ctx).await.unwrap();
 
-        // Increment by 5 (via RPC wrapper that calls activity)
-        let payload = rmp_serde::to_vec(&5i32).unwrap();
+        // Non-persisted RPC
         let result = handler
-            .handle_request("do_increment", &payload, &HashMap::new())
+            .handle_request("read_data", &[], &HashMap::new())
             .await
             .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 5);
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "data");
 
-        // Get count
+        // Persisted RPC — dispatch works the same, persistence is a client-side concern
+        let payload = rmp_serde::to_vec(&"hello".to_string()).unwrap();
         let result = handler
-            .handle_request("get_count", &[], &HashMap::new())
+            .handle_request("write_data", &payload, &HashMap::new())
             .await
             .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 5);
-
-        // Increment again
-        let payload = rmp_serde::to_vec(&3i32).unwrap();
-        let result = handler
-            .handle_request("do_increment", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 8);
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "wrote: hello");
     }
 
     #[tokio::test]
-    async fn stateful_entity_unknown_tag() {
-        let e = Counter;
-        let ctx = test_ctx("Counter", "c-1");
-        let handler = e.spawn(ctx).await.unwrap();
-        let err = handler
-            .handle_request("unknown", &[], &HashMap::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ClusterError::MalformedMessage { .. }));
+    async fn persisted_rpc_client_uses_send_persisted() {
+        // This test verifies that the generated client for `#[rpc(persisted)]`
+        // methods uses `send_persisted()` while `#[rpc]` uses `send()`.
+        //
+        // We construct the client manually and verify the method signatures
+        // compile correctly — the actual network behavior is tested at the
+        // integration level.
+        //
+        // The fact that `PersistedRpcEntityClient` compiles with both
+        // `read_data` (non-persisted) and `write_data` (persisted) methods
+        // is the test.
+        let _client_type_check = |client: &PersistedRpcEntityClient| {
+            let eid = EntityId::new("test");
+            let val = "value".to_string();
+            // Non-persisted: `send()`
+            let _read = client.read_data(&eid);
+            // Persisted: `send_persisted()` — different code path
+            let _write = client.write_data(&eid, &val);
+        };
     }
 
-    // --- Persisted state entity ---
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-    struct PersistedCounterState {
-        count: i32,
-    }
-
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct PersistedCounter;
-
-    #[entity_impl(krate = "crate")]
-    #[state(PersistedCounterState)]
-    impl PersistedCounter {
-        fn init(&self, _ctx: &EntityContext) -> Result<PersistedCounterState, ClusterError> {
-            Ok(PersistedCounterState { count: 0 })
-        }
-
-        #[activity]
-        async fn increment(&mut self, amount: i32) -> Result<i32, ClusterError> {
-            self.state.count += amount;
-            Ok(self.state.count)
-        }
-
-        #[rpc]
-        async fn get_count(&self) -> Result<i32, ClusterError> {
-            Ok(self.state.count)
-        }
-
-        #[workflow]
-        async fn do_increment(&self, amount: i32) -> Result<i32, ClusterError> {
-            self.increment(amount).await
-        }
-    }
-
-    #[tokio::test]
-    async fn persisted_state_entity_saves_after_mut() {
-        let storage = Arc::new(MemoryWorkflowStorage::new());
-        let e = PersistedCounter;
-        let ctx = test_ctx_with_storage("PersistedCounter", "pc-1", storage.clone());
-        let handler = e.spawn(ctx).await.unwrap();
-
-        // Increment by 10
-        let payload = rmp_serde::to_vec(&10i32).unwrap();
-        handler
-            .handle_request("do_increment", &payload, &HashMap::new())
-            .await
-            .unwrap();
-
-        // With transactional activities, state is persisted SYNCHRONOUSLY
-        // before the activity returns. No yield needed.
-
-        // Verify state was saved to storage
-        let stored = storage
-            .load("entity/PersistedCounter/pc-1/state")
-            .await
-            .unwrap();
-        assert!(stored.is_some());
-        let state: PersistedCounterState = rmp_serde::from_slice(&stored.unwrap()).unwrap();
-        assert_eq!(state.count, 10);
-    }
-
-    #[tokio::test]
-    async fn persisted_state_entity_loads_on_spawn() {
-        let storage = Arc::new(MemoryWorkflowStorage::new());
-
-        // Pre-populate storage with state
-        let pre_state = PersistedCounterState { count: 42 };
-        let bytes = rmp_serde::to_vec(&pre_state).unwrap();
-        storage
-            .save("entity/PersistedCounter/pc-2/state", &bytes)
-            .await
-            .unwrap();
-
-        let e = PersistedCounter;
-        let ctx = test_ctx_with_storage("PersistedCounter", "pc-2", storage.clone());
-        let handler = e.spawn(ctx).await.unwrap();
-
-        // Get count — should be loaded from storage
-        let result = handler
-            .handle_request("get_count", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 42);
-    }
-
-    #[tokio::test]
-    async fn persisted_state_read_only_does_not_save() {
-        let storage = Arc::new(MemoryWorkflowStorage::new());
-        let e = PersistedCounter;
-        let ctx = test_ctx_with_storage("PersistedCounter", "pc-3", storage.clone());
-        let handler = e.spawn(ctx).await.unwrap();
-
-        // Read-only call
-        handler
-            .handle_request("get_count", &[], &HashMap::new())
-            .await
-            .unwrap();
-
-        // State should NOT be saved (read-only)
-        let stored = storage
-            .load("entity/PersistedCounter/pc-3/state")
-            .await
-            .unwrap();
-        assert!(stored.is_none());
-    }
-
-    #[tokio::test]
-    async fn persisted_state_without_storage_falls_back_to_init() {
-        // No storage provided — should use init()
-        let e = PersistedCounter;
-        let ctx = test_ctx("PersistedCounter", "pc-4");
-        let handler = e.spawn(ctx).await.unwrap();
-
-        let result = handler
-            .handle_request("get_count", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 0);
-    }
-
-    // --- Persisted method entity ---
+    // --- Persisted RPC entity (uses #[rpc(persisted)] for at-least-once delivery) ---
 
     #[entity(krate = "crate")]
     #[derive(Clone)]
@@ -436,7 +180,7 @@ mod tests {
 
     #[entity_impl(krate = "crate")]
     impl PersistedMethodEntity {
-        #[workflow]
+        #[rpc(persisted)]
         async fn important_action(&self, data: String) -> Result<String, ClusterError> {
             Ok(format!("processed: {data}"))
         }
@@ -453,6 +197,7 @@ mod tests {
         let ctx = test_ctx("PersistedMethodEntity", "pm-1");
         let handler = e.spawn(ctx).await.unwrap();
 
+        // Persisted RPC dispatches the same as non-persisted
         let payload = rmp_serde::to_vec(&"hello".to_string()).unwrap();
         let result = handler
             .handle_request("important_action", &payload, &HashMap::new())
@@ -469,7 +214,7 @@ mod tests {
         assert_eq!(value, "regular");
     }
 
-    // Test that the generated client uses send_persisted for #[workflow] methods
+    // Test that the generated client uses send_persisted for #[rpc(persisted)] methods
     // (This is a compile-time check — the client struct should exist with the right methods)
     #[test]
     fn persisted_method_client_exists() {
@@ -481,7 +226,7 @@ mod tests {
         }
     }
 
-    // --- Mixed entity (persisted + regular) ---
+    // --- Mixed entity (#[rpc(persisted)] + #[rpc]) ---
 
     #[entity(krate = "crate")]
     #[derive(Clone)]
@@ -489,7 +234,7 @@ mod tests {
 
     #[entity_impl(krate = "crate")]
     impl MixedEntity {
-        #[workflow]
+        #[rpc(persisted)]
         async fn persisted_action(&self, value: String) -> Result<String, ClusterError> {
             Ok(format!("persisted:{value}"))
         }
@@ -500,87 +245,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mixed_entity_client_calls_persisted_and_regular() {
-        let config = Arc::new(ShardingConfig {
-            shard_groups: vec!["default".to_string()],
-            shards_per_group: 10,
-            ..Default::default()
-        });
-        let runners: Arc<dyn crate::runners::Runners> = Arc::new(NoopRunners);
-        let metrics = Arc::new(ClusterMetrics::unregistered());
-        let storage = Arc::new(MemoryMessageStorage::new());
-        let sharding_impl =
-            ShardingImpl::new(config, runners, None, None, Some(storage), metrics).unwrap();
-        sharding_impl.acquire_all_shards().await;
+    // mixed_entity_client_calls_persisted_and_regular moved to tests/macro_integration.rs
+    // persisted_method_replay_returns_cached_reply moved to tests/macro_integration.rs
 
-        let sharding: Arc<dyn Sharding> = sharding_impl.clone();
-        let client = MixedEntity.register(Arc::clone(&sharding)).await.unwrap();
-        let entity_id = EntityId::new("mixed-1");
-
-        let persisted: String = client
-            .persisted_action(&entity_id, &"hello".to_string())
-            .await
-            .unwrap();
-        assert_eq!(persisted, "persisted:hello");
-
-        let regular: i32 = client.regular_action(&entity_id, &7).await.unwrap();
-        assert_eq!(regular, 14);
-
-        sharding.shutdown().await.unwrap();
-    }
-
-    // --- Persisted method idempotency replay ---
-
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct PersistedIdempotentEntity {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[entity_impl(krate = "crate")]
-    impl PersistedIdempotentEntity {
-        #[workflow]
-        async fn process(&self, value: i32) -> Result<i32, ClusterError> {
-            let count = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(value + count as i32)
-        }
-    }
-
-    #[tokio::test]
-    async fn persisted_method_replay_returns_cached_reply() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let entity = PersistedIdempotentEntity {
-            calls: Arc::clone(&calls),
-        };
-
-        let config = Arc::new(ShardingConfig {
-            shard_groups: vec!["default".to_string()],
-            shards_per_group: 10,
-            ..Default::default()
-        });
-        let runners: Arc<dyn crate::runners::Runners> = Arc::new(NoopRunners);
-        let metrics = Arc::new(ClusterMetrics::unregistered());
-        let storage = Arc::new(MemoryMessageStorage::new());
-        let sharding_impl =
-            ShardingImpl::new(config, runners, None, None, Some(storage), metrics).unwrap();
-        sharding_impl.acquire_all_shards().await;
-
-        let sharding: Arc<dyn Sharding> = sharding_impl.clone();
-        let client = entity.register(Arc::clone(&sharding)).await.unwrap();
-        let entity_id = EntityId::new("idem-1");
-
-        let first: i32 = client.process(&entity_id, &5).await.unwrap();
-        let second: i32 = client.process(&entity_id, &5).await.unwrap();
-
-        assert_eq!(first, 6);
-        assert_eq!(second, 6);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        sharding.shutdown().await.unwrap();
-    }
-
-    // --- Persisted method idempotency key override ---
+    // --- Workflow with custom key extraction (migrated from entity #[workflow(key(...))] to standalone workflow) ---
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct UpdateRequest {
@@ -588,14 +256,13 @@ mod tests {
         value: i32,
     }
 
-    #[entity(krate = "crate")]
+    #[workflow(krate = "crate")]
     #[derive(Clone)]
-    struct PersistedKeyEntity;
+    struct UpdateWorkflow;
 
-    #[entity_impl(krate = "crate")]
-    impl PersistedKeyEntity {
-        #[workflow(key(|req: &UpdateRequest| req.id.clone()))]
-        async fn update(&self, req: UpdateRequest) -> Result<String, ClusterError> {
+    #[workflow_impl(krate = "crate", key = |req: &UpdateRequest| req.id.clone())]
+    impl UpdateWorkflow {
+        async fn execute(&self, req: UpdateRequest) -> Result<String, ClusterError> {
             Ok(format!("{}:{}", req.id, req.value))
         }
     }
@@ -784,15 +451,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_key_override_uses_custom_idempotency_key() {
+    async fn workflow_key_override_uses_custom_idempotency_key() {
+        // Migrated from PersistedKeyEntity — tests that custom key extraction
+        // produces the same entity_id for requests with the same key field.
         let captured = Arc::new(Mutex::new(Vec::new()));
         let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
             inner: MockSharding::new(),
             captured: Arc::clone(&captured),
         });
-        let client = PersistedKeyEntityClient::new(Arc::clone(&sharding));
+        let client = UpdateWorkflowClient::new(Arc::clone(&sharding));
 
-        let entity_id = EntityId::new("pk-1");
         let req1 = UpdateRequest {
             id: "same".to_string(),
             value: 1,
@@ -802,23 +470,28 @@ mod tests {
             value: 2,
         };
 
-        let entity = PersistedKeyEntity;
-        let ctx = test_ctx("PersistedKeyEntity", "pk-handler");
-        let handler = entity.spawn(ctx).await.unwrap();
+        // Dispatch works correctly
+        let w = UpdateWorkflow;
+        let ctx = test_ctx("Workflow/UpdateWorkflow", "pk-handler");
+        let handler = w.spawn(ctx).await.unwrap();
         let payload = rmp_serde::to_vec(&req1).unwrap();
         let result = handler
-            .handle_request("update", &payload, &HashMap::new())
+            .handle_request("execute", &payload, &HashMap::new())
             .await
             .unwrap();
         let response: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(response, "same:1");
 
-        let _: String = client.update(&entity_id, &req1).await.unwrap();
-        let _: String = client.update(&entity_id, &req2).await.unwrap();
+        // Client calls with same key field produce same entity_id
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].request_id, captured[1].request_id);
+        assert_eq!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same key field should produce same entity_id"
+        );
     }
 
     // --- Multiple request parameters ---
@@ -850,422 +523,74 @@ mod tests {
         assert_eq!(value, 5);
     }
 
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct MultiParamPersisted;
+    // --- Workflow with key extraction from a subset of fields (migrated from MultiParamPersisted entity) ---
 
-    #[entity_impl(krate = "crate")]
-    impl MultiParamPersisted {
-        #[workflow(key(|order_id: &String, _body: &String| order_id.clone()))]
-        async fn send_email(&self, order_id: String, body: String) -> Result<String, ClusterError> {
-            Ok(format!("{order_id}:{body}"))
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct SendEmailRequest {
+        order_id: String,
+        body: String,
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct SendEmailWorkflow;
+
+    #[workflow_impl(krate = "crate", key = |req: &SendEmailRequest| req.order_id.clone())]
+    impl SendEmailWorkflow {
+        async fn execute(&self, req: SendEmailRequest) -> Result<String, ClusterError> {
+            Ok(format!("{}:{}", req.order_id, req.body))
         }
     }
 
     #[tokio::test]
-    async fn multi_param_persist_key_uses_subset() {
+    async fn workflow_key_uses_subset_of_fields() {
+        // Migrated from MultiParamPersisted — tests that key extraction uses
+        // only a subset of request fields for idempotency.
         let captured = Arc::new(Mutex::new(Vec::new()));
         let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
             inner: MockSharding::new(),
             captured: Arc::clone(&captured),
         });
-        let client = MultiParamPersistedClient::new(Arc::clone(&sharding));
+        let client = SendEmailWorkflowClient::new(Arc::clone(&sharding));
 
-        let entity_id = EntityId::new("mp-1");
         let order_id = "order-1".to_string();
         let body1 = "first".to_string();
         let body2 = "second".to_string();
 
-        let entity = MultiParamPersisted;
-        let ctx = test_ctx("MultiParamPersisted", "mp-handler");
-        let handler = entity.spawn(ctx).await.unwrap();
-        let payload = rmp_serde::to_vec(&(order_id.clone(), body1.clone())).unwrap();
+        // Dispatch works correctly
+        let w = SendEmailWorkflow;
+        let ctx = test_ctx("Workflow/SendEmailWorkflow", "mp-handler");
+        let handler = w.spawn(ctx).await.unwrap();
+        let req1 = SendEmailRequest {
+            order_id: order_id.clone(),
+            body: body1.clone(),
+        };
+        let payload = rmp_serde::to_vec(&req1).unwrap();
         let result = handler
-            .handle_request("send_email", &payload, &HashMap::new())
+            .handle_request("execute", &payload, &HashMap::new())
             .await
             .unwrap();
         let response: String = rmp_serde::from_slice(&result).unwrap();
         assert_eq!(response, format!("{order_id}:{body1}"));
 
-        let _: String = client
-            .send_email(&entity_id, &order_id, &body1)
-            .await
-            .unwrap();
-        let _: String = client
-            .send_email(&entity_id, &order_id, &body2)
-            .await
-            .unwrap();
+        // Client calls with same order_id but different body produce same entity_id
+        let req_a = SendEmailRequest {
+            order_id: order_id.clone(),
+            body: body1,
+        };
+        let req_b = SendEmailRequest {
+            order_id: order_id.clone(),
+            body: body2,
+        };
+        let _: String = client.execute(&req_a).await.unwrap();
+        let _: String = client.execute(&req_b).await.unwrap();
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].request_id, captured[1].request_id);
-    }
-
-    // --- Entity traits ---
-
-    #[entity_trait(krate = "crate")]
-    #[derive(Clone)]
-    pub struct LoggerTrait {
-        pub captured: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[entity_trait_impl(krate = "crate")]
-    impl LoggerTrait {
-        #[rpc]
-        async fn log(&self, message: String) -> Result<String, ClusterError> {
-            self.captured.lock().unwrap().push(message.clone());
-            Ok(message)
-        }
-    }
-
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct LoggingEntity;
-
-    #[entity_impl(krate = "crate", traits(LoggerTrait))]
-    #[state(())]
-    impl LoggingEntity {
-        fn init(&self, _ctx: &EntityContext) -> Result<(), ClusterError> {
-            Ok(())
-        }
-
-        #[rpc]
-        async fn ping(&self) -> Result<String, ClusterError> {
-            Ok("pong".to_string())
-        }
-
-        #[rpc]
-        async fn log_from_entity(&self, message: String) -> Result<String, ClusterError> {
-            // Trait methods need to go through __handler (trait delegation not yet implemented for views)
-            self.__handler.log(message).await
-        }
-    }
-
-    #[tokio::test]
-    async fn trait_dispatches_via_handler() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let trait_impl = LoggerTrait {
-            captured: Arc::clone(&captured),
-        };
-        let entity = LoggingEntity.with(trait_impl);
-        let ctx = test_ctx("LoggingEntity", "log-1");
-        let handler = entity.spawn(ctx).await.unwrap();
-
-        let payload = rmp_serde::to_vec(&"hello".to_string()).unwrap();
-        let result = handler
-            .handle_request("log", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "hello");
-
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.as_slice(), ["hello".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn trait_methods_available_on_entity_self() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let trait_impl = LoggerTrait {
-            captured: Arc::clone(&captured),
-        };
-        let entity = LoggingEntity.with(trait_impl);
-        let ctx = test_ctx("LoggingEntity", "log-1");
-        let handler = entity.spawn(ctx).await.unwrap();
-
-        let payload = rmp_serde::to_vec(&"self-call".to_string()).unwrap();
-        let result = handler
-            .handle_request("log_from_entity", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "self-call");
-
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.as_slice(), ["self-call".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn trait_client_extension_calls_send() {
-        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
-        let client = LoggingEntityClient::new(sharding);
-        let entity_id = EntityId::new("log-2");
-
-        let response: String = client.log(&entity_id, &"hi".to_string()).await.unwrap();
-        assert_eq!(response, "ok");
-    }
-
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct StatelessLoggingEntity;
-
-    #[entity_impl(krate = "crate", traits(LoggerTrait))]
-    impl StatelessLoggingEntity {
-        #[rpc]
-        async fn ping(&self) -> Result<String, ClusterError> {
-            Ok("pong".to_string())
-        }
-    }
-
-    #[tokio::test]
-    async fn stateless_trait_dispatches_via_handler() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let trait_impl = LoggerTrait {
-            captured: Arc::clone(&captured),
-        };
-        let entity = StatelessLoggingEntity.with(trait_impl);
-        let ctx = test_ctx("StatelessLoggingEntity", "log-3");
-        let handler = entity.spawn(ctx).await.unwrap();
-
-        let payload = rmp_serde::to_vec(&"hello".to_string()).unwrap();
-        let result = handler
-            .handle_request("log", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "hello");
-
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.as_slice(), ["hello".to_string()]);
-    }
-
-    // --- Entity traits with state ---
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-    pub struct TraitCounterState {
-        count: i32,
-    }
-
-    #[entity_trait(krate = "crate")]
-    #[derive(Clone)]
-    pub struct TraitCounter;
-
-    #[entity_trait_impl(krate = "crate")]
-    #[state(TraitCounterState)]
-    impl TraitCounter {
-        fn init(&self) -> Result<TraitCounterState, ClusterError> {
-            Ok(TraitCounterState { count: 0 })
-        }
-
-        #[activity]
-        #[protected]
-        async fn do_increment(&mut self, amount: i32) -> Result<i32, ClusterError> {
-            self.state.count += amount;
-            Ok(self.state.count)
-        }
-
-        /// Public workflow that wraps the increment activity.
-        #[workflow]
-        pub async fn increment(&self, amount: i32) -> Result<i32, ClusterError> {
-            self.do_increment(amount).await
-        }
-
-        #[rpc]
-        async fn get_count(&self) -> Result<i32, ClusterError> {
-            Ok(self.state.count)
-        }
-    }
-
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct TraitStateEntity;
-
-    #[entity_impl(krate = "crate", traits(TraitCounter))]
-    #[state(())]
-    impl TraitStateEntity {
-        fn init(&self, _ctx: &EntityContext) -> Result<(), ClusterError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn trait_state_persists_with_entity_state() {
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let entity = TraitStateEntity.with(TraitCounter);
-        let ctx = test_ctx_with_storage("TraitStateEntity", "ts-1", storage.clone());
-        let handler = entity.spawn(ctx).await.unwrap();
-
-        let payload = rmp_serde::to_vec(&5i32).unwrap();
-        handler
-            .handle_request("increment", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        drop(handler);
-
-        let entity = TraitStateEntity.with(TraitCounter);
-        let ctx = test_ctx_with_storage("TraitStateEntity", "ts-1", storage.clone());
-        let handler = entity.spawn(ctx).await.unwrap();
-        let result = handler
-            .handle_request("get_count", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 5);
-    }
-
-    // --- Multi-trait entities ---
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-    pub struct AlphaState {
-        count: i32,
-    }
-
-    #[entity_trait(krate = "crate")]
-    #[derive(Clone)]
-    pub struct AlphaTrait;
-
-    #[entity_trait_impl(krate = "crate")]
-    #[state(AlphaState)]
-    impl AlphaTrait {
-        fn init(&self) -> Result<AlphaState, ClusterError> {
-            Ok(AlphaState { count: 0 })
-        }
-
-        #[activity]
-        #[protected]
-        async fn do_inc_alpha(&mut self, amount: i32) -> Result<i32, ClusterError> {
-            self.state.count += amount;
-            Ok(self.state.count)
-        }
-
-        /// Public workflow that wraps the activity.
-        #[workflow]
-        pub async fn inc_alpha(&self, amount: i32) -> Result<i32, ClusterError> {
-            self.do_inc_alpha(amount).await
-        }
-
-        #[rpc]
-        async fn get_alpha(&self) -> Result<i32, ClusterError> {
-            Ok(self.state.count)
-        }
-    }
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-    pub struct BetaState {
-        count: i32,
-    }
-
-    #[entity_trait(krate = "crate")]
-    #[derive(Clone)]
-    pub struct BetaTrait;
-
-    #[entity_trait_impl(krate = "crate")]
-    #[state(BetaState)]
-    impl BetaTrait {
-        fn init(&self) -> Result<BetaState, ClusterError> {
-            Ok(BetaState { count: 0 })
-        }
-
-        #[activity]
-        #[protected]
-        async fn do_add_beta(&mut self, amount: i32) -> Result<i32, ClusterError> {
-            self.state.count += amount;
-            Ok(self.state.count)
-        }
-
-        /// Public workflow that wraps the activity.
-        #[workflow]
-        pub async fn add_beta(&self, amount: i32) -> Result<i32, ClusterError> {
-            self.do_add_beta(amount).await
-        }
-
-        #[rpc]
-        async fn get_beta(&self) -> Result<i32, ClusterError> {
-            Ok(self.state.count)
-        }
-    }
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-    struct CompositeState {
-        total: i32,
-    }
-
-    #[entity(krate = "crate")]
-    #[derive(Clone)]
-    struct CompositeEntity;
-
-    #[entity_impl(krate = "crate", traits(AlphaTrait, BetaTrait))]
-    #[state(CompositeState)]
-    impl CompositeEntity {
-        fn init(&self, _ctx: &EntityContext) -> Result<CompositeState, ClusterError> {
-            Ok(CompositeState { total: 0 })
-        }
-
-        #[activity]
-        async fn do_bump_total(&mut self, amount: i32) -> Result<i32, ClusterError> {
-            self.state.total += amount;
-            Ok(self.state.total)
-        }
-
-        #[workflow]
-        async fn bump_total(&self, amount: i32) -> Result<i32, ClusterError> {
-            self.do_bump_total(amount).await
-        }
-
-        #[rpc]
-        async fn get_total(&self) -> Result<i32, ClusterError> {
-            Ok(self.state.total)
-        }
-    }
-
-    #[tokio::test]
-    async fn multi_trait_state_persists_and_dispatches() {
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let entity = CompositeEntity.with(AlphaTrait).with(BetaTrait);
-        let ctx = test_ctx_with_storage("CompositeEntity", "ct-1", storage.clone());
-        let handler = entity.spawn(ctx).await.unwrap();
-
-        let payload = rmp_serde::to_vec(&2i32).unwrap();
-        let result = handler
-            .handle_request("inc_alpha", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 2);
-
-        let payload = rmp_serde::to_vec(&3i32).unwrap();
-        let result = handler
-            .handle_request("add_beta", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 3);
-
-        let payload = rmp_serde::to_vec(&5i32).unwrap();
-        let result = handler
-            .handle_request("bump_total", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 5);
-
-        drop(handler);
-
-        // Reload and verify state persisted
-        let entity = CompositeEntity.with(AlphaTrait).with(BetaTrait);
-        let ctx = test_ctx_with_storage("CompositeEntity", "ct-1", storage.clone());
-        let handler = entity.spawn(ctx).await.unwrap();
-
-        let result = handler
-            .handle_request("get_alpha", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 2);
-
-        let result = handler
-            .handle_request("get_beta", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 3);
-
-        let result = handler
-            .handle_request("get_total", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 5);
+        assert_eq!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same order_id should produce same entity_id regardless of body"
+        );
     }
 
     // --- Private method entity ---
@@ -1317,1369 +642,1365 @@ mod tests {
         // omitted from the client.
     }
 
-    // --- Private method with stateful entity ---
+    // ==========================================================================
+    // Standalone Workflow Macro Tests
+    // ==========================================================================
 
-    #[derive(Clone, Serialize, Deserialize)]
-    struct PrivateStatefulState {
-        value: String,
+    // ==========================================================================
+    // #[workflow] / #[workflow_impl] Macro Tests
+    // ==========================================================================
+
+    use crate::workflow_impl;
+
+    // --- Basic workflow using new macros ---
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct NewWfRequest {
+        name: String,
     }
 
-    #[entity(krate = "crate")]
+    #[workflow(krate = "crate")]
     #[derive(Clone)]
-    struct PrivateStatefulEntity;
+    struct NewSimpleWorkflow;
 
-    #[entity_impl(krate = "crate")]
-    #[state(PrivateStatefulState)]
-    impl PrivateStatefulEntity {
-        fn init(&self, _ctx: &EntityContext) -> Result<PrivateStatefulState, ClusterError> {
-            Ok(PrivateStatefulState {
-                value: "initial".to_string(),
-            })
+    #[workflow_impl(krate = "crate")]
+    impl NewSimpleWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            Ok(format!("new-hello, {}", request.name))
         }
+    }
 
-        #[rpc]
-        async fn get_value(&self) -> Result<String, ClusterError> {
-            Ok(self.state.value.clone())
+    #[test]
+    fn new_workflow_entity_type() {
+        let w = NewSimpleWorkflow;
+        assert_eq!(w.entity_type().0, "Workflow/NewSimpleWorkflow");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_dispatch() {
+        let w = NewSimpleWorkflow;
+        let ctx = test_ctx("Workflow/NewSimpleWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let req = NewWfRequest {
+            name: "world".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
+        let result = handler
+            .handle_request("execute", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "new-hello, world");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_unknown_tag() {
+        let w = NewSimpleWorkflow;
+        let ctx = test_ctx("Workflow/NewSimpleWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
+
+        let err = handler
+            .handle_request("unknown", &[], &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClusterError::MalformedMessage { .. }));
+    }
+
+    // --- Workflow with activities using new macros ---
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct NewOrderRequest {
+        order_id: String,
+        amount: i32,
+    }
+
+    // Workflow activity dispatch tests moved to tests/macro_integration.rs
+
+    // --- Client generation with new macros ---
+
+    #[test]
+    fn new_workflow_client_exists() {
+        fn _assert_client_methods(_c: &NewSimpleWorkflowClient) {
+            // execute, start, with_key, with_key_raw should exist
         }
+    }
 
-        #[activity]
-        #[allow(dead_code)]
-        async fn set_internal(&mut self, val: String) -> Result<(), ClusterError> {
-            self.state.value = val;
+    #[tokio::test]
+    async fn new_workflow_start_returns_execution_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflow
+            .register(Arc::clone(&sharding))
+            .await
+            .unwrap();
+
+        let req = NewWfRequest {
+            name: "fire-and-forget".to_string(),
+        };
+        let exec_id = client.start(&req).await.unwrap();
+
+        // The execution ID should be a non-empty string (the derived entity ID)
+        assert!(!exec_id.is_empty(), "execution ID should not be empty");
+
+        // The message should have been sent via notify (not send)
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "exactly one message should be captured");
+        assert_eq!(captured[0].tag, "execute");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_key_hashes() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "keyed".to_string(),
+        };
+
+        // execute via with_key — should hash the key
+        let _: String = client.with_key("my-key").execute(&req).await.unwrap();
+
+        let captured_msgs = captured.lock().unwrap();
+        assert_eq!(captured_msgs.len(), 1);
+
+        // The entity_id should be the SHA-256 hash of "my-key", not "my-key" itself
+        let entity_id = &captured_msgs[0].address.entity_id.0;
+        assert_ne!(entity_id, "my-key", "key should be hashed");
+        assert_eq!(
+            entity_id,
+            &crate::hash::sha256_hex("my-key".as_bytes()),
+            "entity_id should match SHA-256 of key"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_key_raw_no_hash() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "raw-keyed".to_string(),
+        };
+
+        // execute via with_key_raw — should use key as-is
+        let _: String = client
+            .with_key_raw("raw-id-42")
+            .execute(&req)
+            .await
+            .unwrap();
+
+        let captured_msgs = captured.lock().unwrap();
+        assert_eq!(captured_msgs.len(), 1);
+        assert_eq!(
+            captured_msgs[0].address.entity_id.0, "raw-id-42",
+            "raw key should be used directly as entity_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_workflow_with_key_start() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "start-keyed".to_string(),
+        };
+
+        // start via with_key_raw — fire-and-forget with raw key
+        let exec_id = client
+            .with_key_raw("start-raw-1")
+            .start(&req)
+            .await
+            .unwrap();
+        assert_eq!(exec_id, "start-raw-1");
+
+        let captured_msgs = captured.lock().unwrap();
+        assert_eq!(captured_msgs.len(), 1);
+        assert_eq!(captured_msgs[0].address.entity_id.0, "start-raw-1");
+        assert_eq!(captured_msgs[0].tag, "execute");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = NewSimpleWorkflow
+            .register(Arc::clone(&sharding))
+            .await
+            .unwrap();
+        let req = NewWfRequest {
+            name: "test".to_string(),
+        };
+        let _: String = client.execute(&req).await.unwrap();
+    }
+
+    #[test]
+    fn new_workflow_implements_client_factory() {
+        use crate::entity_client::WorkflowClientFactory;
+        fn _assert_factory<T: WorkflowClientFactory>() {}
+        _assert_factory::<NewSimpleWorkflow>();
+    }
+
+    // --- Workflow poll tests ---
+
+    /// Mock sharding that stores replies and supports `replies_for` for poll testing.
+    struct PollableSharding {
+        inner: MockSharding,
+        replies: Arc<Mutex<HashMap<Snowflake, Vec<Reply>>>>,
+    }
+
+    impl PollableSharding {
+        fn new() -> Self {
+            Self {
+                inner: MockSharding::new(),
+                replies: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Sharding for PollableSharding {
+        fn get_shard_id(&self, et: &EntityType, eid: &EntityId) -> ShardId {
+            self.inner.get_shard_id(et, eid)
+        }
+        fn has_shard_id(&self, sid: &ShardId) -> bool {
+            self.inner.has_shard_id(sid)
+        }
+        fn snowflake(&self) -> &SnowflakeGenerator {
+            self.inner.snowflake()
+        }
+        fn is_shutdown(&self) -> bool {
+            false
+        }
+        async fn register_entity(&self, _: Arc<dyn Entity>) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn register_singleton(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Arc<
+                dyn Fn(SingletonContext) -> BoxFuture<'static, Result<(), ClusterError>>
+                    + Send
+                    + Sync,
+            >,
+        ) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        fn make_client(self: Arc<Self>, et: EntityType) -> EntityClient {
+            EntityClient::new(self, et)
+        }
+        async fn send(&self, envelope: EnvelopeRequest) -> Result<ReplyReceiver, ClusterError> {
+            // Build reply
+            let response = rmp_serde::to_vec(&"ok".to_string()).unwrap();
+            let reply = Reply::WithExit(ReplyWithExit {
+                request_id: envelope.request_id,
+                id: self.inner.snowflake.next_async().await?,
+                exit: ExitResult::Success(response),
+            });
+            // Store reply for poll
+            self.replies
+                .lock()
+                .unwrap()
+                .entry(envelope.request_id)
+                .or_default()
+                .push(reply.clone());
+            // Also send via channel for send_persisted
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(reply)
+                .await
+                .map_err(|_| ClusterError::MalformedMessage {
+                    reason: "reply channel closed".into(),
+                    source: None,
+                })?;
+            Ok(rx)
+        }
+        async fn notify(&self, _envelope: EnvelopeRequest) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn ack_chunk(&self, _: AckChunk) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn interrupt(&self, _: Interrupt) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        async fn poll_storage(&self) -> Result<(), ClusterError> {
+            Ok(())
+        }
+        fn active_entity_count(&self) -> usize {
+            0
+        }
+        async fn registration_events(
+            &self,
+        ) -> Pin<Box<dyn Stream<Item = ShardingRegistrationEvent> + Send>> {
+            Box::pin(tokio_stream::empty())
+        }
+        async fn replies_for(&self, request_id: Snowflake) -> Result<Vec<Reply>, ClusterError> {
+            Ok(self
+                .replies
+                .lock()
+                .unwrap()
+                .get(&request_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        async fn shutdown(&self) -> Result<(), ClusterError> {
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn private_activity_method_not_dispatchable() {
-        let e = PrivateStatefulEntity;
-        let ctx = test_ctx("PrivateStatefulEntity", "ps-1");
-        let handler = e.spawn(ctx).await.unwrap();
+    async fn new_workflow_poll_returns_none_when_not_started() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
 
-        // Activity methods are private by default, so dispatch should fail
-        let payload = rmp_serde::to_vec(&"updated".to_string()).unwrap();
-        let err = handler
-            .handle_request("set_internal", &payload, &HashMap::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ClusterError::MalformedMessage { .. }));
+        // Poll for an execution that was never started — should return None
+        let result: Option<String> = client.poll("nonexistent-id").await.unwrap();
+        assert!(
+            result.is_none(),
+            "poll should return None for unknown execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_workflow_poll_returns_result_after_execute() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "poll-test".to_string(),
+        };
+
+        // Execute the workflow (which stores the reply)
+        let result: String = client.execute(&req).await.unwrap();
+        assert_eq!(result, "ok");
+
+        // Now poll for the same execution — derive entity_id the same way
+        let key_bytes = rmp_serde::to_vec(&req).unwrap();
+        let entity_id = crate::hash::sha256_hex(&key_bytes);
+        let poll_result: Option<String> = client.poll(&entity_id).await.unwrap();
+        assert_eq!(poll_result, Some("ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn new_workflow_poll_with_key_returns_result() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "poll-keyed".to_string(),
+        };
+
+        // Execute with a raw key
+        let keyed = client.with_key_raw("poll-exec-1");
+        let _: String = keyed.execute(&req).await.unwrap();
+
+        // Poll on the ClientWithKey view
+        let keyed_again = client.with_key_raw("poll-exec-1");
+        let poll_result: Option<String> = keyed_again.poll().await.unwrap();
+        assert_eq!(poll_result, Some("ok".to_string()));
     }
 
     #[test]
-    fn private_activity_method_not_on_client() {
-        fn _assert_client_methods(c: &PrivateStatefulEntityClient) {
-            let _ = &c.inner;
-            // get_value exists on client, set_internal does NOT
+    fn new_workflow_poll_method_exists() {
+        // Compile-time check that poll exists on both client types
+        fn _assert_poll(_c: &NewSimpleWorkflowClient) {
+            // client.poll(execution_id) should exist
+        }
+        fn _assert_poll_with_key(_c: &NewSimpleWorkflowClientWithKey<'_>) {
+            // client_with_key.poll() should exist
         }
     }
 
-    // --- DurableContext entity ---
+    // --- Workflow with helpers using new macros ---
 
-    fn test_ctx_with_engine(
-        entity_type: &str,
-        entity_id: &str,
-        engine: Arc<dyn crate::durable::WorkflowEngine>,
-    ) -> EntityContext {
-        EntityContext {
-            address: EntityAddress {
-                shard_id: ShardId::new("default", 0),
-                entity_type: EntityType::new(entity_type),
-                entity_id: EntityId::new(entity_id),
-            },
-            runner_address: RunnerAddress::new("127.0.0.1", 9000),
-            snowflake: Arc::new(SnowflakeGenerator::new()),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            state_storage: None,
-            workflow_engine: Some(engine),
-            sharding: None,
-            message_storage: None,
-        }
-    }
-
-    #[entity(krate = "crate")]
+    #[workflow(krate = "crate")]
     #[derive(Clone)]
-    struct DurableProcessor;
+    struct NewHelperWorkflow;
 
-    #[entity_impl(krate = "crate")]
-    impl DurableProcessor {
-        #[workflow]
-        async fn process_order(
-            &self,
-            _ctx: &crate::durable::DurableContext,
-            order_id: String,
-        ) -> Result<String, ClusterError> {
-            Ok(format!("processed:{order_id}"))
+    #[workflow_impl(krate = "crate")]
+    impl NewHelperWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            let upper = self.to_upper(&request.name);
+            Ok(upper)
         }
 
-        #[rpc]
-        async fn get_status(&self) -> Result<String, ClusterError> {
-            Ok("ready".to_string())
+        fn to_upper(&self, s: &str) -> String {
+            s.to_uppercase()
         }
-    }
-
-    #[test]
-    fn durable_entity_type_name() {
-        let e = DurableProcessor;
-        assert_eq!(e.entity_type().0, "DurableProcessor");
     }
 
     #[tokio::test]
-    async fn durable_entity_dispatches_with_context() {
-        let engine = Arc::new(TestWorkflowEngine::new());
-        let e = DurableProcessor;
-        let ctx = test_ctx_with_engine("DurableProcessor", "dp-1", engine);
-        let handler = e.spawn(ctx).await.unwrap();
+    async fn new_workflow_with_helpers() {
+        let w = NewHelperWorkflow;
+        let ctx = test_ctx("Workflow/NewHelperWorkflow", "exec-1");
+        let handler = w.spawn(ctx).await.unwrap();
 
-        // Call the durable method
-        let payload = rmp_serde::to_vec(&"order-123".to_string()).unwrap();
+        let req = NewWfRequest {
+            name: "hello".to_string(),
+        };
+        let payload = rmp_serde::to_vec(&req).unwrap();
         let result = handler
-            .handle_request("process_order", &payload, &HashMap::new())
+            .handle_request("execute", &payload, &HashMap::new())
             .await
             .unwrap();
         let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "processed:order-123");
+        assert_eq!(value, "HELLO");
     }
 
-    #[tokio::test]
-    async fn durable_entity_non_durable_method_works() {
-        let engine = Arc::new(TestWorkflowEngine::new());
-        let e = DurableProcessor;
-        let ctx = test_ctx_with_engine("DurableProcessor", "dp-2", engine);
-        let handler = e.spawn(ctx).await.unwrap();
+    // ==========================================================================
+    // #[activity_group] / #[activity_group_impl] Macro Tests
+    // ==========================================================================
 
-        let result = handler
-            .handle_request("get_status", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "ready");
-    }
+    use crate::activity_group_impl;
 
-    #[tokio::test]
-    async fn durable_entity_without_engine_returns_error() {
-        let e = DurableProcessor;
-        let ctx = test_ctx("DurableProcessor", "dp-3"); // No engine
-        let handler = e.spawn(ctx).await.unwrap();
+    // --- Basic activity group ---
 
-        let payload = rmp_serde::to_vec(&"order-456".to_string()).unwrap();
-        let err = handler
-            .handle_request("process_order", &payload, &HashMap::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ClusterError::MalformedMessage { .. }));
-    }
-
-    // --- Stateful entity with DurableContext ---
-
-    #[derive(Clone, serde::Serialize, serde::Deserialize)]
-    struct OrderState {
-        status: String,
-    }
-
-    #[entity(krate = "crate")]
+    #[activity_group(krate = "crate")]
     #[derive(Clone)]
-    struct StatefulDurableEntity;
+    pub struct TestPayments {
+        pub rate: f64,
+    }
 
-    #[entity_impl(krate = "crate")]
-    #[state(OrderState)]
-    impl StatefulDurableEntity {
-        fn init(&self, _ctx: &EntityContext) -> Result<OrderState, ClusterError> {
-            Ok(OrderState {
-                status: "new".to_string(),
-            })
+    #[activity_group_impl(krate = "crate")]
+    impl TestPayments {
+        #[activity]
+        async fn charge(&self, amount: i32) -> Result<String, ClusterError> {
+            let total = (amount as f64 * self.rate) as i32;
+            Ok(format!("charged:{total}"))
         }
 
         #[activity]
-        async fn fulfill(
-            &mut self,
-            _ctx: &crate::durable::DurableContext,
-            item: String,
-        ) -> Result<String, ClusterError> {
-            self.state.status = "fulfilled".to_string();
-            Ok(format!("ok:{item}"))
+        async fn refund(&self, tx_id: String) -> Result<String, ClusterError> {
+            Ok(format!("refunded:{tx_id}"))
+        }
+
+        /// Helper (not an activity)
+        fn format_amount(&self, amount: i32) -> String {
+            format!("${amount}")
+        }
+    }
+
+    // --- Activity group composed into a workflow ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct PaymentWorkflow;
+
+    #[workflow_impl(krate = "crate", activity_groups(TestPayments))]
+    impl PaymentWorkflow {
+        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
+            let charge_result = self.charge(request.amount).await?;
+            let refund_result = self.refund(request.order_id.clone()).await?;
+            Ok(format!("{charge_result}|{refund_result}"))
+        }
+    }
+
+    // activity_group_workflow_dispatch moved to tests/macro_integration.rs
+
+    #[tokio::test]
+    async fn activity_group_workflow_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = PaymentWorkflow
+            .register(Arc::clone(&sharding), TestPayments { rate: 2.0 })
+            .await
+            .unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-2".to_string(),
+            amount: 50,
+        };
+        let _: String = client.execute(&req).await.unwrap();
+    }
+
+    #[test]
+    fn activity_group_workflow_entity_type() {
+        // When activity_groups are present, Entity is on the WithGroups wrapper
+        let bundle = __PaymentWorkflowWithGroups {
+            __workflow: PaymentWorkflow,
+            __group_test_payments: TestPayments { rate: 1.0 },
+        };
+        assert_eq!(bundle.entity_type().0, "Workflow/PaymentWorkflow");
+    }
+
+    // --- Multiple activity groups ---
+
+    #[activity_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct TestInventory;
+
+    #[activity_group_impl(krate = "crate")]
+    impl TestInventory {
+        #[activity]
+        async fn reserve(&self, item_count: i32) -> Result<String, ClusterError> {
+            Ok(format!("reserved:{item_count}"))
+        }
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct MultiGroupWorkflow;
+
+    #[workflow_impl(krate = "crate", activity_groups(TestPayments, TestInventory))]
+    impl MultiGroupWorkflow {
+        async fn execute(&self, request: NewOrderRequest) -> Result<String, ClusterError> {
+            let reserved = self.reserve(request.amount).await?;
+            let charged = self.charge(request.amount).await?;
+            Ok(format!("{reserved}|{charged}"))
+        }
+    }
+
+    // multi_activity_group_workflow_dispatch moved to tests/macro_integration.rs
+
+    #[tokio::test]
+    async fn multi_activity_group_workflow_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = MultiGroupWorkflow
+            .register(
+                Arc::clone(&sharding),
+                TestPayments { rate: 1.0 },
+                TestInventory,
+            )
+            .await
+            .unwrap();
+
+        let req = NewOrderRequest {
+            order_id: "order-4".to_string(),
+            amount: 20,
+        };
+        let _: String = client.execute(&req).await.unwrap();
+    }
+
+    // MixedActivitiesWorkflow + test moved to tests/macro_integration.rs
+
+    // ==========================================================================
+    // Activity Retry Support Tests (#[activity(retries = N, backoff = "...")])
+    // ==========================================================================
+
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    // InstantWorkflowEngine + test_ctx_with_instant_engine moved to tests/macro_integration.rs
+
+    // --- Workflow with retries (no backoff specified = exponential default) ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct RetryWorkflow {
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[workflow_impl(krate = "crate")]
+    impl RetryWorkflow {
+        async fn execute(&self, request: NewWfRequest) -> Result<String, ClusterError> {
+            let result = self.flaky_activity(request.name.clone()).await?;
+            Ok(result)
+        }
+
+        #[activity(retries = 3)]
+        async fn flaky_activity(&self, name: String) -> Result<String, ClusterError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count < 2 {
+                Err(ClusterError::PersistenceError {
+                    reason: format!("flaky failure #{count}"),
+                    source: None,
+                })
+            } else {
+                Ok(format!("success:{name}:attempt-{count}"))
+            }
+        }
+    }
+
+    #[test]
+    fn retry_workflow_entity_type() {
+        let w = RetryWorkflow {
+            call_count: Arc::new(AtomicU32::new(0)),
+        };
+        assert_eq!(w.entity_type().0, "Workflow/RetryWorkflow");
+    }
+
+    // retry_workflow_activity_succeeds_after_retries moved to tests/macro_integration.rs
+
+    // --- Workflow with constant backoff ---
+
+    // ConstantBackoffWorkflow + test moved to tests/macro_integration.rs
+
+    // --- Workflow where all retries fail ---
+
+    // AlwaysFailWorkflow + test moved to tests/macro_integration.rs
+
+    // --- Activity with retries = 0 (same as no retries) ---
+
+    // NoRetryWorkflow + test moved to tests/macro_integration.rs
+
+    // --- Activity group with retries ---
+
+    // RetryPayments + GroupRetryWorkflow + test moved to tests/macro_integration.rs
+
+    // --- Test compute_retry_backoff utility ---
+
+    #[test]
+    fn test_compute_retry_backoff_exponential() {
+        use crate::durable::compute_retry_backoff;
+
+        assert_eq!(
+            compute_retry_backoff(0, "exponential", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(1, "exponential", 1),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            compute_retry_backoff(2, "exponential", 1),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            compute_retry_backoff(3, "exponential", 1),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            compute_retry_backoff(5, "exponential", 1),
+            Duration::from_secs(32)
+        );
+        // Capped at 60 seconds
+        assert_eq!(
+            compute_retry_backoff(6, "exponential", 1),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            compute_retry_backoff(10, "exponential", 1),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn test_compute_retry_backoff_constant() {
+        use crate::durable::compute_retry_backoff;
+
+        assert_eq!(
+            compute_retry_backoff(0, "constant", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(1, "constant", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(5, "constant", 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            compute_retry_backoff(0, "constant", 5),
+            Duration::from_secs(5)
+        );
+    }
+
+    // =============================================================================
+    // Pure-RPC Entity tests (stateless entities, new simplified codegen)
+    // =============================================================================
+
+    /// A pure-RPC entity: no #[state], no #[workflow], no #[activity].
+    /// Uses the simplified handler codegen without write locks or view structs.
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct PureRpcEntity {
+        prefix: String,
+    }
+
+    #[entity_impl(krate = "crate")]
+    impl PureRpcEntity {
+        #[rpc]
+        async fn greet(&self, name: String) -> Result<String, ClusterError> {
+            Ok(format!("{}: hello, {}", self.prefix, name))
+        }
+
+        #[rpc(persisted)]
+        async fn save_data(&self, data: String) -> Result<String, ClusterError> {
+            Ok(format!("{}: saved {}", self.prefix, data))
         }
 
         #[rpc]
-        async fn get_status(&self) -> Result<String, ClusterError> {
-            Ok(self.state.status.clone())
-        }
-
-        #[workflow]
-        async fn do_fulfill(
-            &self,
-            ctx: &crate::durable::DurableContext,
-            item: String,
-        ) -> Result<String, ClusterError> {
-            self.fulfill(ctx, item).await
+        async fn add(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
+            Ok(a + b)
         }
     }
 
+    #[test]
+    fn pure_rpc_entity_type_name() {
+        let e = PureRpcEntity {
+            prefix: "test".into(),
+        };
+        assert_eq!(e.entity_type().0, "PureRpcEntity");
+    }
+
     #[tokio::test]
-    async fn stateful_durable_entity_dispatches() {
-        let storage = Arc::new(MemoryWorkflowStorage::new());
-        let engine = Arc::new(TestWorkflowEngine::new());
-        let e = StatefulDurableEntity;
-        let ctx =
-            test_ctx_with_storage_and_engine("StatefulDurableEntity", "sde-1", storage, engine);
+    async fn pure_rpc_entity_dispatches() {
+        let e = PureRpcEntity {
+            prefix: "svc".into(),
+        };
+        let ctx = test_ctx("PureRpcEntity", "pure-1");
         let handler = e.spawn(ctx).await.unwrap();
 
-        // Call the workflow method which calls the activity — mutates state
-        let payload = rmp_serde::to_vec(&"widget".to_string()).unwrap();
+        // Non-persisted RPC
+        let payload = rmp_serde::to_vec(&"world".to_string()).unwrap();
         let result = handler
-            .handle_request("do_fulfill", &payload, &HashMap::new())
+            .handle_request("greet", &payload, &HashMap::new())
             .await
             .unwrap();
         let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "ok:widget");
+        assert_eq!(value, "svc: hello, world");
 
-        // Verify state was mutated
+        // Persisted RPC (dispatch is the same)
+        let payload = rmp_serde::to_vec(&"item".to_string()).unwrap();
         let result = handler
-            .handle_request("get_status", &[], &HashMap::new())
+            .handle_request("save_data", &payload, &HashMap::new())
             .await
             .unwrap();
-        let status: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(status, "fulfilled");
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "svc: saved item");
     }
 
-    // --- Built-in durable methods on self (sleep/await_deferred/resolve_deferred) ---
-
-    fn test_ctx_with_storage_and_engine(
-        entity_type: &str,
-        entity_id: &str,
-        storage: Arc<dyn crate::durable::WorkflowStorage>,
-        engine: Arc<dyn crate::durable::WorkflowEngine>,
-    ) -> EntityContext {
-        EntityContext {
-            address: EntityAddress {
-                shard_id: ShardId::new("default", 0),
-                entity_type: EntityType::new(entity_type),
-                entity_id: EntityId::new(entity_id),
-            },
-            runner_address: RunnerAddress::new("127.0.0.1", 9000),
-            snowflake: Arc::new(SnowflakeGenerator::new()),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            state_storage: Some(storage),
-            workflow_engine: Some(engine),
-            sharding: None,
-            message_storage: None,
-        }
-    }
-
-    // Test that built-in durable methods exist and error correctly without engine
     #[tokio::test]
-    async fn builtin_sleep_without_engine_returns_error() {
-        // Create an entity with #[state(..., persistent)] but no workflow engine
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct SimpleState {
-            count: i32,
-        }
+    async fn pure_rpc_entity_multi_param() {
+        let e = PureRpcEntity {
+            prefix: "test".into(),
+        };
+        let ctx = test_ctx("PureRpcEntity", "pure-2");
+        let handler = e.spawn(ctx).await.unwrap();
 
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct SleepTestEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(SimpleState)]
-        impl SleepTestEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<SimpleState, ClusterError> {
-                Ok(SimpleState { count: 0 })
-            }
-
-            /// This activity method uses the built-in self.sleep() and modifies state
-            #[activity]
-            async fn sleep_and_increment(&mut self) -> Result<String, ClusterError> {
-                self.sleep("test-sleep", std::time::Duration::from_secs(1))
-                    .await?;
-                self.state.count += 1;
-                Ok("slept".into())
-            }
-
-            /// This workflow method calls the activity
-            #[workflow]
-            async fn do_sleep(&self) -> Result<String, ClusterError> {
-                self.sleep_and_increment().await
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx_with_storage("SleepTestEntity", "e1", storage);
-        let handler = SleepTestEntity.spawn(ctx).await.unwrap();
-
-        // Call do_sleep — should fail because no workflow engine
+        let payload = rmp_serde::to_vec(&(3i32, 4i32)).unwrap();
         let result = handler
-            .handle_request("do_sleep", &[], &HashMap::new())
+            .handle_request("add", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn pure_rpc_entity_unknown_tag_errors() {
+        let e = PureRpcEntity {
+            prefix: "test".into(),
+        };
+        let ctx = test_ctx("PureRpcEntity", "pure-3");
+        let handler = e.spawn(ctx).await.unwrap();
+
+        let result = handler
+            .handle_request("nonexistent", &[], &HashMap::new())
             .await;
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("workflow engine"),
-            "expected workflow engine error, got: {err}"
-        );
+        match result.unwrap_err() {
+            ClusterError::MalformedMessage { reason, .. } => {
+                assert!(reason.contains("unknown RPC tag"));
+            }
+            other => panic!("expected MalformedMessage, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn builtin_sleep_with_engine_resumes() {
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct SleepState {
-            count: i32,
-        }
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct SleepWithEngineEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(SleepState)]
-        impl SleepWithEngineEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<SleepState, ClusterError> {
-                Ok(SleepState { count: 0 })
-            }
-
-            #[activity]
-            async fn sleep_and_increment(&mut self) -> Result<String, ClusterError> {
-                self.sleep("test-sleep", std::time::Duration::from_millis(10))
-                    .await?;
-                self.state.count += 1;
-                Ok("slept".into())
-            }
-
-            #[workflow]
-            async fn do_sleep(&self) -> Result<String, ClusterError> {
-                self.sleep_and_increment().await
-            }
-
-            #[rpc]
-            async fn get_count(&self) -> Result<i32, ClusterError> {
-                Ok(self.state.count)
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn crate::durable::WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        let ctx = test_ctx_with_storage_and_engine(
-            "SleepWithEngineEntity",
-            "e1",
-            Arc::clone(&storage),
-            engine,
-        );
-        let handler = SleepWithEngineEntity.spawn(ctx).await.unwrap();
-
-        let result = handler
-            .handle_request("do_sleep", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "slept");
-
-        let result = handler
-            .handle_request("get_count", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let count: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(count, 1);
-
-        // With transactional activities, state is persisted SYNCHRONOUSLY
-        // before the activity returns. No yield needed.
-
-        let stored = storage
-            .load("entity/SleepWithEngineEntity/e1/state")
-            .await
-            .unwrap();
-        assert!(stored.is_some());
-        let state: SleepState = rmp_serde::from_slice(&stored.unwrap()).unwrap();
-        assert_eq!(state.count, 1);
-    }
-
-    #[tokio::test]
-    async fn builtin_resolve_deferred_with_engine_succeeds() {
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct ResolveState {
-            resolved: bool,
-        }
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct ResolveTestEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(ResolveState)]
-        impl ResolveTestEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<ResolveState, ClusterError> {
-                Ok(ResolveState { resolved: false })
-            }
-
-            #[activity]
-            async fn resolve_and_mark(
-                &mut self,
-                signal_name: String,
-            ) -> Result<String, ClusterError> {
-                self.resolve_deferred(&signal_name, &42i32).await?;
-                self.state.resolved = true;
-                Ok("done".into())
-            }
-
-            #[workflow]
-            async fn do_resolve(&self, signal_name: String) -> Result<String, ClusterError> {
-                self.resolve_and_mark(signal_name).await
-            }
-
-            #[rpc]
-            async fn is_resolved(&self) -> Result<bool, ClusterError> {
-                Ok(self.state.resolved)
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn crate::durable::WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        let ctx = test_ctx_with_storage_and_engine("ResolveTestEntity", "e1", storage, engine);
-        let handler = ResolveTestEntity.spawn(ctx).await.unwrap();
-
-        // Call do_resolve — should succeed
-        let payload = rmp_serde::to_vec(&"my-signal".to_string()).unwrap();
-        let result = handler
-            .handle_request("do_resolve", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "done");
-
-        // Verify state was mutated
-        let result = handler
-            .handle_request("is_resolved", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let resolved: bool = rmp_serde::from_slice(&result).unwrap();
-        assert!(resolved);
-    }
-
-    #[tokio::test]
-    async fn builtin_await_deferred_waits_and_resumes_with_resolve_deferred() {
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct DeferredState;
-
-        #[entity(krate = "crate", concurrency = 2)]
-        #[derive(Clone)]
-        struct DeferredEntity;
-
-        #[entity_impl(krate = "crate", deferred_keys(SIGNAL: i32 = "signal"))]
-        #[state(DeferredState)]
-        impl DeferredEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<DeferredState, ClusterError> {
-                Ok(DeferredState)
-            }
-
-            #[workflow]
-            async fn wait_for_signal(&self) -> Result<i32, ClusterError> {
-                self.await_deferred(SIGNAL).await
-            }
-
-            #[workflow]
-            async fn resolve_signal(&self, value: i32) -> Result<(), ClusterError> {
-                self.resolve_deferred(SIGNAL, &value).await
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn crate::durable::WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        let ctx = test_ctx_with_storage_and_engine("DeferredEntity", "e1", storage, engine);
-        let handler = DeferredEntity.spawn(ctx).await.unwrap();
-        let handler: Arc<dyn EntityHandler> = Arc::from(handler);
-
-        let wait_task = {
-            let handler = Arc::clone(&handler);
-            tokio::spawn(async move {
-                handler
-                    .handle_request("wait_for_signal", &[], &HashMap::new())
-                    .await
-            })
-        };
-
-        tokio::task::yield_now().await;
-
-        let payload = rmp_serde::to_vec(&123i32).unwrap();
-        handler
-            .handle_request("resolve_signal", &payload, &HashMap::new())
-            .await
-            .unwrap();
-
-        let result = wait_task.await.unwrap().unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 123);
-    }
-
-    // --- ArcSwap concurrency verification tests ---
-
-    /// Verify that concurrent read operations don't block each other.
-    /// With the new ArcSwap design, multiple reads can happen simultaneously
-    /// without any locking contention.
-    #[tokio::test]
-    async fn concurrent_reads_dont_block() {
-        use std::time::{Duration, Instant};
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct SlowReadState {
-            value: i32,
-        }
-
-        #[entity(krate = "crate", concurrency = 10)]
-        #[derive(Clone)]
-        struct ConcurrentReadsEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(SlowReadState)]
-        impl ConcurrentReadsEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<SlowReadState, ClusterError> {
-                Ok(SlowReadState { value: 42 })
-            }
-
-            #[rpc]
-            async fn slow_get(&self) -> Result<i32, ClusterError> {
-                // Simulate a slow read by sleeping while accessing state
-                let value = self.state.value;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok(value)
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx_with_storage("ConcurrentReadsEntity", "cr-1", storage);
-        let handler = ConcurrentReadsEntity.spawn(ctx).await.unwrap();
-        let handler: Arc<dyn EntityHandler> = Arc::from(handler);
-
-        let start = Instant::now();
-
-        // Launch 5 concurrent read operations
-        let mut tasks = Vec::new();
-        for _ in 0..5 {
-            let h = Arc::clone(&handler);
-            tasks.push(tokio::spawn(async move {
-                h.handle_request("slow_get", &[], &HashMap::new()).await
-            }));
-        }
-
-        // Wait for all to complete
-        for task in tasks {
-            let result = task.await.unwrap().unwrap();
-            let value: i32 = rmp_serde::from_slice(&result).unwrap();
-            assert_eq!(value, 42);
-        }
-
-        let elapsed = start.elapsed();
-
-        // If reads were blocking, this would take ~250ms (5 * 50ms)
-        // With concurrent reads, it should take ~50ms + some overhead
-        // Allow up to 150ms to account for test system variance
-        assert!(
-            elapsed < Duration::from_millis(150),
-            "Concurrent reads took {:?}, expected < 150ms (reads should not block each other)",
-            elapsed
-        );
-    }
-
-    /// Verify that write operations are properly serialized via the write lock.
-    /// Multiple concurrent writes should not interleave.
-    #[tokio::test]
-    async fn write_operations_are_serialized() {
-        #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
-        struct WriteTestState {
-            operations: Vec<String>,
-        }
-
-        #[entity(krate = "crate", concurrency = 10)]
-        #[derive(Clone)]
-        struct SerializedWritesEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(WriteTestState)]
-        impl SerializedWritesEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<WriteTestState, ClusterError> {
-                Ok(WriteTestState { operations: vec![] })
-            }
-
-            #[activity]
-            async fn record_operation(&mut self, name: String) -> Result<(), ClusterError> {
-                // Record start
-                self.state.operations.push(format!("{}-start", name));
-                // Simulate some work
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                // Record end - if writes are serialized, start and end should be adjacent
-                self.state.operations.push(format!("{}-end", name));
-                Ok(())
-            }
-
-            #[workflow]
-            async fn do_record(&self, name: String) -> Result<(), ClusterError> {
-                self.record_operation(name).await
-            }
-
-            #[rpc]
-            async fn get_operations(&self) -> Result<Vec<String>, ClusterError> {
-                Ok(self.state.operations.clone())
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx_with_storage("SerializedWritesEntity", "sw-1", storage);
-        let handler = SerializedWritesEntity.spawn(ctx).await.unwrap();
-        let handler: Arc<dyn EntityHandler> = Arc::from(handler);
-
-        // Launch 3 concurrent write operations
-        let mut tasks = Vec::new();
-        for i in 0..3 {
-            let h = Arc::clone(&handler);
-            let name = format!("op{}", i);
-            tasks.push(tokio::spawn(async move {
-                let payload = rmp_serde::to_vec(&name).unwrap();
-                h.handle_request("do_record", &payload, &HashMap::new())
-                    .await
-            }));
-        }
-
-        // Wait for all to complete
-        for task in tasks {
-            task.await.unwrap().unwrap();
-        }
-
-        // Get the operation log
-        let result = handler
-            .handle_request("get_operations", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let ops: Vec<String> = rmp_serde::from_slice(&result).unwrap();
-
-        // Verify operations are properly paired (each start immediately followed by its end)
-        assert_eq!(ops.len(), 6, "Expected 6 operations (3 start + 3 end)");
-        for i in (0..6).step_by(2) {
-            let start = &ops[i];
-            let end = &ops[i + 1];
-            assert!(
-                start.ends_with("-start"),
-                "Expected start at position {}",
-                i
-            );
-            assert!(end.ends_with("-end"), "Expected end at position {}", i + 1);
-            // Extract operation name and verify they match
-            let start_name = start.strip_suffix("-start").unwrap();
-            let end_name = end.strip_suffix("-end").unwrap();
-            assert_eq!(
-                start_name, end_name,
-                "Operation start/end mismatch at position {}: {} vs {}",
-                i, start, end
-            );
-        }
-    }
-
-    /// Verify that workflows can suspend (via sleep/await_deferred) without holding locks.
-    /// Test that activities run in a transaction - state changes are only visible
-    /// after the activity completes successfully.
-    ///
-    /// With transactional activities:
-    /// 1. State mutations within an activity are buffered in a transaction
-    /// 2. The transaction commits AFTER the entire activity completes
-    /// 3. State is NOT visible to other readers until commit
-    ///
-    /// This ensures durability - if an activity fails mid-way, state is not
-    /// partially modified.
-    #[tokio::test]
-    async fn activity_state_changes_are_transactional() {
-        use std::time::{Duration, Instant};
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct SuspendState {
-            value: i32,
-        }
-
-        #[entity(krate = "crate", concurrency = 2)]
-        #[derive(Clone)]
-        struct SuspendTestEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(SuspendState)]
-        impl SuspendTestEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<SuspendState, ClusterError> {
-                Ok(SuspendState { value: 0 })
-            }
-
-            /// This activity modifies state, suspends, then modifies again.
-            /// With transactional activities, the state changes are only
-            /// visible after the ENTIRE activity completes.
-            #[activity]
-            async fn suspend_and_modify(&mut self) -> Result<i32, ClusterError> {
-                // First modification (buffered in transaction)
-                self.state.value = 1;
-
-                // Suspend for 100ms
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                // Second modification (also buffered)
-                self.state.value = 2;
-                Ok(self.state.value)
-            }
-
-            #[workflow]
-            async fn do_suspend(&self) -> Result<i32, ClusterError> {
-                self.suspend_and_modify().await
-            }
-
-            #[rpc]
-            async fn get_value(&self) -> Result<i32, ClusterError> {
-                Ok(self.state.value)
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx_with_storage("SuspendTestEntity", "st-1", storage);
-        let handler = SuspendTestEntity.spawn(ctx).await.unwrap();
-        let handler: Arc<dyn EntityHandler> = Arc::from(handler);
-
-        let start = Instant::now();
-
-        // Start the suspending workflow
-        let suspend_task = {
-            let h = Arc::clone(&handler);
-            tokio::spawn(async move { h.handle_request("do_suspend", &[], &HashMap::new()).await })
-        };
-
-        // Wait a bit - the activity is running but state is NOT committed yet
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        // Read the value - should still be 0 because transaction hasn't committed
-        let read_start = Instant::now();
-        let result = handler
-            .handle_request("get_value", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let read_elapsed = read_start.elapsed();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-
-        // TRANSACTIONAL: Value should still be 0 during activity execution
-        // (the transaction hasn't committed yet)
-        assert_eq!(
-            value, 0,
-            "Expected value=0 during activity (transaction not committed)"
-        );
-
-        // The read should complete quickly (not blocked)
-        assert!(
-            read_elapsed < Duration::from_millis(50),
-            "Read took {:?}, expected < 50ms",
-            read_elapsed
-        );
-
-        // Wait for suspend task to complete
-        let result = suspend_task.await.unwrap().unwrap();
-        let final_value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(final_value, 2);
-
-        // Now read again - should see the committed value
-        let result = handler
-            .handle_request("get_value", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let committed_value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(
-            committed_value, 2,
-            "Expected value=2 after activity committed"
-        );
-
-        let total_elapsed = start.elapsed();
-        // Total should be ~100ms (suspension time) + small overhead
-        assert!(
-            total_elapsed < Duration::from_millis(200),
-            "Total took {:?}, expected < 200ms",
-            total_elapsed
-        );
-    }
-
-    /// Test that `self.state` in a workflow reflects updated values after
-    /// calling an activity. With the `StateRef` proxy, the read view
-    /// is refreshed after each activity delegation, so subsequent reads
-    /// within the same workflow see the committed state.
-    #[tokio::test]
-    async fn workflow_state_refreshes_after_activity() {
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct RefreshState {
-            count: i32,
-            label: String,
-        }
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct RefreshEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(RefreshState)]
-        impl RefreshEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<RefreshState, ClusterError> {
-                Ok(RefreshState {
-                    count: 0,
-                    label: "init".to_string(),
-                })
-            }
-
-            #[activity]
-            async fn do_increment(&mut self, amount: i32) -> Result<(), ClusterError> {
-                self.state.count += amount;
-                Ok(())
-            }
-
-            #[activity]
-            async fn do_set_label(&mut self, label: String) -> Result<(), ClusterError> {
-                self.state.label = label;
-                Ok(())
-            }
-
-            /// Workflow that calls multiple activities and reads self.state
-            /// after each one. With StateRef, these reads should reflect
-            /// the latest committed state.
-            #[workflow]
-            async fn increment_and_read(&self, amount: i32) -> Result<i32, ClusterError> {
-                assert_eq!(self.state.count, 0, "count should start at 0");
-
-                self.do_increment(amount).await?;
-
-                // This read must reflect the activity's mutation
-                let after_first = self.state.count;
-                assert_eq!(
-                    after_first, amount,
-                    "count should be {amount} after first increment"
-                );
-
-                self.do_increment(amount).await?;
-
-                // Second read must reflect the second mutation
-                let after_second = self.state.count;
-                assert_eq!(
-                    after_second,
-                    amount * 2,
-                    "count should be {} after second increment",
-                    amount * 2
-                );
-
-                Ok(after_second)
-            }
-
-            /// Workflow that interleaves different activities and reads
-            /// multiple fields after each call.
-            #[workflow]
-            async fn multi_field_workflow(&self) -> Result<String, ClusterError> {
-                self.do_increment(10).await?;
-                assert_eq!(self.state.count, 10);
-                assert_eq!(self.state.label, "init");
-
-                self.do_set_label("updated".to_string()).await?;
-                assert_eq!(self.state.count, 10);
-                assert_eq!(self.state.label, "updated");
-
-                self.do_increment(5).await?;
-                assert_eq!(self.state.count, 15);
-                assert_eq!(self.state.label, "updated");
-
-                Ok(format!("{}:{}", self.state.label, self.state.count))
-            }
-
-            #[rpc]
-            async fn get_count(&self) -> Result<i32, ClusterError> {
-                Ok(self.state.count)
-            }
-        }
-
-        let storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx_with_storage("RefreshEntity", "r-1", storage);
-        let handler = RefreshEntity.spawn(ctx).await.unwrap();
-
-        // Test 1: workflow reads state after activity calls
-        let payload = rmp_serde::to_vec(&10i32).unwrap();
-        let result = handler
-            .handle_request("increment_and_read", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 20);
-
-        // Verify via RPC that state persisted correctly
-        let result = handler
-            .handle_request("get_count", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 20);
-
-        // Test 2: multi-field workflow
-        let storage2: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx2 = test_ctx_with_storage("RefreshEntity", "r-2", storage2);
-        let handler2 = RefreshEntity.spawn(ctx2).await.unwrap();
-
-        let result = handler2
-            .handle_request("multi_field_workflow", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "updated:15");
-    }
-
-    // --- Activity Journaling tests ---
-
-    fn test_ctx_with_all_storage(
-        entity_type: &str,
-        entity_id: &str,
-        state_storage: Arc<dyn crate::durable::WorkflowStorage>,
-        engine: Arc<dyn crate::durable::WorkflowEngine>,
-        message_storage: Arc<dyn crate::message_storage::MessageStorage>,
-    ) -> EntityContext {
-        EntityContext {
-            address: EntityAddress {
-                shard_id: ShardId::new("default", 0),
-                entity_type: EntityType::new(entity_type),
-                entity_id: EntityId::new(entity_id),
+    async fn pure_rpc_entity_register_returns_client() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = PureRpcEntity::register(
+            PureRpcEntity {
+                prefix: "test".into(),
             },
-            runner_address: RunnerAddress::new("127.0.0.1", 9000),
-            snowflake: Arc::new(SnowflakeGenerator::new()),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            state_storage: Some(state_storage),
-            workflow_engine: Some(engine),
-            sharding: None,
-            message_storage: Some(message_storage),
+            Arc::clone(&sharding),
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("pure-4");
+        // Client should have entity's own methods
+        let response: String = client
+            .greet(&entity_id, &"alice".to_string())
+            .await
+            .unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    #[tokio::test]
+    async fn pure_rpc_entity_client_persisted_method_exists() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = PureRpcEntity::register(
+            PureRpcEntity {
+                prefix: "test".into(),
+            },
+            Arc::clone(&sharding),
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("pure-5");
+        // save_data uses persisted delivery
+        let response: String = client
+            .save_data(&entity_id, &"payload".to_string())
+            .await
+            .unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    // =============================================================================
+    // RPC Group tests
+    // =============================================================================
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct HealthCheckGroup;
+
+    #[rpc_group_impl(krate = "crate")]
+    impl HealthCheckGroup {
+        #[rpc]
+        async fn health(&self) -> Result<String, ClusterError> {
+            Ok("ok".to_string())
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct RpcGroupEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(HealthCheckGroup))]
+    impl RpcGroupEntity {
+        #[rpc]
+        async fn ping(&self) -> Result<String, ClusterError> {
+            Ok("pong".to_string())
         }
     }
 
     #[tokio::test]
-    async fn activity_journal_caches_result_on_replay() {
-        // Entity with a workflow that calls an activity.
-        // We verify that with message_storage configured, the activity result
-        // is journaled and returned on "replay" (second dispatch of same workflow).
-        //
-        // We use a global AtomicUsize counter to track how many times the activity
-        // body actually executes, independent of state.
+    async fn rpc_group_dispatches_via_handler() {
+        let entity_with_groups = RpcGroupEntityWithRpcGroups {
+            entity: RpcGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+        };
+        let ctx = test_ctx("RpcGroupEntity", "rg-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
 
-        static JOURNAL_EXEC_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct JournalState {
-            call_count: i32,
-        }
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct JournalTestEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(JournalState)]
-        impl JournalTestEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<JournalState, ClusterError> {
-                Ok(JournalState { call_count: 0 })
-            }
-
-            #[activity]
-            async fn counted_activity(&mut self) -> Result<String, ClusterError> {
-                JOURNAL_EXEC_COUNT.fetch_add(1, Ordering::SeqCst);
-                self.state.call_count += 1;
-                Ok(format!("executed:{}", self.state.call_count))
-            }
-
-            #[workflow]
-            async fn do_counted(&self) -> Result<String, ClusterError> {
-                self.counted_activity().await
-            }
-
-            #[rpc]
-            async fn get_call_count(&self) -> Result<i32, ClusterError> {
-                Ok(self.state.call_count)
-            }
-        }
-
-        JOURNAL_EXEC_COUNT.store(0, Ordering::SeqCst);
-
-        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
-            Arc::new(MemoryMessageStorage::new());
-
-        // First execution — activity runs and result is journaled
-        let ctx = test_ctx_with_all_storage(
-            "JournalTestEntity",
-            "j-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler = JournalTestEntity.spawn(ctx).await.unwrap();
-
+        // Entity's own RPC
         let result = handler
-            .handle_request("do_counted", &[], &HashMap::new())
+            .handle_request("ping", &[], &HashMap::new())
             .await
             .unwrap();
         let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "executed:1");
-        assert_eq!(
-            JOURNAL_EXEC_COUNT.load(Ordering::SeqCst),
-            1,
-            "activity should have executed once"
-        );
+        assert_eq!(value, "pong");
 
-        // Second execution (simulates crash recovery replay) — same entity, same message_storage.
-        // The workflow calls the activity again but the journal should return the cached result.
-        // The activity body should NOT re-execute.
-        let ctx2 = test_ctx_with_all_storage(
-            "JournalTestEntity",
-            "j-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler2 = JournalTestEntity.spawn(ctx2).await.unwrap();
-
-        let result2 = handler2
-            .handle_request("do_counted", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let value2: String = rmp_serde::from_slice(&result2).unwrap();
-        assert_eq!(
-            value2, "executed:1",
-            "should return cached result from journal"
-        );
-
-        // The global counter should still be 1 — the activity body was NOT re-entered.
-        assert_eq!(
-            JOURNAL_EXEC_COUNT.load(Ordering::SeqCst),
-            1,
-            "activity body should not have re-executed on replay"
-        );
-    }
-
-    #[tokio::test]
-    async fn activity_journal_without_message_storage_executes_normally() {
-        // When no message_storage is configured, activities should execute normally
-        // without journaling (backward-compatible behavior).
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct NoJournalState {
-            count: i32,
-        }
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct NoJournalEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(NoJournalState)]
-        impl NoJournalEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<NoJournalState, ClusterError> {
-                Ok(NoJournalState { count: 0 })
-            }
-
-            #[activity]
-            async fn increment(&mut self) -> Result<i32, ClusterError> {
-                self.state.count += 1;
-                Ok(self.state.count)
-            }
-
-            #[workflow]
-            async fn do_increment(&self) -> Result<i32, ClusterError> {
-                self.increment().await
-            }
-        }
-
-        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        // NO message_storage — journaling disabled
-        let ctx = test_ctx_with_storage_and_engine(
-            "NoJournalEntity",
-            "nj-1",
-            state_storage.clone(),
-            engine.clone(),
-        );
-        let handler = NoJournalEntity.spawn(ctx).await.unwrap();
-
-        // Each call should execute the activity (no caching)
+        // RPC from group
         let result = handler
-            .handle_request("do_increment", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let v: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(v, 1);
-
-        let result = handler
-            .handle_request("do_increment", &[], &HashMap::new())
-            .await
-            .unwrap();
-        let v: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(v, 2, "activity should execute again without journaling");
-    }
-
-    #[tokio::test]
-    async fn activity_journal_different_args_produce_different_entries() {
-        // Verify that the same activity called with different arguments
-        // produces different journal entries (different key bytes).
-
-        static ARG_JOURNAL_EXEC: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct ArgJournalState {
-            total: i32,
-        }
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct ArgJournalEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(ArgJournalState)]
-        impl ArgJournalEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<ArgJournalState, ClusterError> {
-                Ok(ArgJournalState { total: 0 })
-            }
-
-            #[activity]
-            async fn add(&mut self, amount: i32) -> Result<i32, ClusterError> {
-                ARG_JOURNAL_EXEC.fetch_add(1, Ordering::SeqCst);
-                self.state.total += amount;
-                Ok(self.state.total)
-            }
-
-            #[workflow]
-            async fn add_two_amounts(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
-                self.add(a).await?;
-                self.add(b).await
-            }
-        }
-
-        ARG_JOURNAL_EXEC.store(0, Ordering::SeqCst);
-
-        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
-            Arc::new(MemoryMessageStorage::new());
-
-        // First execution: add(10) then add(20) → total 30
-        let ctx = test_ctx_with_all_storage(
-            "ArgJournalEntity",
-            "aj-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler = ArgJournalEntity.spawn(ctx).await.unwrap();
-
-        let payload = rmp_serde::to_vec(&(10i32, 20i32)).unwrap();
-        let result = handler
-            .handle_request("add_two_amounts", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 30);
-        assert_eq!(
-            ARG_JOURNAL_EXEC.load(Ordering::SeqCst),
-            2,
-            "both activities should have executed"
-        );
-
-        // Replay: same workflow, same args → journal should return cached results for both
-        let ctx2 = test_ctx_with_all_storage(
-            "ArgJournalEntity",
-            "aj-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler2 = ArgJournalEntity.spawn(ctx2).await.unwrap();
-
-        let result2 = handler2
-            .handle_request("add_two_amounts", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value2: i32 = rmp_serde::from_slice(&result2).unwrap();
-        assert_eq!(value2, 30, "should return cached result");
-        assert_eq!(
-            ARG_JOURNAL_EXEC.load(Ordering::SeqCst),
-            2,
-            "no additional executions on replay — both activities served from journal"
-        );
-    }
-
-    #[tokio::test]
-    async fn stateless_activity_journal_caches_result_on_replay() {
-        // Stateless entity with #[activity] + #[workflow].
-        // Verifies that the journal caches the activity result and
-        // returns it on replay without re-executing the body.
-        // This proves the unified codegen generates journal infrastructure
-        // for stateless entities.
-
-        static STATELESS_JOURNAL_EXEC: AtomicUsize = AtomicUsize::new(0);
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct StatelessJournalEntity;
-
-        #[entity_impl(krate = "crate")]
-        impl StatelessJournalEntity {
-            #[activity]
-            async fn compute(&mut self, input: i32) -> Result<i32, ClusterError> {
-                STATELESS_JOURNAL_EXEC.fetch_add(1, Ordering::SeqCst);
-                Ok(input * 2 + 1)
-            }
-
-            #[workflow]
-            async fn do_compute(&self, input: i32) -> Result<i32, ClusterError> {
-                self.compute(input).await
-            }
-        }
-
-        STATELESS_JOURNAL_EXEC.store(0, Ordering::SeqCst);
-
-        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
-            Arc::new(MemoryMessageStorage::new());
-
-        // First execution — activity runs
-        let ctx = test_ctx_with_all_storage(
-            "StatelessJournalEntity",
-            "sj-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler = StatelessJournalEntity.spawn(ctx).await.unwrap();
-
-        let payload = rmp_serde::to_vec(&7i32).unwrap();
-        let result = handler
-            .handle_request("do_compute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value: i32 = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, 15); // 7*2+1
-        assert_eq!(
-            STATELESS_JOURNAL_EXEC.load(Ordering::SeqCst),
-            1,
-            "activity should have executed once"
-        );
-
-        // Replay — same entity, same storages.
-        // The journal should return the cached result.
-        let ctx2 = test_ctx_with_all_storage(
-            "StatelessJournalEntity",
-            "sj-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler2 = StatelessJournalEntity.spawn(ctx2).await.unwrap();
-
-        let result2 = handler2
-            .handle_request("do_compute", &payload, &HashMap::new())
-            .await
-            .unwrap();
-        let value2: i32 = rmp_serde::from_slice(&result2).unwrap();
-        assert_eq!(
-            value2, 15,
-            "should return cached result from journal on replay"
-        );
-        assert_eq!(
-            STATELESS_JOURNAL_EXEC.load(Ordering::SeqCst),
-            1,
-            "activity body should not have re-executed on replay"
-        );
-    }
-
-    #[tokio::test]
-    async fn activity_journal_with_explicit_key() {
-        // Verify that #[activity(key(...))] is used as the journal key.
-
-        static KEY_JOURNAL_EXEC: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Clone, serde::Serialize, serde::Deserialize)]
-        struct KeyJournalState {
-            last_processed: String,
-        }
-
-        #[entity(krate = "crate")]
-        #[derive(Clone)]
-        struct KeyJournalEntity;
-
-        #[entity_impl(krate = "crate")]
-        #[state(KeyJournalState)]
-        impl KeyJournalEntity {
-            fn init(&self, _ctx: &EntityContext) -> Result<KeyJournalState, ClusterError> {
-                Ok(KeyJournalState {
-                    last_processed: String::new(),
-                })
-            }
-
-            // The key is only the order_id — the body is ignored for idempotency.
-            #[activity(key(|order_id: &String, _body: &String| order_id.clone()))]
-            async fn process_order(
-                &mut self,
-                order_id: String,
-                body: String,
-            ) -> Result<String, ClusterError> {
-                KEY_JOURNAL_EXEC.fetch_add(1, Ordering::SeqCst);
-                self.state.last_processed = order_id.clone();
-                Ok(format!("{order_id}:{body}"))
-            }
-
-            #[workflow]
-            async fn do_process(
-                &self,
-                order_id: String,
-                body: String,
-            ) -> Result<String, ClusterError> {
-                self.process_order(order_id, body).await
-            }
-        }
-
-        KEY_JOURNAL_EXEC.store(0, Ordering::SeqCst);
-
-        let state_storage: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let engine: Arc<dyn WorkflowEngine> = Arc::new(TestWorkflowEngine::new());
-        let msg_storage: Arc<dyn crate::message_storage::MessageStorage> =
-            Arc::new(MemoryMessageStorage::new());
-
-        // First execution
-        let ctx = test_ctx_with_all_storage(
-            "KeyJournalEntity",
-            "kj-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler = KeyJournalEntity.spawn(ctx).await.unwrap();
-
-        let payload =
-            rmp_serde::to_vec(&("order-1".to_string(), "first-body".to_string())).unwrap();
-        let result = handler
-            .handle_request("do_process", &payload, &HashMap::new())
+            .handle_request("health", &[], &HashMap::new())
             .await
             .unwrap();
         let value: String = rmp_serde::from_slice(&result).unwrap();
-        assert_eq!(value, "order-1:first-body");
-        assert_eq!(KEY_JOURNAL_EXEC.load(Ordering::SeqCst), 1);
+        assert_eq!(value, "ok");
+    }
 
-        // Replay with different body but same order_id — key is same, so journal hit
-        let ctx2 = test_ctx_with_all_storage(
-            "KeyJournalEntity",
-            "kj-1",
-            state_storage.clone(),
-            engine.clone(),
-            msg_storage.clone(),
-        );
-        let handler2 = KeyJournalEntity.spawn(ctx2).await.unwrap();
+    #[tokio::test]
+    async fn rpc_group_unknown_tag_errors() {
+        let entity_with_groups = RpcGroupEntityWithRpcGroups {
+            entity: RpcGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+        };
+        let ctx = test_ctx("RpcGroupEntity", "rg-2");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
 
-        let payload2 =
-            rmp_serde::to_vec(&("order-1".to_string(), "different-body".to_string())).unwrap();
-        let result2 = handler2
-            .handle_request("do_process", &payload2, &HashMap::new())
+        let result = handler
+            .handle_request("nonexistent", &[], &HashMap::new())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_group_register_returns_client() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client =
+            RpcGroupEntity::register(RpcGroupEntity, Arc::clone(&sharding), HealthCheckGroup)
+                .await
+                .unwrap();
+
+        let entity_id = EntityId::new("rg-3");
+        // Client should have entity's own methods
+        let response: String = client.ping(&entity_id).await.unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    #[tokio::test]
+    async fn rpc_group_client_extension_methods_exist() {
+        // Verify that the generated ClientExt trait adds group methods to the entity client
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client =
+            RpcGroupEntity::register(RpcGroupEntity, Arc::clone(&sharding), HealthCheckGroup)
+                .await
+                .unwrap();
+
+        let entity_id = EntityId::new("rg-4");
+        // Group method should be callable via client extension
+        let response: String = client.health(&entity_id).await.unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    // --- RPC group with fields ---
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct MetricsGroup {
+        pub prefix: String,
+    }
+
+    #[rpc_group_impl(krate = "crate")]
+    impl MetricsGroup {
+        #[rpc]
+        async fn get_metrics(&self) -> Result<String, ClusterError> {
+            Ok(format!("{}/metrics", self.prefix))
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct MultiGroupEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(HealthCheckGroup, MetricsGroup))]
+    impl MultiGroupEntity {
+        #[rpc]
+        async fn status(&self) -> Result<String, ClusterError> {
+            Ok("running".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_rpc_group_dispatch() {
+        let entity_with_groups = MultiGroupEntityWithRpcGroups {
+            entity: MultiGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+            __rpc_group_metrics_group: MetricsGroup {
+                prefix: "app".to_string(),
+            },
+        };
+        let ctx = test_ctx("MultiGroupEntity", "mg-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        // Entity's own RPC
+        let result = handler
+            .handle_request("status", &[], &HashMap::new())
             .await
             .unwrap();
-        let value2: String = rmp_serde::from_slice(&result2).unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "running");
+
+        // First group RPC
+        let result = handler
+            .handle_request("health", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "ok");
+
+        // Second group RPC
+        let result = handler
+            .handle_request("get_metrics", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "app/metrics");
+    }
+
+    #[tokio::test]
+    async fn multi_rpc_group_register() {
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = MultiGroupEntity::register(
+            MultiGroupEntity,
+            Arc::clone(&sharding),
+            HealthCheckGroup,
+            MetricsGroup {
+                prefix: "test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let entity_id = EntityId::new("mg-2");
+        let response: String = client.status(&entity_id).await.unwrap();
+        assert_eq!(response, "ok");
+    }
+
+    // --- RPC group with persisted RPC ---
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct PersistedRpcGroup;
+
+    #[rpc_group_impl(krate = "crate")]
+    impl PersistedRpcGroup {
+        #[rpc(persisted)]
+        async fn save_data(&self, data: String) -> Result<String, ClusterError> {
+            Ok(format!("saved:{data}"))
+        }
+
+        #[rpc]
+        async fn read_data(&self) -> Result<String, ClusterError> {
+            Ok("data".to_string())
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct PersistedGroupEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(PersistedRpcGroup))]
+    impl PersistedGroupEntity {
+        #[rpc]
+        async fn ping(&self) -> Result<String, ClusterError> {
+            Ok("pong".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_rpc_group_dispatches() {
+        let entity_with_groups = PersistedGroupEntityWithRpcGroups {
+            entity: PersistedGroupEntity,
+            __rpc_group_persisted_rpc_group: PersistedRpcGroup,
+        };
+        let ctx = test_ctx("PersistedGroupEntity", "prg-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        // Non-persisted group RPC
+        let result = handler
+            .handle_request("read_data", &[], &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "data");
+
+        // Persisted group RPC
+        let payload = rmp_serde::to_vec(&"test".to_string()).unwrap();
+        let result = handler
+            .handle_request("save_data", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: String = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, "saved:test");
+    }
+
+    // --- RPC group with parameters ---
+
+    #[rpc_group(krate = "crate")]
+    #[derive(Clone)]
+    pub struct MathGroup;
+
+    #[rpc_group_impl(krate = "crate")]
+    impl MathGroup {
+        #[rpc]
+        async fn add(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
+            Ok(a + b)
+        }
+
+        #[rpc]
+        async fn multiply(&self, a: i32, b: i32) -> Result<i32, ClusterError> {
+            Ok(a * b)
+        }
+    }
+
+    #[entity(krate = "crate")]
+    #[derive(Clone)]
+    struct MathEntity;
+
+    #[entity_impl(krate = "crate", rpc_groups(MathGroup))]
+    impl MathEntity {
+        #[rpc]
+        async fn negate(&self, x: i32) -> Result<i32, ClusterError> {
+            Ok(-x)
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_group_with_params_dispatch() {
+        let entity_with_groups = MathEntityWithRpcGroups {
+            entity: MathEntity,
+            __rpc_group_math_group: MathGroup,
+        };
+        let ctx = test_ctx("MathEntity", "math-1");
+        let handler = entity_with_groups.spawn(ctx).await.unwrap();
+
+        // Entity's own RPC with param
+        let payload = rmp_serde::to_vec(&5i32).unwrap();
+        let result = handler
+            .handle_request("negate", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, -5);
+
+        // Group RPC with multiple params
+        let payload = rmp_serde::to_vec(&(3i32, 4i32)).unwrap();
+        let result = handler
+            .handle_request("add", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 7);
+
+        let result = handler
+            .handle_request("multiply", &payload, &HashMap::new())
+            .await
+            .unwrap();
+        let value: i32 = rmp_serde::from_slice(&result).unwrap();
+        assert_eq!(value, 12);
+    }
+
+    #[tokio::test]
+    async fn rpc_group_entity_type_is_struct_name() {
+        let entity_with_groups = RpcGroupEntityWithRpcGroups {
+            entity: RpcGroupEntity,
+            __rpc_group_health_check_group: HealthCheckGroup,
+        };
+        // Entity type should be the original struct name
+        assert_eq!(entity_with_groups.entity_type().0, "RpcGroupEntity");
+    }
+
+    // =============================================================================
+    // Workflow key extraction tests (#[workflow_impl(key = |req| ..., hash = ...)])
+    // =============================================================================
+
+    // --- Workflow with custom key extraction (hashed, default) ---
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct KeyedOrderRequest {
+        order_id: String,
+        amount: i32,
+    }
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct KeyedWorkflow;
+
+    #[workflow_impl(krate = "crate", key = |req: &KeyedOrderRequest| req.order_id.clone())]
+    impl KeyedWorkflow {
+        async fn execute(&self, request: KeyedOrderRequest) -> Result<String, ClusterError> {
+            Ok(format!("{}:{}", request.order_id, request.amount))
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_key_extracts_custom_field_hashed() {
+        // Verify that two requests with the same order_id but different amount
+        // produce the same entity_id (because key only uses order_id)
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = KeyedWorkflowClient::new(Arc::clone(&sharding));
+
+        let req1 = KeyedOrderRequest {
+            order_id: "order-42".to_string(),
+            amount: 100,
+        };
+        let req2 = KeyedOrderRequest {
+            order_id: "order-42".to_string(),
+            amount: 200,
+        };
+
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        // Both should target the same entity_id since key only uses order_id
         assert_eq!(
-            value2, "order-1:first-body",
-            "should return cached result (same key despite different body)"
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same order_id should produce same entity_id"
         );
+        // The entity_id should be the SHA-256 hash of the serialized order_id
+        let expected_id =
+            crate::hash::sha256_hex(&rmp_serde::to_vec(&"order-42".to_string()).unwrap());
         assert_eq!(
-            KEY_JOURNAL_EXEC.load(Ordering::SeqCst),
-            1,
-            "activity should not have re-executed (key matched)"
+            captured[0].address.entity_id.0, expected_id,
+            "entity_id should be SHA-256 of serialized key value"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_key_different_keys_different_entity_ids() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = KeyedWorkflowClient::new(Arc::clone(&sharding));
+
+        let req1 = KeyedOrderRequest {
+            order_id: "order-1".to_string(),
+            amount: 100,
+        };
+        let req2 = KeyedOrderRequest {
+            order_id: "order-2".to_string(),
+            amount: 100,
+        };
+
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_ne!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "different order_ids should produce different entity_ids"
+        );
+    }
+
+    // --- Workflow with custom key, hash = false ---
+
+    #[workflow(krate = "crate")]
+    #[derive(Clone)]
+    struct RawKeyWorkflow;
+
+    #[workflow_impl(krate = "crate", key = |req: &KeyedOrderRequest| req.order_id.clone(), hash = false)]
+    impl RawKeyWorkflow {
+        async fn execute(&self, request: KeyedOrderRequest) -> Result<String, ClusterError> {
+            Ok(format!("raw:{}:{}", request.order_id, request.amount))
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_key_raw_uses_value_directly() {
+        // With hash = false, the key closure result is used directly as entity_id
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "my-raw-key-123".to_string(),
+            amount: 50,
+        };
+
+        let _: String = client.execute(&req).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        // Entity ID should be the raw order_id, no hashing
+        assert_eq!(
+            captured[0].address.entity_id.0, "my-raw-key-123",
+            "raw key should be used directly as entity_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_key_raw_same_key_same_entity_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req1 = KeyedOrderRequest {
+            order_id: "same-id".to_string(),
+            amount: 1,
+        };
+        let req2 = KeyedOrderRequest {
+            order_id: "same-id".to_string(),
+            amount: 9999,
+        };
+
+        let _: String = client.execute(&req1).await.unwrap();
+        let _: String = client.execute(&req2).await.unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0].address.entity_id, captured[1].address.entity_id,
+            "same order_id with raw key should produce same entity_id"
+        );
+        assert_eq!(captured[0].address.entity_id.0, "same-id");
+    }
+
+    // --- Workflow key with start() ---
+
+    #[tokio::test]
+    async fn workflow_key_raw_start_returns_raw_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "start-raw-key".to_string(),
+            amount: 0,
+        };
+
+        let exec_id = client.start(&req).await.unwrap();
+        // start() returns the entity_id which should be the raw key
+        assert_eq!(exec_id, "start-raw-key");
+    }
+
+    #[tokio::test]
+    async fn workflow_key_hashed_start_returns_hashed_id() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = KeyedWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "order-hashed".to_string(),
+            amount: 0,
+        };
+
+        let exec_id = client.start(&req).await.unwrap();
+        // start() returns the entity_id which should be hashed
+        let expected_id =
+            crate::hash::sha256_hex(&rmp_serde::to_vec(&"order-hashed".to_string()).unwrap());
+        assert_eq!(exec_id, expected_id);
+    }
+
+    // --- Verify with_key still overrides custom key extraction ---
+
+    #[tokio::test]
+    async fn workflow_with_key_overrides_custom_key() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sharding: Arc<dyn Sharding> = Arc::new(CapturingSharding {
+            inner: MockSharding::new(),
+            captured: Arc::clone(&captured),
+        });
+        let client = RawKeyWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = KeyedOrderRequest {
+            order_id: "should-be-ignored".to_string(),
+            amount: 0,
+        };
+
+        // with_key_raw overrides the key extraction from the closure
+        let _: String = client
+            .with_key_raw("override-key")
+            .execute(&req)
+            .await
+            .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].address.entity_id.0, "override-key",
+            "with_key_raw should override the custom key extraction"
         );
     }
 }

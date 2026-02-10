@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Cluster framework
-cruster = { path = "../../crates/cruster", features = ["sql", "etcd"] }
+cruster = { path = "../../crates/cruster", features = ["etcd"] }
 
 # etcd client
 etcd-client = "0.14"
@@ -45,7 +45,6 @@ anyhow = { workspace = true }
 
 # Required by cruster macros
 async-trait = { workspace = true }
-arc-swap = { workspace = true }
 rmp-serde = "1"
 
 # Concurrency

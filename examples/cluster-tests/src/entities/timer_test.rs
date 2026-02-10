@@ -1,16 +1,26 @@
-//! TimerTest entity - entity for testing timers and scheduled execution.
+//! TimerTest - tests durable timer execution and scheduling.
 //!
-//! This entity provides timer operations to test:
-//! - Timer fires after delay
-//! - Timer can be cancelled
-//! - Timer survives runner restart
-//! - Multiple timers handled correctly
+//! Migrated from old stateful entity API to new pure-RPC entity + standalone workflow.
+//!
+//! ## Architecture
+//! - `TimerTest` entity: pure-RPC for reads and simple mutations
+//!   - `get_timer_fires(entity_id)` — read fired timers from PG
+//!   - `get_pending_timers(entity_id)` — read pending timers from PG
+//!   - `cancel_timer(entity_id, timer_id)` — mark timer cancelled in PG
+//!   - `clear_fires(entity_id, request_id)` — clear fire history in PG
+//! - `ScheduleTimerWorkflow`: standalone workflow with durable sleep
+//!   - Adds pending timer, sleeps for delay, checks cancellation, records fire
+//!
+//! All timer state is stored in PostgreSQL tables:
+//! - `timer_test_fires` — history of fired timers
+//! - `timer_test_pending` — currently pending/cancelled timers
 
 use chrono::{DateTime, Utc};
-use cruster::entity::EntityContext;
+
 use cruster::error::ClusterError;
 use cruster::prelude::*;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::time::Duration;
 
 /// Record of a timer that has fired.
@@ -32,192 +42,331 @@ pub struct PendingTimer {
     /// When the timer was scheduled.
     pub scheduled_at: DateTime<Utc>,
     /// Delay in milliseconds.
-    pub delay_ms: u64,
+    pub delay_ms: i64,
     /// Whether the timer was cancelled.
     pub cancelled: bool,
 }
 
-/// State for a TimerTest entity.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct TimerTestState {
-    /// History of fired timers.
-    pub timer_fires: Vec<TimerFire>,
-    /// Currently pending timers.
-    pub pending_timers: Vec<PendingTimer>,
-}
+// ============================================================================
+// TimerTest entity - pure-RPC for reads and simple mutations
+// ============================================================================
 
 /// TimerTest entity for testing timer/scheduling functionality.
 ///
-/// ## State (Persisted)
-/// - timer_fires: `Vec<TimerFire>` - history of fired timers
-/// - pending_timers: `Vec<PendingTimer>` - currently scheduled timers
+/// Uses the new stateless entity API — state is stored directly in PostgreSQL
+/// via the `timer_test_fires` and `timer_test_pending` tables.
 ///
 /// ## RPCs
-/// - `schedule_timer(timer_id, delay_ms)` - Schedule a timer
-/// - `cancel_timer(timer_id)` - Cancel a pending timer
-/// - `get_timer_fires()` - Get fired timer history
-/// - `clear_fires()` - Clear fire history
+/// - `get_timer_fires(entity_id)` - Get fired timer history
+/// - `get_pending_timers(entity_id)` - Get pending timers
+/// - `cancel_timer(entity_id, timer_id)` - Cancel a pending timer
+/// - `clear_fires(entity_id, request_id)` - Clear fire history
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
-pub struct TimerTest;
+pub struct TimerTest {
+    /// Database pool for direct state queries.
+    pub pool: PgPool,
+}
+
+/// Request to get timer fires for an entity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetTimerFiresRequest {
+    /// Entity ID to query.
+    pub entity_id: String,
+}
+
+/// Request to get pending timers for an entity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GetPendingTimersRequest {
+    /// Entity ID to query.
+    pub entity_id: String,
+}
+
+/// Request to cancel a timer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CancelTimerRequest {
+    /// Entity ID that owns the timer.
+    pub entity_id: String,
+    /// Timer ID to cancel.
+    pub timer_id: String,
+}
+
+/// Request to clear timer fires (includes unique ID for deduplication).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClearFiresRequest {
+    /// Entity ID to clear fires for.
+    pub entity_id: String,
+    /// Unique request ID to ensure each clear is a separate execution.
+    pub request_id: String,
+}
+
+#[entity_impl]
+impl TimerTest {
+    /// Get the list of all fired timers.
+    #[rpc]
+    pub async fn get_timer_fires(
+        &self,
+        request: GetTimerFiresRequest,
+    ) -> Result<Vec<TimerFire>, ClusterError> {
+        let rows: Vec<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT timer_id, scheduled_at, fired_at FROM timer_test_fires
+             WHERE entity_id = $1
+             ORDER BY fired_at",
+        )
+        .bind(&request.entity_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("get_timer_fires failed: {e}"),
+            source: None,
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(timer_id, scheduled_at, fired_at)| TimerFire {
+                timer_id,
+                scheduled_at,
+                fired_at,
+            })
+            .collect())
+    }
+
+    /// Get the list of pending timers.
+    #[rpc]
+    pub async fn get_pending_timers(
+        &self,
+        request: GetPendingTimersRequest,
+    ) -> Result<Vec<PendingTimer>, ClusterError> {
+        let rows: Vec<(String, DateTime<Utc>, i64, bool)> = sqlx::query_as(
+            "SELECT timer_id, scheduled_at, delay_ms, cancelled FROM timer_test_pending
+             WHERE entity_id = $1
+             ORDER BY scheduled_at",
+        )
+        .bind(&request.entity_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("get_pending_timers failed: {e}"),
+            source: None,
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(timer_id, scheduled_at, delay_ms, cancelled)| PendingTimer {
+                    timer_id,
+                    scheduled_at,
+                    delay_ms,
+                    cancelled,
+                },
+            )
+            .collect())
+    }
+
+    /// Cancel a pending timer.
+    ///
+    /// Returns true if the timer was found and cancelled, false if not found
+    /// or already cancelled/fired.
+    #[rpc(persisted)]
+    pub async fn cancel_timer(&self, request: CancelTimerRequest) -> Result<bool, ClusterError> {
+        let result = sqlx::query(
+            "UPDATE timer_test_pending SET cancelled = true
+             WHERE entity_id = $1 AND timer_id = $2 AND cancelled = false",
+        )
+        .bind(&request.entity_id)
+        .bind(&request.timer_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("cancel_timer failed: {e}"),
+            source: None,
+        })?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Clear the timer fire history.
+    #[rpc(persisted)]
+    pub async fn clear_fires(&self, request: ClearFiresRequest) -> Result<(), ClusterError> {
+        sqlx::query("DELETE FROM timer_test_fires WHERE entity_id = $1")
+            .bind(&request.entity_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ClusterError::PersistenceError {
+                reason: format!("clear_fires failed: {e}"),
+                source: None,
+            })?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// ScheduleTimerWorkflow - standalone workflow with durable sleep
+// ============================================================================
 
 /// Request to schedule a timer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScheduleTimerRequest {
+    /// Entity ID that owns the timer.
+    pub entity_id: String,
     /// Unique timer identifier.
     pub timer_id: String,
     /// Delay in milliseconds.
     pub delay_ms: u64,
 }
 
-/// Request to cancel a timer.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CancelTimerRequest {
-    /// Timer ID to cancel.
-    pub timer_id: String,
-}
+/// Standalone workflow for scheduling a timer with durable sleep.
+///
+/// Creates a pending timer record, sleeps for the delay duration,
+/// then checks if the timer was cancelled. If not cancelled, records
+/// the timer fire and removes the pending record.
+///
+/// Activities use `&self.tx` for transactional DB writes — no `pool` field needed.
+#[workflow]
+#[derive(Clone)]
+pub struct ScheduleTimerWorkflow;
 
-/// Request to clear timer fires (includes unique ID for workflow deduplication).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClearFiresRequest {
-    /// Unique request ID to ensure each clear is a new workflow execution.
-    pub request_id: String,
-}
-
-#[entity_impl]
-#[state(TimerTestState)]
-impl TimerTest {
-    fn init(&self, _ctx: &EntityContext) -> Result<TimerTestState, ClusterError> {
-        Ok(TimerTestState::default())
-    }
-
-    #[activity]
-    async fn add_pending_timer(
-        &mut self,
-        timer_id: String,
-        scheduled_at: DateTime<Utc>,
-        delay_ms: u64,
-    ) -> Result<(), ClusterError> {
-        self.state.pending_timers.push(PendingTimer {
-            timer_id,
-            scheduled_at,
-            delay_ms,
-            cancelled: false,
-        });
-        Ok(())
-    }
-
-    #[activity]
-    async fn record_timer_fire(
-        &mut self,
-        timer_id: String,
-        scheduled_at: DateTime<Utc>,
-        fired_at: DateTime<Utc>,
-    ) -> Result<(), ClusterError> {
-        self.state.timer_fires.push(TimerFire {
-            timer_id: timer_id.clone(),
-            scheduled_at,
-            fired_at,
-        });
-        self.state.pending_timers.retain(|t| t.timer_id != timer_id);
-        Ok(())
-    }
-
-    #[activity]
-    async fn remove_pending_timer(&mut self, timer_id: String) -> Result<(), ClusterError> {
-        self.state.pending_timers.retain(|t| t.timer_id != timer_id);
-        Ok(())
-    }
-
-    #[activity]
-    async fn do_cancel_timer(&mut self, timer_id: String) -> Result<bool, ClusterError> {
-        if let Some(timer) = self
-            .state
-            .pending_timers
-            .iter_mut()
-            .find(|t| t.timer_id == timer_id && !t.cancelled)
-        {
-            timer.cancelled = true;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    #[activity]
-    async fn do_clear_fires(&mut self) -> Result<(), ClusterError> {
-        self.state.timer_fires.clear();
-        Ok(())
-    }
-
-    /// Schedule a timer that will fire after the specified delay.
-    ///
-    /// This is implemented as a workflow that sleeps for the delay duration
-    /// and then records the timer fire. The workflow is spawned and returns
-    /// immediately.
-    #[workflow]
-    pub async fn schedule_timer(&self, request: ScheduleTimerRequest) -> Result<(), ClusterError> {
-        let timer_id = request.timer_id;
+#[workflow_impl(key = |req: &ScheduleTimerRequest| format!("{}/{}", req.entity_id, req.timer_id), hash = false)]
+impl ScheduleTimerWorkflow {
+    async fn execute(&self, request: ScheduleTimerRequest) -> Result<(), ClusterError> {
+        let entity_id = request.entity_id.clone();
+        let timer_id = request.timer_id.clone();
         let delay_ms = request.delay_ms;
         let scheduled_at = Utc::now();
 
         // Record the pending timer
-        self.add_pending_timer(timer_id.clone(), scheduled_at, delay_ms)
-            .await?;
+        self.add_pending_timer(
+            entity_id.clone(),
+            timer_id.clone(),
+            scheduled_at,
+            delay_ms as i64,
+        )
+        .await?;
 
-        // Use durable sleep with the timer_id as the unique name
-        self.sleep(&timer_id, Duration::from_millis(delay_ms))
-            .await?;
+        // Durable sleep — workflow suspends, resumes after delay
+        self.sleep(Duration::from_millis(delay_ms)).await?;
 
         // After sleep completes, check if timer was cancelled
         let was_cancelled = self
-            .state
-            .pending_timers
-            .iter()
-            .find(|t| t.timer_id == timer_id)
-            .is_some_and(|t| t.cancelled);
+            .check_cancelled(entity_id.clone(), timer_id.clone())
+            .await?;
 
-        // If not cancelled, record the fire
         if !was_cancelled {
+            // Record the fire and remove from pending
             let fired_at = Utc::now();
-            self.record_timer_fire(timer_id, scheduled_at, fired_at)
+            self.record_timer_fire(entity_id, timer_id, scheduled_at, fired_at)
                 .await?;
         } else {
             // Remove cancelled timer from pending
-            self.remove_pending_timer(timer_id).await?;
+            self.remove_pending_timer(entity_id, timer_id).await?;
         }
 
         Ok(())
     }
 
-    /// Cancel a pending timer.
-    ///
-    /// Returns true if the timer was found and cancelled, false if not found
-    /// or already fired.
-    #[workflow]
-    pub async fn cancel_timer(&self, request: CancelTimerRequest) -> Result<bool, ClusterError> {
-        self.do_cancel_timer(request.timer_id).await
+    #[activity]
+    async fn add_pending_timer(
+        &self,
+        entity_id: String,
+        timer_id: String,
+        scheduled_at: DateTime<Utc>,
+        delay_ms: i64,
+    ) -> Result<(), ClusterError> {
+        sqlx::query(
+            "INSERT INTO timer_test_pending (entity_id, timer_id, scheduled_at, delay_ms, cancelled)
+             VALUES ($1, $2, $3, $4, false)
+             ON CONFLICT (entity_id, timer_id) DO NOTHING",
+        )
+        .bind(&entity_id)
+        .bind(&timer_id)
+        .bind(scheduled_at)
+        .bind(delay_ms)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("add_pending_timer failed: {e}"),
+            source: None,
+        })?;
+        Ok(())
     }
 
-    /// Get the list of all fired timers.
-    #[rpc]
-    pub async fn get_timer_fires(&self) -> Result<Vec<TimerFire>, ClusterError> {
-        Ok(self.state.timer_fires.clone())
+    #[activity]
+    async fn check_cancelled(
+        &self,
+        entity_id: String,
+        timer_id: String,
+    ) -> Result<bool, ClusterError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT cancelled FROM timer_test_pending
+             WHERE entity_id = $1 AND timer_id = $2",
+        )
+        .bind(&entity_id)
+        .bind(&timer_id)
+        .fetch_optional(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("check_cancelled failed: {e}"),
+            source: None,
+        })?;
+
+        Ok(row.is_some_and(|(cancelled,)| cancelled))
     }
 
-    /// Clear the timer fire history.
-    ///
-    /// Each call must have a unique `request_id` to ensure it executes as a new
-    /// workflow (not replayed from journal).
-    #[workflow]
-    pub async fn clear_fires(&self, _request: ClearFiresRequest) -> Result<(), ClusterError> {
-        self.do_clear_fires().await
+    #[activity]
+    async fn record_timer_fire(
+        &self,
+        entity_id: String,
+        timer_id: String,
+        scheduled_at: DateTime<Utc>,
+        fired_at: DateTime<Utc>,
+    ) -> Result<(), ClusterError> {
+        // Insert fire record
+        sqlx::query(
+            "INSERT INTO timer_test_fires (entity_id, timer_id, scheduled_at, fired_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (entity_id, timer_id) DO NOTHING",
+        )
+        .bind(&entity_id)
+        .bind(&timer_id)
+        .bind(scheduled_at)
+        .bind(fired_at)
+        .execute(&self.tx)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("record_timer_fire failed: {e}"),
+            source: None,
+        })?;
+
+        // Remove from pending
+        sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
+            .bind(&entity_id)
+            .bind(&timer_id)
+            .execute(&self.tx)
+            .await
+            .map_err(|e| ClusterError::PersistenceError {
+                reason: format!("record_timer_fire (cleanup) failed: {e}"),
+                source: None,
+            })?;
+
+        Ok(())
     }
 
-    /// Get the list of pending timers.
-    #[rpc]
-    pub async fn get_pending_timers(&self) -> Result<Vec<PendingTimer>, ClusterError> {
-        Ok(self.state.pending_timers.clone())
+    #[activity]
+    async fn remove_pending_timer(
+        &self,
+        entity_id: String,
+        timer_id: String,
+    ) -> Result<(), ClusterError> {
+        sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
+            .bind(&entity_id)
+            .bind(&timer_id)
+            .execute(&self.tx)
+            .await
+            .map_err(|e| ClusterError::PersistenceError {
+                reason: format!("remove_pending_timer failed: {e}"),
+                source: None,
+            })?;
+        Ok(())
     }
 }
 
@@ -257,33 +406,40 @@ mod tests {
     }
 
     #[test]
-    fn test_timer_test_state_default() {
-        let state = TimerTestState::default();
-        assert!(state.timer_fires.is_empty());
-        assert!(state.pending_timers.is_empty());
+    fn test_schedule_timer_request_serialization() {
+        let req = ScheduleTimerRequest {
+            entity_id: "timer-entity-1".to_string(),
+            timer_id: "t1".to_string(),
+            delay_ms: 1000,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ScheduleTimerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "timer-entity-1");
+        assert_eq!(parsed.timer_id, "t1");
+        assert_eq!(parsed.delay_ms, 1000);
     }
 
     #[test]
-    fn test_timer_test_state_serialization() {
-        let mut state = TimerTestState::default();
-        state.timer_fires.push(TimerFire {
+    fn test_cancel_timer_request_serialization() {
+        let req = CancelTimerRequest {
+            entity_id: "timer-entity-1".to_string(),
             timer_id: "t1".to_string(),
-            scheduled_at: Utc::now(),
-            fired_at: Utc::now(),
-        });
-        state.pending_timers.push(PendingTimer {
-            timer_id: "t2".to_string(),
-            scheduled_at: Utc::now(),
-            delay_ms: 1000,
-            cancelled: false,
-        });
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: CancelTimerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "timer-entity-1");
+        assert_eq!(parsed.timer_id, "t1");
+    }
 
-        let json = serde_json::to_string(&state).unwrap();
-        let parsed: TimerTestState = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed.timer_fires.len(), 1);
-        assert_eq!(parsed.timer_fires[0].timer_id, "t1");
-        assert_eq!(parsed.pending_timers.len(), 1);
-        assert_eq!(parsed.pending_timers[0].timer_id, "t2");
+    #[test]
+    fn test_clear_fires_request_serialization() {
+        let req = ClearFiresRequest {
+            entity_id: "timer-entity-1".to_string(),
+            request_id: "clear-1".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ClearFiresRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.entity_id, "timer-entity-1");
+        assert_eq!(parsed.request_id, "clear-1");
     }
 }

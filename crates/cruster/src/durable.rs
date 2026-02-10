@@ -2,9 +2,6 @@
 //!
 //! This module exposes `DurableContext` so entity methods annotated with
 //! `#[workflow]` can call `sleep`, `await_deferred`, `resolve_deferred`, and `on_interrupt`.
-//!
-//! It also provides `MemoryWorkflowEngine` and `MemoryWorkflowStorage` for testing
-//! entities that use durable workflows.
 
 use crate::entity_client::persisted_request_id;
 use crate::envelope::EnvelopeRequest;
@@ -13,7 +10,6 @@ use crate::message_storage::{MessageStorage, SaveResult};
 use crate::reply::ExitResult;
 use crate::types::{EntityAddress, EntityId, EntityType, ShardId};
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::Any;
@@ -22,7 +18,6 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
 
 /// Deferred key name used for interrupt signals.
 pub const INTERRUPT_SIGNAL: &str = "Workflow/InterruptSignal";
@@ -34,6 +29,7 @@ pub const INTERRUPT_SIGNAL: &str = "Workflow/InterruptSignal";
 
 tokio::task_local! {
     static WORKFLOW_REQUEST_ID: i64;
+    static WORKFLOW_JOURNAL_KEYS: std::cell::RefCell<Vec<String>>;
 }
 
 /// Scope that carries the current workflow execution's request ID.
@@ -44,17 +40,41 @@ pub struct WorkflowScope;
 
 impl WorkflowScope {
     /// Execute `f` with the given workflow request ID in scope.
-    pub async fn run<F, Fut, T>(request_id: i64, f: F) -> T
+    ///
+    /// Also sets up a journal key collector so that activity journal keys
+    /// written during this workflow execution can be marked as completed
+    /// when the workflow finishes. Returns `(result, journal_keys)`.
+    pub async fn run<F, Fut, T>(request_id: i64, f: F) -> (T, Vec<String>)
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        WORKFLOW_REQUEST_ID.scope(request_id, f()).await
+        WORKFLOW_REQUEST_ID
+            .scope(
+                request_id,
+                WORKFLOW_JOURNAL_KEYS.scope(std::cell::RefCell::new(Vec::new()), async {
+                    let result = f().await;
+                    let keys =
+                        WORKFLOW_JOURNAL_KEYS.with(|keys| keys.borrow_mut().drain(..).collect());
+                    (result, keys)
+                }),
+            )
+            .await
     }
 
     /// Get the current workflow request ID, if inside a `WorkflowScope`.
     pub fn current() -> Option<i64> {
         WORKFLOW_REQUEST_ID.try_with(|id| *id).ok()
+    }
+
+    /// Register a journal key written during this workflow execution.
+    ///
+    /// Called by `DurableContext` when a journal entry is written so that
+    /// all keys can be marked as completed when the workflow finishes.
+    pub fn register_journal_key(key: String) {
+        let _ = WORKFLOW_JOURNAL_KEYS.try_with(|keys| {
+            keys.borrow_mut().push(key);
+        });
     }
 }
 
@@ -100,6 +120,15 @@ pub trait WorkflowStorage: Send + Sync {
     /// Implementations that provide real transactions can return a dummy value.
     fn as_arc(&self) -> Arc<dyn WorkflowStorage> {
         panic!("WorkflowStorage::as_arc() must be implemented for default begin_transaction()")
+    }
+
+    /// Get the underlying SQL connection pool, if this is a SQL-backed storage.
+    ///
+    /// Returns `Some(&PgPool)` for `SqlWorkflowStorage`, `None` for others.
+    /// Used by the framework to open transactions for activity execution
+    /// and to provide `self.db` in activity views.
+    fn sql_pool(&self) -> Option<&sqlx::PgPool> {
+        None
     }
 }
 
@@ -162,152 +191,6 @@ impl StorageTransaction for NoopTransaction {
     async fn rollback(self: Box<Self>) -> Result<(), ClusterError> {
         // No-op, can't rollback immediate operations
         // This is a limitation of the no-op transaction
-        Ok(())
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-/// In-memory workflow storage for testing.
-///
-/// This storage keeps all data in memory and is not durable across restarts.
-/// Use [`SqlWorkflowStorage`](crate::storage::sql_workflow::SqlWorkflowStorage) for
-/// production persistence (requires the `sql` feature).
-///
-/// The storage uses `Arc` internally so clones share the same underlying data.
-/// This is important for transactions to work correctly.
-#[derive(Clone)]
-pub struct MemoryWorkflowStorage {
-    entries: Arc<DashMap<String, Vec<u8>>>,
-    completed_at: Arc<DashMap<String, std::time::Instant>>,
-}
-
-impl MemoryWorkflowStorage {
-    /// Create a new in-memory workflow storage.
-    pub fn new() -> Self {
-        Self {
-            entries: Arc::new(DashMap::new()),
-            completed_at: Arc::new(DashMap::new()),
-        }
-    }
-}
-
-impl Default for MemoryWorkflowStorage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl WorkflowStorage for MemoryWorkflowStorage {
-    async fn load(&self, key: &str) -> Result<Option<Vec<u8>>, ClusterError> {
-        Ok(self.entries.get(key).map(|v| v.value().clone()))
-    }
-
-    async fn save(&self, key: &str, value: &[u8]) -> Result<(), ClusterError> {
-        self.entries.insert(key.to_string(), value.to_vec());
-        Ok(())
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), ClusterError> {
-        self.entries.remove(key);
-        Ok(())
-    }
-
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, ClusterError> {
-        Ok(self
-            .entries
-            .iter()
-            .filter(|e| e.key().starts_with(prefix))
-            .map(|e| e.key().clone())
-            .collect())
-    }
-
-    async fn mark_completed(&self, key: &str) -> Result<(), ClusterError> {
-        self.completed_at
-            .insert(key.to_string(), std::time::Instant::now());
-        Ok(())
-    }
-
-    async fn cleanup(&self, older_than: Duration) -> Result<u64, ClusterError> {
-        let cutoff = std::time::Instant::now() - older_than;
-        let mut deleted = 0u64;
-        let expired_keys: Vec<String> = self
-            .completed_at
-            .iter()
-            .filter(|e| *e.value() < cutoff)
-            .map(|e| e.key().clone())
-            .collect();
-        for key in expired_keys {
-            self.entries.remove(&key);
-            self.completed_at.remove(&key);
-            deleted += 1;
-        }
-        Ok(deleted)
-    }
-
-    async fn begin_transaction(&self) -> Result<Box<dyn StorageTransaction>, ClusterError> {
-        Ok(Box::new(MemoryTransaction {
-            storage: Arc::new(self.clone()),
-            pending_saves: Vec::new(),
-            pending_deletes: Vec::new(),
-        }))
-    }
-
-    fn as_arc(&self) -> Arc<dyn WorkflowStorage> {
-        Arc::new(self.clone())
-    }
-}
-
-/// A transaction for `MemoryWorkflowStorage`.
-///
-/// Buffers all operations and applies them atomically on commit.
-struct MemoryTransaction {
-    storage: Arc<MemoryWorkflowStorage>,
-    pending_saves: Vec<(String, Vec<u8>)>,
-    pending_deletes: Vec<String>,
-}
-
-#[async_trait]
-impl StorageTransaction for MemoryTransaction {
-    async fn save(&mut self, key: &str, value: &[u8]) -> Result<(), ClusterError> {
-        // Remove any pending delete for this key
-        self.pending_deletes.retain(|k| k != key);
-        // Add or update the pending save
-        if let Some(pos) = self.pending_saves.iter().position(|(k, _)| k == key) {
-            self.pending_saves[pos].1 = value.to_vec();
-        } else {
-            self.pending_saves.push((key.to_string(), value.to_vec()));
-        }
-        Ok(())
-    }
-
-    async fn delete(&mut self, key: &str) -> Result<(), ClusterError> {
-        // Remove any pending save for this key
-        self.pending_saves.retain(|(k, _)| k != key);
-        // Add to pending deletes if not already there
-        if !self.pending_deletes.contains(&key.to_string()) {
-            self.pending_deletes.push(key.to_string());
-        }
-        Ok(())
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), ClusterError> {
-        // Apply all pending deletes
-        for key in &self.pending_deletes {
-            self.storage.entries.remove(key);
-        }
-        // Apply all pending saves
-        for (key, value) in self.pending_saves {
-            self.storage.entries.insert(key, value);
-        }
-        Ok(())
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), ClusterError> {
-        // Just drop the pending operations
         Ok(())
     }
 
@@ -539,6 +422,8 @@ impl DurableContext {
                         &self.entity_id,
                     );
                     if let Some(bytes) = wf_storage.load(&storage_key).await? {
+                        // Register key for completion even on replay hits
+                        WorkflowScope::register_journal_key(storage_key);
                         let result: T = Self::deserialize_journal_result(&bytes)?;
                         return Ok(Some(result));
                     }
@@ -674,6 +559,9 @@ impl DurableContext {
             Self::journal_storage_key(name, key_bytes, &self.entity_type, &self.entity_id);
         let journal_bytes = Self::serialize_journal_result(&result)?;
 
+        // Register this journal key so it can be marked completed when the workflow finishes
+        WorkflowScope::register_journal_key(storage_key.clone());
+
         if crate::state_guard::ActivityScope::is_active() {
             // Inside an ActivityScope — buffer into the same transaction
             crate::state_guard::ActivityScope::buffer_write(storage_key, journal_bytes);
@@ -685,6 +573,26 @@ impl DurableContext {
         }
 
         result
+    }
+}
+
+/// Compute the backoff delay for an activity retry attempt.
+///
+/// Used by macro-generated retry loops for `#[activity(retries = N, backoff = "...")]`.
+///
+/// - `"exponential"`: `min(base_secs * 2^attempt, 60)` seconds (capped at 60s)
+/// - `"constant"`: `base_secs` seconds (default 1s)
+///
+/// Returns the delay as a [`Duration`].
+pub fn compute_retry_backoff(attempt: u32, backoff_strategy: &str, base_secs: u64) -> Duration {
+    match backoff_strategy {
+        "constant" => Duration::from_secs(base_secs),
+        // Default to exponential
+        _ => {
+            let power = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+            let delay_secs = base_secs.saturating_mul(power);
+            Duration::from_secs(delay_secs.min(60))
+        }
     }
 }
 
@@ -725,359 +633,5 @@ pub trait WorkflowEngine: Send + Sync {
     ) -> Result<(), ClusterError>;
 }
 
-/// In-memory workflow engine for testing.
-///
-/// This engine provides an in-memory implementation of the [`WorkflowEngine`] trait
-/// suitable for use in tests and examples. It does not persist state across restarts.
-///
-/// # Example
-///
-/// ```text
-/// use std::sync::Arc;
-/// use cruster::testing::TestCluster;
-///
-/// let cluster = TestCluster::with_workflow_support().await;
-/// // Register entities with #[workflow] methods and test them
-/// ```
-#[derive(Default)]
-pub struct MemoryWorkflowEngine {
-    /// Storage for deferred values: (workflow_name, execution_id, name) -> serialized value
-    deferred: DashMap<(String, String, String), Vec<u8>>,
-    /// Notifiers for awaiting deferred values
-    notifiers: DashMap<(String, String, String), Arc<Notify>>,
-}
-
-impl MemoryWorkflowEngine {
-    /// Create a new in-memory workflow engine.
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl WorkflowEngine for MemoryWorkflowEngine {
-    async fn sleep(
-        &self,
-        _workflow_name: &str,
-        _execution_id: &str,
-        _name: &str,
-        duration: Duration,
-    ) -> Result<(), ClusterError> {
-        // Simple tokio sleep - not durable, but sufficient for testing
-        tokio::time::sleep(duration).await;
-        Ok(())
-    }
-
-    async fn await_deferred(
-        &self,
-        workflow_name: &str,
-        execution_id: &str,
-        name: &str,
-    ) -> Result<Vec<u8>, ClusterError> {
-        let key = (
-            workflow_name.to_string(),
-            execution_id.to_string(),
-            name.to_string(),
-        );
-
-        // Check if value already exists
-        if let Some(value) = self.deferred.get(&key) {
-            return Ok(value.clone());
-        }
-
-        // Get or create notifier
-        let notify = self
-            .notifiers
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone();
-
-        // Re-check after inserting notifier (avoid race)
-        if let Some(value) = self.deferred.get(&key) {
-            return Ok(value.clone());
-        }
-
-        // Wait for notification
-        notify.notified().await;
-
-        // Return the value
-        self.deferred
-            .get(&key)
-            .map(|v| v.clone())
-            .ok_or_else(|| ClusterError::PersistenceError {
-                reason: format!(
-                    "deferred value not found after notification: {}/{}/{}",
-                    workflow_name, execution_id, name
-                ),
-                source: None,
-            })
-    }
-
-    async fn resolve_deferred(
-        &self,
-        workflow_name: &str,
-        execution_id: &str,
-        name: &str,
-        value: Vec<u8>,
-    ) -> Result<(), ClusterError> {
-        let key = (
-            workflow_name.to_string(),
-            execution_id.to_string(),
-            name.to_string(),
-        );
-
-        // Store the value
-        self.deferred.insert(key.clone(), value);
-
-        // Notify any waiters
-        if let Some(notify) = self.notifiers.get(&key) {
-            notify.notify_waiters();
-        }
-
-        Ok(())
-    }
-
-    async fn on_interrupt(
-        &self,
-        workflow_name: &str,
-        execution_id: &str,
-    ) -> Result<(), ClusterError> {
-        // Wait for the special interrupt signal
-        let _ = self
-            .await_deferred(workflow_name, execution_id, INTERRUPT_SIGNAL)
-            .await?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::memory_message::MemoryMessageStorage;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// Build a DurableContext with message and workflow storage for testing.
-    fn test_ctx(
-        msg_storage: Arc<dyn MessageStorage>,
-        wf_storage: Arc<dyn WorkflowStorage>,
-    ) -> DurableContext {
-        let engine = Arc::new(MemoryWorkflowEngine::new());
-        DurableContext::with_journal_storage(engine, "TestEntity", "e-1", msg_storage, wf_storage)
-    }
-
-    /// Build a DurableContext *without* message storage (backward-compatible mode).
-    fn test_ctx_no_storage() -> DurableContext {
-        let engine = Arc::new(MemoryWorkflowEngine::new());
-        DurableContext::new(engine, "TestEntity", "e-1")
-    }
-
-    #[tokio::test]
-    async fn run_caches_result_on_first_execution() {
-        let msg = Arc::new(MemoryMessageStorage::new());
-        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx(msg.clone(), wf.clone());
-
-        let call_count = Arc::new(AtomicU32::new(0));
-        let cc = call_count.clone();
-
-        let result: i32 = ctx
-            .run("my_activity", b"key1", || async move {
-                cc.fetch_add(1, Ordering::SeqCst);
-                Ok(42)
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result, 42);
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn run_returns_cached_on_replay() {
-        let msg = Arc::new(MemoryMessageStorage::new());
-        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-
-        // First execution — caches the result
-        {
-            let ctx = test_ctx(msg.clone(), wf.clone());
-            let result: i32 = ctx
-                .run("my_activity", b"key1", || async { Ok(42) })
-                .await
-                .unwrap();
-            assert_eq!(result, 42);
-        }
-
-        // Second execution (simulates replay) — should return cached result
-        {
-            let ctx = test_ctx(msg.clone(), wf.clone());
-            let call_count = Arc::new(AtomicU32::new(0));
-            let cc = call_count.clone();
-
-            let result: i32 = ctx
-                .run("my_activity", b"key1", || async move {
-                    cc.fetch_add(1, Ordering::SeqCst);
-                    Ok(99) // Would return 99 if actually executed
-                })
-                .await
-                .unwrap();
-
-            assert_eq!(result, 42, "should return cached result, not re-execute");
-            assert_eq!(
-                call_count.load(Ordering::SeqCst),
-                0,
-                "closure should not have been called"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn run_different_keys_execute_independently() {
-        let msg = Arc::new(MemoryMessageStorage::new());
-        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx(msg.clone(), wf.clone());
-
-        let a: i32 = ctx
-            .run("activity_a", b"k1", || async { Ok(1) })
-            .await
-            .unwrap();
-        let b: i32 = ctx
-            .run("activity_b", b"k2", || async { Ok(2) })
-            .await
-            .unwrap();
-
-        assert_eq!(a, 1);
-        assert_eq!(b, 2);
-
-        // Replay — both should return cached values
-        let ctx2 = test_ctx(msg.clone(), wf.clone());
-        let a2: i32 = ctx2
-            .run("activity_a", b"k1", || async { Ok(99) })
-            .await
-            .unwrap();
-        let b2: i32 = ctx2
-            .run("activity_b", b"k2", || async { Ok(99) })
-            .await
-            .unwrap();
-
-        assert_eq!(a2, 1, "activity_a should return cached value");
-        assert_eq!(b2, 2, "activity_b should return cached value");
-    }
-
-    #[tokio::test]
-    async fn run_same_name_different_args_execute_independently() {
-        let msg = Arc::new(MemoryMessageStorage::new());
-        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-        let ctx = test_ctx(msg.clone(), wf.clone());
-
-        // Same activity name but different key bytes (different arguments)
-        let a: i32 = ctx
-            .run("do_work", b"arg-1", || async { Ok(10) })
-            .await
-            .unwrap();
-        let b: i32 = ctx
-            .run("do_work", b"arg-2", || async { Ok(20) })
-            .await
-            .unwrap();
-
-        assert_eq!(a, 10);
-        assert_eq!(b, 20);
-
-        // Replay — each should return its own cached value
-        let ctx2 = test_ctx(msg.clone(), wf.clone());
-        let a2: i32 = ctx2
-            .run("do_work", b"arg-1", || async { Ok(99) })
-            .await
-            .unwrap();
-        let b2: i32 = ctx2
-            .run("do_work", b"arg-2", || async { Ok(99) })
-            .await
-            .unwrap();
-
-        assert_eq!(a2, 10, "arg-1 should return its cached value");
-        assert_eq!(b2, 20, "arg-2 should return its cached value");
-    }
-
-    #[tokio::test]
-    async fn run_without_storage_executes_directly() {
-        let ctx = test_ctx_no_storage();
-
-        let call_count = Arc::new(AtomicU32::new(0));
-        let cc = call_count.clone();
-
-        let result: i32 = ctx
-            .run("my_activity", b"key1", || async move {
-                cc.fetch_add(1, Ordering::SeqCst);
-                Ok(42)
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result, 42);
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn run_without_storage_always_re_executes() {
-        let ctx = test_ctx_no_storage();
-
-        let call_count = Arc::new(AtomicU32::new(0));
-
-        for _ in 0..3 {
-            let cc = call_count.clone();
-            let _: i32 = ctx
-                .run("my_activity", b"key1", || async move {
-                    cc.fetch_add(1, Ordering::SeqCst);
-                    Ok(42)
-                })
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            3,
-            "without storage, every call should execute"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_caches_error_result() {
-        let msg = Arc::new(MemoryMessageStorage::new());
-        let wf: Arc<dyn WorkflowStorage> = Arc::new(MemoryWorkflowStorage::new());
-
-        // First execution — fails
-        {
-            let ctx = test_ctx(msg.clone(), wf.clone());
-            let result: Result<i32, ClusterError> = ctx
-                .run("failing_activity", b"key1", || async {
-                    Err(ClusterError::PersistenceError {
-                        reason: "activity failed".into(),
-                        source: None,
-                    })
-                })
-                .await;
-            assert!(result.is_err());
-        }
-
-        // Replay — should return the cached failure
-        {
-            let ctx = test_ctx(msg.clone(), wf.clone());
-            let call_count = Arc::new(AtomicU32::new(0));
-            let cc = call_count.clone();
-
-            let result: Result<i32, ClusterError> = ctx
-                .run("failing_activity", b"key1", || async move {
-                    cc.fetch_add(1, Ordering::SeqCst);
-                    Ok(99) // Would succeed if actually executed
-                })
-                .await;
-
-            assert!(result.is_err(), "should return cached failure");
-            assert_eq!(
-                call_count.load(Ordering::SeqCst),
-                0,
-                "closure should not have been called"
-            );
-        }
-    }
-}
+// Tests for DurableContext have been moved to tests/sql_integration.rs
+// (module `durable_context`) to use real PostgreSQL via testcontainers.

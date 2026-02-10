@@ -3,7 +3,7 @@
   "specsDir": "specs",
 
   // OpenCode model to use
-  "model": "anthropic/claude-opus-4-5",
+  "model": "anthropic/claude-opus-4-6",
 
   // OpenCode variant (low, medium, high)
   "variant": "high",

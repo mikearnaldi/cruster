@@ -13,16 +13,25 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::entities::{
-    ActivityRecord, ActivityTestClient, AuditEntry, CancelTimerRequest, ClearFiresRequest,
-    ClearMessagesRequest, CounterClient, CrossEntityClient, DecrementRequest, DeleteRequest,
-    FailingTransferRequest, GetExecutionRequest, GetRequest, GetSqlCountRequest, IncrementRequest,
-    KVStoreClient, Message, PendingTimer, PingRequest, ReceiveRequest, ResetPingCountRequest,
+    ActivityGroupTestClient, ActivityRecord, ActivityTestClient, ActivityWorkflowClient,
+    AuditEntry, CancelTimerRequest, ClearFiresRequest, ClearMessagesRequest, ClearRequest,
+    CounterClient, CrossEntityClient, DecrementRequest, DeleteRequest, FailingTransferRequest,
+    FailingWorkflowClient, GetActivityLogRequest, GetAuditLogRequest, GetCounterRequest,
+    GetExecutionRequest, GetMessagesRequest, GetOrderStepsRequest, GetPendingTimersRequest,
+    GetRequest, GetSqlCountRequest, GetStateRequest, GetTimerFiresRequest, GetTraitDataRequest,
+    GetVersionRequest, IncrementRequest, KVStoreClient, ListExecutionsRequest, ListKeysRequest,
+    LongWorkflowClient, Message, OrderResult, OrderStep, OrderWorkflowClient, PendingTimer,
+    PingRequest, ProcessOrderRequest, ReceiveRequest, ResetCounterRequest, ResetPingCountRequest,
     RunFailingWorkflowRequest, RunLongWorkflowRequest, RunSimpleWorkflowRequest,
-    RunWithActivitiesRequest, ScheduleTimerRequest, SetRequest, SingletonManager, SingletonState,
-    SqlActivityTestClient, SqlActivityTestState, TimerFire, TimerTestClient, TraitTestClient,
-    TransferRequest, UpdateRequest, WorkflowExecution, WorkflowTestClient,
+    RunWithActivitiesRequest, ScheduleTimerRequest, ScheduleTimerWorkflowClient, SetRequest,
+    SimpleWorkflowClient, SingletonManager, SingletonState, SqlActivityTestClient,
+    SqlActivityTestState, SqlCountWorkflowClient, SqlFailingTransferWorkflowClient,
+    SqlTransferWorkflowClient, StatelessCounterClient, StatelessDecrementRequest,
+    StatelessGetRequest, StatelessIncrementRequest, StatelessResetRequest, TimerFire,
+    TimerTestClient, TraitTestClient, TransferRequest, UpdateRequest, WorkflowExecution,
+    WorkflowTestClient,
 };
-// Import trait client extensions to make trait methods available on TraitTestClient
+// Import RPC group client extensions to make group methods available on TraitTestClient
 use crate::entities::trait_test::{AuditableClientExt, VersionedClientExt};
 
 /// Shared application state.
@@ -31,18 +40,40 @@ pub struct AppState {
     pub counter_client: CounterClient,
     /// KVStore entity client.
     pub kv_store_client: KVStoreClient,
-    /// WorkflowTest entity client.
+    /// WorkflowTest entity client (for read queries).
     pub workflow_test_client: WorkflowTestClient,
-    /// ActivityTest entity client.
+    /// SimpleWorkflow client (standalone workflow).
+    pub simple_workflow_client: SimpleWorkflowClient,
+    /// FailingWorkflow client (standalone workflow).
+    pub failing_workflow_client: FailingWorkflowClient,
+    /// LongWorkflow client (standalone workflow).
+    pub long_workflow_client: LongWorkflowClient,
+    /// ActivityTest entity client (for read queries).
     pub activity_test_client: ActivityTestClient,
+    /// ActivityWorkflow client (standalone workflow).
+    pub activity_workflow_client: ActivityWorkflowClient,
     /// TraitTest entity client.
     pub trait_test_client: TraitTestClient,
-    /// TimerTest entity client.
+    /// TimerTest entity client (pure-RPC for reads/mutations).
     pub timer_test_client: TimerTestClient,
+    /// ScheduleTimerWorkflow client (standalone workflow for timer scheduling).
+    pub schedule_timer_workflow_client: ScheduleTimerWorkflowClient,
     /// CrossEntity entity client.
     pub cross_entity_client: CrossEntityClient,
-    /// SqlActivityTest entity client.
+    /// SqlActivityTest entity client (for reads).
     pub sql_activity_test_client: SqlActivityTestClient,
+    /// SqlTransferWorkflow client (standalone workflow).
+    pub sql_transfer_workflow_client: SqlTransferWorkflowClient,
+    /// SqlFailingTransferWorkflow client (standalone workflow).
+    pub sql_failing_transfer_workflow_client: SqlFailingTransferWorkflowClient,
+    /// SqlCountWorkflow client (standalone workflow).
+    pub sql_count_workflow_client: SqlCountWorkflowClient,
+    /// StatelessCounter entity client (pure-RPC, new API).
+    pub stateless_counter_client: StatelessCounterClient,
+    /// ActivityGroupTest entity client (for reading order steps).
+    pub activity_group_test_client: ActivityGroupTestClient,
+    /// OrderWorkflow client (standalone workflow with activity groups).
+    pub order_workflow_client: OrderWorkflowClient,
     /// Singleton manager (uses cluster's register_singleton feature).
     pub singleton_manager: Arc<SingletonManager>,
     /// Reference to the sharding implementation for debug endpoints.
@@ -53,6 +84,8 @@ pub struct AppState {
     pub shards_per_group: i32,
     /// List of registered entity types.
     pub registered_entity_types: Vec<String>,
+    /// Database pool for debug queries.
+    pub pool: sqlx::PgPool,
 }
 
 /// Health check response.
@@ -118,6 +151,29 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/cross/:id/messages", get(cross_get_messages))
         .route("/cross/:id/clear", post(cross_clear_messages))
         .route("/cross/:id/ping-pong", post(cross_ping_pong))
+        // StatelessCounter routes (pure-RPC, new API)
+        .route("/stateless-counter/:id", get(stateless_counter_get))
+        .route(
+            "/stateless-counter/:id/increment",
+            post(stateless_counter_increment),
+        )
+        .route(
+            "/stateless-counter/:id/decrement",
+            post(stateless_counter_decrement),
+        )
+        .route(
+            "/stateless-counter/:id/reset",
+            post(stateless_counter_reset),
+        )
+        // ActivityGroupTest routes (activity group composition)
+        .route(
+            "/activity-group/:id/process-order",
+            post(activity_group_process_order),
+        )
+        .route(
+            "/activity-group/:id/order-steps",
+            get(activity_group_get_order_steps),
+        )
         // SingletonTest routes (uses cluster's register_singleton feature)
         .route("/singleton/state", get(singleton_state))
         .route("/singleton/tick-count", get(singleton_tick_count))
@@ -126,6 +182,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Debug routes
         .route("/debug/shards", get(debug_shards))
         .route("/debug/entities", get(debug_entities))
+        .route("/debug/messages", get(debug_messages))
+        .route("/debug/replies", get(debug_replies))
+        .route("/debug/journal", get(debug_journal))
         .with_state(state)
 }
 
@@ -142,7 +201,15 @@ async fn counter_get(
     Path(id): Path<String>,
 ) -> Result<Json<i64>, AppError> {
     let entity_id = EntityId::new(&id);
-    let value = state.counter_client.get(&entity_id).await?;
+    let value = state
+        .counter_client
+        .get(
+            &entity_id,
+            &GetCounterRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(value))
 }
 
@@ -156,7 +223,13 @@ async fn counter_increment(
     let entity_id = EntityId::new(&id);
     let value = state
         .counter_client
-        .increment(&entity_id, &IncrementRequest { amount })
+        .increment(
+            &entity_id,
+            &IncrementRequest {
+                entity_id: id.clone(),
+                amount,
+            },
+        )
         .await?;
     tracing::info!("counter_increment completed: id={}, value={}", id, value);
     Ok(Json(value))
@@ -171,7 +244,13 @@ async fn counter_decrement(
     let entity_id = EntityId::new(&id);
     let value = state
         .counter_client
-        .decrement(&entity_id, &DecrementRequest { amount })
+        .decrement(
+            &entity_id,
+            &DecrementRequest {
+                entity_id: id.clone(),
+                amount,
+            },
+        )
         .await?;
     Ok(Json(value))
 }
@@ -182,7 +261,15 @@ async fn counter_reset(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    state.counter_client.reset(&entity_id).await?;
+    state
+        .counter_client
+        .reset(
+            &entity_id,
+            &ResetCounterRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(()))
 }
 
@@ -211,6 +298,7 @@ async fn kv_set(
         .set(
             &entity_id,
             &SetRequest {
+                entity_id: id,
                 key: body.key,
                 value: body.value,
             },
@@ -227,7 +315,7 @@ async fn kv_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .kv_store_client
-        .get(&entity_id, &GetRequest { key })
+        .get(&entity_id, &GetRequest { entity_id: id, key })
         .await?;
     Ok(Json(value))
 }
@@ -240,7 +328,7 @@ async fn kv_delete(
     let entity_id = EntityId::new(&id);
     let deleted = state
         .kv_store_client
-        .delete(&entity_id, &DeleteRequest { key })
+        .delete(&entity_id, &DeleteRequest { entity_id: id, key })
         .await?;
     Ok(Json(deleted))
 }
@@ -251,7 +339,10 @@ async fn kv_list_keys(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let keys = state.kv_store_client.list_keys(&entity_id).await?;
+    let keys = state
+        .kv_store_client
+        .list_keys(&entity_id, &ListKeysRequest { entity_id: id })
+        .await?;
     Ok(Json(keys))
 }
 
@@ -261,7 +352,10 @@ async fn kv_clear(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    state.kv_store_client.clear(&entity_id).await?;
+    state
+        .kv_store_client
+        .clear(&entity_id, &ClearRequest { entity_id: id })
+        .await?;
     Ok(Json(()))
 }
 
@@ -300,15 +394,12 @@ async fn workflow_run_simple(
     Path(id): Path<String>,
     Json(body): Json<WorkflowRunSimpleBody>,
 ) -> Result<Json<String>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .workflow_test_client
-        .run_simple_workflow(
-            &entity_id,
-            &RunSimpleWorkflowRequest {
-                exec_id: body.exec_id,
-            },
-        )
+        .simple_workflow_client
+        .execute(&RunSimpleWorkflowRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -319,16 +410,13 @@ async fn workflow_run_failing(
     Path(id): Path<String>,
     Json(body): Json<WorkflowRunFailingBody>,
 ) -> Result<Json<String>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .workflow_test_client
-        .run_failing_workflow(
-            &entity_id,
-            &RunFailingWorkflowRequest {
-                exec_id: body.exec_id,
-                fail_at: body.fail_at,
-            },
-        )
+        .failing_workflow_client
+        .execute(&RunFailingWorkflowRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+            fail_at: body.fail_at,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -339,16 +427,13 @@ async fn workflow_run_long(
     Path(id): Path<String>,
     Json(body): Json<WorkflowRunLongBody>,
 ) -> Result<Json<String>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .workflow_test_client
-        .run_long_workflow(
-            &entity_id,
-            &RunLongWorkflowRequest {
-                exec_id: body.exec_id,
-                steps: body.steps,
-            },
-        )
+        .long_workflow_client
+        .execute(&RunLongWorkflowRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+            steps: body.steps,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -361,7 +446,13 @@ async fn workflow_get_execution(
     let entity_id = EntityId::new(&id);
     let execution = state
         .workflow_test_client
-        .get_execution(&entity_id, &GetExecutionRequest { exec_id })
+        .get_execution(
+            &entity_id,
+            &GetExecutionRequest {
+                entity_id: id,
+                exec_id,
+            },
+        )
         .await?;
     Ok(Json(execution))
 }
@@ -374,7 +465,7 @@ async fn workflow_list_executions(
     let entity_id = EntityId::new(&id);
     let executions = state
         .workflow_test_client
-        .list_executions(&entity_id)
+        .list_executions(&entity_id, &ListExecutionsRequest { entity_id: id })
         .await?;
     Ok(Json(executions))
 }
@@ -396,15 +487,12 @@ async fn activity_run(
     Path(id): Path<String>,
     Json(body): Json<ActivityRunBody>,
 ) -> Result<Json<Vec<String>>, AppError> {
-    let entity_id = EntityId::new(&id);
     let result = state
-        .activity_test_client
-        .run_with_activities(
-            &entity_id,
-            &RunWithActivitiesRequest {
-                exec_id: body.exec_id,
-            },
-        )
+        .activity_workflow_client
+        .execute(&RunWithActivitiesRequest {
+            entity_id: id,
+            exec_id: body.exec_id,
+        })
         .await?;
     Ok(Json(result))
 }
@@ -417,7 +505,7 @@ async fn activity_get_log(
     let entity_id = EntityId::new(&id);
     let log = state
         .activity_test_client
-        .get_activity_log(&entity_id)
+        .get_activity_log(&entity_id, &GetActivityLogRequest { entity_id: id })
         .await?;
     Ok(Json(log))
 }
@@ -441,16 +529,13 @@ async fn sql_activity_transfer(
     Path(id): Path<String>,
     Json(body): Json<SqlActivityTransferBody>,
 ) -> Result<Json<i64>, AppError> {
-    let entity_id = EntityId::new(&id);
     let count = state
-        .sql_activity_test_client
-        .transfer(
-            &entity_id,
-            &TransferRequest {
-                to_entity: body.to_entity,
-                amount: body.amount,
-            },
-        )
+        .sql_transfer_workflow_client
+        .execute(&TransferRequest {
+            entity_id: id,
+            to_entity: body.to_entity,
+            amount: body.amount,
+        })
         .await?;
     Ok(Json(count))
 }
@@ -461,16 +546,13 @@ async fn sql_activity_failing_transfer(
     Path(id): Path<String>,
     Json(body): Json<SqlActivityTransferBody>,
 ) -> Result<Json<i64>, AppError> {
-    let entity_id = EntityId::new(&id);
     let count = state
-        .sql_activity_test_client
-        .failing_transfer(
-            &entity_id,
-            &FailingTransferRequest {
-                to_entity: body.to_entity,
-                amount: body.amount,
-            },
-        )
+        .sql_failing_transfer_workflow_client
+        .execute(&FailingTransferRequest {
+            entity_id: id,
+            to_entity: body.to_entity,
+            amount: body.amount,
+        })
         .await?;
     Ok(Json(count))
 }
@@ -481,7 +563,10 @@ async fn sql_activity_get_state(
     Path(id): Path<String>,
 ) -> Result<Json<SqlActivityTestState>, AppError> {
     let entity_id = EntityId::new(&id);
-    let entity_state = state.sql_activity_test_client.get_state(&entity_id).await?;
+    let entity_state = state
+        .sql_activity_test_client
+        .get_state(&entity_id, &GetStateRequest { entity_id: id })
+        .await?;
     Ok(Json(entity_state))
 }
 
@@ -490,15 +575,17 @@ async fn sql_activity_get_sql_count(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<i64>, AppError> {
-    let entity_id = EntityId::new(&id);
     // Generate unique query ID to prevent workflow caching
     let query_id = format!(
         "query-{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     );
     let count = state
-        .sql_activity_test_client
-        .get_transfer_count_from_sql(&entity_id, &GetSqlCountRequest { query_id })
+        .sql_count_workflow_client
+        .execute(&GetSqlCountRequest {
+            entity_id: id,
+            query_id,
+        })
         .await?;
     Ok(Json(count))
 }
@@ -520,7 +607,15 @@ async fn trait_get(
     Path(id): Path<String>,
 ) -> Result<Json<String>, AppError> {
     let entity_id = EntityId::new(&id);
-    let value = state.trait_test_client.get(&entity_id).await?;
+    let value = state
+        .trait_test_client
+        .get(
+            &entity_id,
+            &GetTraitDataRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(value))
 }
 
@@ -533,28 +628,50 @@ async fn trait_update(
     let entity_id = EntityId::new(&id);
     state
         .trait_test_client
-        .update(&entity_id, &UpdateRequest { data: body.data })
+        .update(
+            &entity_id,
+            &UpdateRequest {
+                entity_id: id.clone(),
+                data: body.data,
+            },
+        )
         .await?;
     Ok(Json(()))
 }
 
-/// Get audit log from Auditable trait.
+/// Get audit log from Auditable RPC group.
 async fn trait_get_audit_log(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<AuditEntry>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let log = state.trait_test_client.get_audit_log(&entity_id).await?;
+    let log = state
+        .trait_test_client
+        .get_audit_log(
+            &entity_id,
+            &GetAuditLogRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(log))
 }
 
-/// Get version from Versioned trait.
+/// Get version from Versioned RPC group.
 async fn trait_get_version(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<u64>, AppError> {
     let entity_id = EntityId::new(&id);
-    let version = state.trait_test_client.get_version(&entity_id).await?;
+    let version = state
+        .trait_test_client
+        .get_version(
+            &entity_id,
+            &GetVersionRequest {
+                entity_id: id.clone(),
+            },
+        )
+        .await?;
     Ok(Json(version))
 }
 
@@ -579,21 +696,20 @@ pub struct TimerCancelBody {
 }
 
 /// Schedule a timer with the given delay.
+///
+/// Uses the ScheduleTimerWorkflow standalone workflow for durable sleep.
 async fn timer_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<TimerScheduleBody>,
 ) -> Result<Json<()>, AppError> {
-    let entity_id = EntityId::new(&id);
     state
-        .timer_test_client
-        .schedule_timer(
-            &entity_id,
-            &ScheduleTimerRequest {
-                timer_id: body.timer_id,
-                delay_ms: body.delay_ms,
-            },
-        )
+        .schedule_timer_workflow_client
+        .execute(&ScheduleTimerRequest {
+            entity_id: id,
+            timer_id: body.timer_id,
+            delay_ms: body.delay_ms,
+        })
         .await?;
     Ok(Json(()))
 }
@@ -610,6 +726,7 @@ async fn timer_cancel(
         .cancel_timer(
             &entity_id,
             &CancelTimerRequest {
+                entity_id: id,
                 timer_id: body.timer_id,
             },
         )
@@ -623,7 +740,10 @@ async fn timer_get_fires(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TimerFire>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let fires = state.timer_test_client.get_timer_fires(&entity_id).await?;
+    let fires = state
+        .timer_test_client
+        .get_timer_fires(&entity_id, &GetTimerFiresRequest { entity_id: id })
+        .await?;
     Ok(Json(fires))
 }
 
@@ -633,11 +753,17 @@ async fn timer_clear_fires(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    // Generate unique request ID so each clear is a new workflow execution
+    // Generate unique request ID so each clear is a separate execution
     let request_id = format!("clear-{}-{}", id, chrono::Utc::now().timestamp_millis());
     state
         .timer_test_client
-        .clear_fires(&entity_id, &ClearFiresRequest { request_id })
+        .clear_fires(
+            &entity_id,
+            &ClearFiresRequest {
+                entity_id: id,
+                request_id,
+            },
+        )
         .await?;
     Ok(Json(()))
 }
@@ -650,7 +776,7 @@ async fn timer_get_pending(
     let entity_id = EntityId::new(&id);
     let pending = state
         .timer_test_client
-        .get_pending_timers(&entity_id)
+        .get_pending_timers(&entity_id, &GetPendingTimersRequest { entity_id: id })
         .await?;
     Ok(Json(pending))
 }
@@ -714,6 +840,7 @@ async fn cross_send(
         .receive(
             &target_entity_id,
             &ReceiveRequest {
+                entity_id: body.target_id.clone(),
                 from: id,
                 message: body.message,
             },
@@ -735,6 +862,7 @@ async fn cross_receive(
         .receive(
             &entity_id,
             &ReceiveRequest {
+                entity_id: id,
                 from: body.from,
                 message: body.message,
             },
@@ -749,7 +877,10 @@ async fn cross_get_messages(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<Message>>, AppError> {
     let entity_id = EntityId::new(&id);
-    let messages = state.cross_entity_client.get_messages(&entity_id).await?;
+    let messages = state
+        .cross_entity_client
+        .get_messages(&entity_id, &GetMessagesRequest { entity_id: id })
+        .await?;
     Ok(Json(messages))
 }
 
@@ -759,11 +890,9 @@ async fn cross_clear_messages(
     Path(id): Path<String>,
 ) -> Result<Json<()>, AppError> {
     let entity_id = EntityId::new(&id);
-    // Generate unique request ID so each clear is a new workflow execution
-    let request_id = format!("clear-{}-{}", id, chrono::Utc::now().timestamp_millis());
     state
         .cross_entity_client
-        .clear_messages(&entity_id, &ClearMessagesRequest { request_id })
+        .clear_messages(&entity_id, &ClearMessagesRequest { entity_id: id })
         .await?;
     Ok(Json(()))
 }
@@ -784,14 +913,13 @@ async fn cross_ping_pong(
     let entity_a_id = EntityId::new(&id);
     let entity_b_id = EntityId::new(&body.partner_id);
 
-    // Reset both entities' ping counts (with unique request IDs)
-    let ts = chrono::Utc::now().timestamp_millis();
+    // Reset both entities' ping counts
     state
         .cross_entity_client
         .reset_ping_count(
             &entity_a_id,
             &ResetPingCountRequest {
-                request_id: format!("reset-{}-{}", id, ts),
+                entity_id: id.clone(),
             },
         )
         .await?;
@@ -800,7 +928,7 @@ async fn cross_ping_pong(
         .reset_ping_count(
             &entity_b_id,
             &ResetPingCountRequest {
-                request_id: format!("reset-{}-{}", body.partner_id, ts),
+                entity_id: body.partner_id.clone(),
             },
         )
         .await?;
@@ -815,6 +943,7 @@ async fn cross_ping_pong(
             .ping(
                 &entity_b_id,
                 &PingRequest {
+                    entity_id: body.partner_id.clone(),
                     count: current_count,
                 },
             )
@@ -827,6 +956,7 @@ async fn cross_ping_pong(
             .ping(
                 &entity_a_id,
                 &PingRequest {
+                    entity_id: id.clone(),
                     count: current_count,
                 },
             )
@@ -872,6 +1002,119 @@ async fn singleton_reset(State(state): State<Arc<AppState>>) -> Result<Json<()>,
 }
 
 // ============================================================================
+// ActivityGroupTest handlers (activity group composition)
+// ============================================================================
+
+/// Request body for processing an order via the activity-group workflow.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActivityGroupProcessOrderBody {
+    /// Number of items in the order.
+    pub item_count: i32,
+    /// Payment amount in cents.
+    pub amount: i64,
+}
+
+/// Process an order using the workflow with composed activity groups.
+async fn activity_group_process_order(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ActivityGroupProcessOrderBody>,
+) -> Result<Json<OrderResult>, AppError> {
+    let result = state
+        .order_workflow_client
+        .execute(&ProcessOrderRequest {
+            order_id: id,
+            item_count: body.item_count,
+            amount: body.amount,
+        })
+        .await?;
+    Ok(Json(result))
+}
+
+/// Get the recorded order processing steps.
+async fn activity_group_get_order_steps(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<OrderStep>>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let steps = state
+        .activity_group_test_client
+        .get_order_steps(&entity_id, &GetOrderStepsRequest { order_id: id })
+        .await?;
+    Ok(Json(steps))
+}
+
+// ============================================================================
+// StatelessCounter handlers (pure-RPC, new API)
+// ============================================================================
+
+/// Get current stateless counter value.
+async fn stateless_counter_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<i64>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let value = state
+        .stateless_counter_client
+        .get(&entity_id, &StatelessGetRequest { entity_id: id })
+        .await?;
+    Ok(Json(value))
+}
+
+/// Increment stateless counter by given amount.
+async fn stateless_counter_increment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(amount): Json<i64>,
+) -> Result<Json<i64>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let value = state
+        .stateless_counter_client
+        .increment(
+            &entity_id,
+            &StatelessIncrementRequest {
+                entity_id: id,
+                amount,
+            },
+        )
+        .await?;
+    Ok(Json(value))
+}
+
+/// Decrement stateless counter by given amount.
+async fn stateless_counter_decrement(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(amount): Json<i64>,
+) -> Result<Json<i64>, AppError> {
+    let entity_id = EntityId::new(&id);
+    let value = state
+        .stateless_counter_client
+        .decrement(
+            &entity_id,
+            &StatelessDecrementRequest {
+                entity_id: id,
+                amount,
+            },
+        )
+        .await?;
+    Ok(Json(value))
+}
+
+/// Reset stateless counter to zero.
+async fn stateless_counter_reset(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<()>, AppError> {
+    let entity_id = EntityId::new(&id);
+    state
+        .stateless_counter_client
+        .reset(&entity_id, &StatelessResetRequest { entity_id: id })
+        .await?;
+    Ok(Json(()))
+}
+
+// ============================================================================
 // Debug handlers
 // ============================================================================
 
@@ -911,6 +1154,245 @@ async fn debug_entities(State(state): State<Arc<AppState>>) -> Json<EntityInfo> 
         entity_types: state.registered_entity_types.clone(),
         active_count: state.sharding.active_entity_count(),
     })
+}
+
+// ============================================================================
+// Debug DB query handlers
+// ============================================================================
+
+/// Query parameters for debug message queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugMessageQuery {
+    /// Filter by entity type.
+    pub entity_type: Option<String>,
+    /// Filter by entity ID.
+    pub entity_id: Option<String>,
+    /// Filter by processed status.
+    pub processed: Option<bool>,
+    /// Filter by tag (message method name).
+    pub tag: Option<String>,
+    /// Maximum number of results (default 100).
+    pub limit: Option<i64>,
+}
+
+/// A message record from the database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugMessageRecord {
+    /// Message request ID.
+    pub request_id: i64,
+    /// Shard group.
+    pub shard_group: String,
+    /// Shard ID.
+    pub shard_id: i32,
+    /// Entity type.
+    pub entity_type: String,
+    /// Entity ID.
+    pub entity_id: String,
+    /// Message tag/method name.
+    pub tag: String,
+    /// Whether this is a request (vs fire-and-forget).
+    pub is_request: bool,
+    /// Whether the message has been processed.
+    pub processed: bool,
+    /// Number of delivery retries.
+    pub retry_count: i32,
+    /// Creation timestamp.
+    pub created_at: String,
+}
+
+/// Query messages from the database.
+async fn debug_messages(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DebugMessageQuery>,
+) -> Result<Json<Vec<DebugMessageRecord>>, AppError> {
+    let limit = params.limit.unwrap_or(100);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT request_id, shard_group, shard_id, entity_type, entity_id,
+               tag, is_request, processed, retry_count, created_at
+        FROM cluster_messages
+        WHERE ($1::text IS NULL OR entity_type = $1)
+          AND ($2::text IS NULL OR entity_id = $2)
+          AND ($3::boolean IS NULL OR processed = $3)
+          AND ($4::text IS NULL OR tag = $4)
+        ORDER BY created_at DESC
+        LIMIT $5
+        "#,
+    )
+    .bind(&params.entity_type)
+    .bind(&params.entity_id)
+    .bind(params.processed)
+    .bind(&params.tag)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("debug messages query failed: {e}"))?;
+
+    let records: Vec<DebugMessageRecord> = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            DebugMessageRecord {
+                request_id: row.get("request_id"),
+                shard_group: row.get("shard_group"),
+                shard_id: row.get("shard_id"),
+                entity_type: row.get("entity_type"),
+                entity_id: row.get("entity_id"),
+                tag: row.get("tag"),
+                is_request: row.get("is_request"),
+                processed: row.get("processed"),
+                retry_count: row.get("retry_count"),
+                created_at: created_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
+}
+
+/// Query parameters for debug reply queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugReplyQuery {
+    /// Filter by request ID.
+    pub request_id: Option<i64>,
+    /// Filter by exit status only.
+    pub is_exit: Option<bool>,
+    /// Maximum number of results (default 100).
+    pub limit: Option<i64>,
+}
+
+/// A reply record from the database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugReplyRecord {
+    /// Reply ID.
+    pub id: i64,
+    /// Associated request ID.
+    pub request_id: i64,
+    /// Reply sequence number.
+    pub sequence: i32,
+    /// Whether this is a final exit reply.
+    pub is_exit: bool,
+    /// Creation timestamp.
+    pub created_at: String,
+}
+
+/// Query replies from the database.
+async fn debug_replies(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DebugReplyQuery>,
+) -> Result<Json<Vec<DebugReplyRecord>>, AppError> {
+    let limit = params.limit.unwrap_or(100);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, request_id, sequence, is_exit, created_at
+        FROM cluster_replies
+        WHERE ($1::bigint IS NULL OR request_id = $1)
+          AND ($2::boolean IS NULL OR is_exit = $2)
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(params.request_id)
+    .bind(params.is_exit)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("debug replies query failed: {e}"))?;
+
+    let records: Vec<DebugReplyRecord> = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            DebugReplyRecord {
+                id: row.get("id"),
+                request_id: row.get("request_id"),
+                sequence: row.get("sequence"),
+                is_exit: row.get("is_exit"),
+                created_at: created_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
+}
+
+/// Query parameters for debug workflow journal queries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugJournalQuery {
+    /// Filter by key prefix.
+    pub prefix: Option<String>,
+    /// Filter to only completed entries.
+    pub completed: Option<bool>,
+    /// Maximum number of results (default 100).
+    pub limit: Option<i64>,
+}
+
+/// A workflow journal record from the database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DebugJournalRecord {
+    /// Journal key.
+    pub key: String,
+    /// Size of the stored value in bytes.
+    pub value_size: i32,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last update timestamp.
+    pub updated_at: String,
+    /// Completion timestamp (null if not completed).
+    pub completed_at: Option<String>,
+}
+
+/// Query workflow journal entries from the database.
+async fn debug_journal(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DebugJournalQuery>,
+) -> Result<Json<Vec<DebugJournalRecord>>, AppError> {
+    let limit = params.limit.unwrap_or(100);
+    let prefix_pattern = params
+        .prefix
+        .as_ref()
+        .map(|p| format!("{}%", p))
+        .unwrap_or_else(|| "%".to_string());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT key, octet_length(value) as value_size, created_at, updated_at, completed_at
+        FROM cluster_workflow_journal
+        WHERE key LIKE $1
+          AND ($2::boolean IS NULL OR ($2 = TRUE AND completed_at IS NOT NULL) OR ($2 = FALSE AND completed_at IS NULL))
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(&prefix_pattern)
+    .bind(params.completed)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("debug journal query failed: {e}"))?;
+
+    let records: Vec<DebugJournalRecord> = rows
+        .iter()
+        .map(|row| {
+            use sqlx::Row;
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
+            let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
+            DebugJournalRecord {
+                key: row.get("key"),
+                value_size: row.get("value_size"),
+                created_at: created_at.to_rfc3339(),
+                updated_at: updated_at.to_rfc3339(),
+                completed_at: completed_at.map(|t| t.to_rfc3339()),
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
 }
 
 /// Application error type.

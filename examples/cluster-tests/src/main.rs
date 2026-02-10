@@ -34,8 +34,11 @@ mod entities;
 
 use api::{create_router, AppState};
 use entities::{
-    ActivityTest, Auditable, Counter, CrossEntity, KVStore, SingletonManager, SqlActivityTest,
-    TimerTest, TraitTest, Versioned, WorkflowTest,
+    ActivityGroupTest, ActivityTest, ActivityWorkflow, Auditable, Counter, CrossEntity,
+    FailingWorkflow, Inventory, KVStore, LongWorkflow, OrderWorkflow, Payments,
+    ScheduleTimerWorkflow, SimpleWorkflow, SingletonManager, SqlActivityTest, SqlCountWorkflow,
+    SqlFailingTransferWorkflow, SqlTransferWorkflow, StatelessCounter, TimerTest, TraitTest,
+    Versioned, WorkflowTest,
 };
 
 /// Parse a "host:port" string into a RunnerAddress.
@@ -230,53 +233,147 @@ async fn main() -> Result<()> {
     let sharding = cluster.sharding();
 
     // Register entities and get typed clients
-    let counter_client = Counter
-        .register(sharding.clone())
-        .await
-        .expect("failed to register Counter entity");
+    let counter_client = Counter {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register Counter entity");
     tracing::info!("Registered Counter entity");
 
-    let kv_store_client = KVStore
-        .register(sharding.clone())
-        .await
-        .expect("failed to register KVStore entity");
+    let kv_store_client = KVStore {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register KVStore entity");
     tracing::info!("Registered KVStore entity");
 
-    let workflow_test_client = WorkflowTest
-        .register(sharding.clone())
-        .await
-        .expect("failed to register WorkflowTest entity");
+    let workflow_test_client = WorkflowTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register WorkflowTest entity");
     tracing::info!("Registered WorkflowTest entity");
 
-    let activity_test_client = ActivityTest
+    let simple_workflow_client = SimpleWorkflow
         .register(sharding.clone())
         .await
-        .expect("failed to register ActivityTest entity");
+        .expect("failed to register SimpleWorkflow");
+    tracing::info!("Registered SimpleWorkflow");
+
+    let failing_workflow_client = FailingWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register FailingWorkflow");
+    tracing::info!("Registered FailingWorkflow");
+
+    let long_workflow_client = LongWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register LongWorkflow");
+    tracing::info!("Registered LongWorkflow");
+
+    let activity_test_client = ActivityTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register ActivityTest entity");
     tracing::info!("Registered ActivityTest entity");
 
-    let trait_test_client = TraitTest
-        .register(sharding.clone(), Auditable, Versioned)
+    let activity_workflow_client = ActivityWorkflow
+        .register(sharding.clone())
         .await
-        .expect("failed to register TraitTest entity");
+        .expect("failed to register ActivityWorkflow");
+    tracing::info!("Registered ActivityWorkflow");
+
+    let trait_test_client = TraitTest {
+        pool: cluster.pool(),
+    }
+    .register(
+        sharding.clone(),
+        Auditable {
+            pool: cluster.pool(),
+        },
+        Versioned {
+            pool: cluster.pool(),
+        },
+    )
+    .await
+    .expect("failed to register TraitTest entity");
     tracing::info!("Registered TraitTest entity");
 
-    let timer_test_client = TimerTest
-        .register(sharding.clone())
-        .await
-        .expect("failed to register TimerTest entity");
+    let timer_test_client = TimerTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register TimerTest entity");
     tracing::info!("Registered TimerTest entity");
 
-    let cross_entity_client = CrossEntity
+    let schedule_timer_workflow_client = ScheduleTimerWorkflow
         .register(sharding.clone())
         .await
-        .expect("failed to register CrossEntity entity");
+        .expect("failed to register ScheduleTimerWorkflow");
+    tracing::info!("Registered ScheduleTimerWorkflow");
+
+    let cross_entity_client = CrossEntity {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register CrossEntity entity");
     tracing::info!("Registered CrossEntity entity");
 
-    let sql_activity_test_client = SqlActivityTest
+    let sql_activity_test_client = SqlActivityTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register SqlActivityTest entity");
+    tracing::info!("Registered SqlActivityTest entity");
+
+    let sql_transfer_workflow_client = SqlTransferWorkflow
         .register(sharding.clone())
         .await
-        .expect("failed to register SqlActivityTest entity");
-    tracing::info!("Registered SqlActivityTest entity");
+        .expect("failed to register SqlTransferWorkflow");
+    tracing::info!("Registered SqlTransferWorkflow");
+
+    let sql_failing_transfer_workflow_client = SqlFailingTransferWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register SqlFailingTransferWorkflow");
+    tracing::info!("Registered SqlFailingTransferWorkflow");
+
+    let sql_count_workflow_client = SqlCountWorkflow
+        .register(sharding.clone())
+        .await
+        .expect("failed to register SqlCountWorkflow");
+    tracing::info!("Registered SqlCountWorkflow");
+
+    let stateless_counter_client = StatelessCounter {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register StatelessCounter entity");
+    tracing::info!("Registered StatelessCounter entity");
+
+    let activity_group_test_client = ActivityGroupTest {
+        pool: cluster.pool(),
+    }
+    .register(sharding.clone())
+    .await
+    .expect("failed to register ActivityGroupTest entity");
+    tracing::info!("Registered ActivityGroupTest entity");
+
+    let order_workflow_client = OrderWorkflow
+        .register(sharding.clone(), Inventory, Payments)
+        .await
+        .expect("failed to register OrderWorkflow");
+    tracing::info!("Registered OrderWorkflow");
 
     // Register the singleton using cluster's register_singleton feature
     let singleton_manager = Arc::new(SingletonManager::new(cluster.pool()));
@@ -300,11 +397,22 @@ async fn main() -> Result<()> {
         counter_client,
         kv_store_client,
         workflow_test_client,
+        simple_workflow_client,
+        failing_workflow_client,
+        long_workflow_client,
         activity_test_client,
+        activity_workflow_client,
         trait_test_client,
         timer_test_client,
+        schedule_timer_workflow_client,
         cross_entity_client,
         sql_activity_test_client,
+        sql_transfer_workflow_client,
+        sql_failing_transfer_workflow_client,
+        sql_count_workflow_client,
+        stateless_counter_client,
+        activity_group_test_client,
+        order_workflow_client,
         singleton_manager,
         sharding,
         shard_groups,
@@ -313,13 +421,25 @@ async fn main() -> Result<()> {
             "Counter".to_string(),
             "KVStore".to_string(),
             "WorkflowTest".to_string(),
+            "Workflow/SimpleWorkflow".to_string(),
+            "Workflow/FailingWorkflow".to_string(),
+            "Workflow/LongWorkflow".to_string(),
             "ActivityTest".to_string(),
+            "Workflow/ActivityWorkflow".to_string(),
             "TraitTest".to_string(),
             "TimerTest".to_string(),
+            "Workflow/ScheduleTimerWorkflow".to_string(),
             "CrossEntity".to_string(),
             "SqlActivityTest".to_string(),
+            "Workflow/SqlTransferWorkflow".to_string(),
+            "Workflow/SqlFailingTransferWorkflow".to_string(),
+            "Workflow/SqlCountWorkflow".to_string(),
+            "StatelessCounter".to_string(),
+            "ActivityGroupTest".to_string(),
+            "Workflow/OrderWorkflow".to_string(),
             "SingletonTest (singleton)".to_string(),
         ],
+        pool: cluster.pool(),
     });
 
     // Create HTTP router

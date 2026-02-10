@@ -231,17 +231,30 @@ pub async fn register_singletons(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TestCluster;
+    use crate::config::ShardingConfig;
+    use crate::metrics::ClusterMetrics;
+    use crate::sharding_impl::ShardingImpl;
+    use crate::storage::noop_runners::NoopRunners;
     use std::sync::Arc;
+
+    /// Create a minimal ShardingImpl with NoopRunners for unit tests.
+    async fn test_sharding() -> Arc<ShardingImpl> {
+        let config = Arc::new(ShardingConfig::default());
+        let metrics = Arc::new(ClusterMetrics::unregistered());
+        let s =
+            ShardingImpl::new(config, Arc::new(NoopRunners), None, None, None, metrics).unwrap();
+        s.acquire_all_shards().await;
+        s
+    }
 
     #[tokio::test]
     async fn register_singleton_via_helper() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
         let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let executed_clone = executed.clone();
 
         register_singleton(
-            cluster.sharding().as_ref(),
+            sharding.as_ref(),
             "test-singleton",
             move |_ctx: SingletonContext| {
                 let e = executed_clone.clone();
@@ -262,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn singleton_builder_api() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
         let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let executed_clone = executed.clone();
 
@@ -273,7 +286,7 @@ mod tests {
                 Ok(())
             }
         })
-        .register(cluster.sharding().as_ref())
+        .register(sharding.as_ref())
         .await
         .unwrap();
 
@@ -284,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_multiple_singletons() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
         let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let mut singletons: Vec<(String, SingletonRun)> = Vec::new();
@@ -305,7 +318,7 @@ mod tests {
             ));
         }
 
-        register_singletons(cluster.sharding().as_ref(), singletons)
+        register_singletons(sharding.as_ref(), singletons)
             .await
             .unwrap();
 
@@ -316,12 +329,12 @@ mod tests {
 
     #[tokio::test]
     async fn singleton_receives_cancellation_token() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
         let token_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let token_received_clone = token_received.clone();
 
         register_singleton(
-            cluster.sharding().as_ref(),
+            sharding.as_ref(),
             "cancellation-test",
             move |ctx: SingletonContext| {
                 let t = token_received_clone.clone();
@@ -345,10 +358,10 @@ mod tests {
 
     #[tokio::test]
     async fn singleton_not_managing_cancellation_is_force_cancelled() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
 
         register_singleton(
-            cluster.sharding().as_ref(),
+            sharding.as_ref(),
             "unmanaged-singleton",
             move |_ctx: SingletonContext| async move {
                 // This singleton does NOT call ctx.cancellation()
@@ -368,7 +381,7 @@ mod tests {
 
         // Shutdown should complete quickly because singleton is force-cancelled
         let start = std::time::Instant::now();
-        cluster.sharding().shutdown().await.unwrap();
+        sharding.shutdown().await.unwrap();
         let elapsed = start.elapsed();
 
         // Should complete in well under 1 second (the singleton's sleep duration)
@@ -381,12 +394,12 @@ mod tests {
 
     #[tokio::test]
     async fn singleton_managing_cancellation_waits_for_graceful_shutdown() {
-        let cluster = TestCluster::new().await;
+        let sharding = test_sharding().await;
         let cleanup_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cleanup_ran_clone = cleanup_ran.clone();
 
         register_singleton(
-            cluster.sharding().as_ref(),
+            sharding.as_ref(),
             "managed-singleton",
             move |ctx: SingletonContext| {
                 let cleanup = cleanup_ran_clone.clone();
@@ -419,7 +432,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Shutdown should wait for graceful cleanup
-        cluster.sharding().shutdown().await.unwrap();
+        sharding.shutdown().await.unwrap();
 
         // Cleanup SHOULD have run
         assert!(

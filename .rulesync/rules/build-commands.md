@@ -30,9 +30,6 @@ globs: ["Cargo.toml", "Cargo.lock", ".cargo/**/*"]
 # Run all library tests
 cargo test -p cruster --lib
 
-# Run chess-cluster example tests
-cargo test -p chess-cluster
-
 # Run cluster-tests example tests  
 cargo test -p cluster-tests
 ```

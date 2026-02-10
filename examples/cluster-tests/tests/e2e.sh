@@ -60,7 +60,16 @@ echo ""
 "$SCRIPT_DIR/test_sql_activity.sh"
 echo ""
 
+"$SCRIPT_DIR/test_db_persistence.sh"
+echo ""
+
 "$SCRIPT_DIR/test_shard_topology.sh"
+echo ""
+
+"$SCRIPT_DIR/test_stateless_counter.sh"
+echo ""
+
+"$SCRIPT_DIR/test_activity_groups.sh"
 echo ""
 
 # Singleton failover test runs last since it kills a node

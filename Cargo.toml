@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/cruster",
     "crates/cruster-macros",
-    "examples/chess-cluster",
     "examples/cluster-tests",
 ]
 
@@ -39,7 +38,6 @@ serde_json = "1"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
-arc-swap = "1"
 
 # Metrics
 prometheus = "0.13"

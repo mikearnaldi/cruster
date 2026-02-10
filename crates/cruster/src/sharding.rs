@@ -3,8 +3,9 @@ use crate::entity_client::EntityClient;
 use crate::envelope::{AckChunk, EnvelopeRequest, Interrupt};
 use crate::error::ClusterError;
 use crate::message::ReplyReceiver;
+use crate::reply::Reply;
 use crate::singleton::SingletonContext;
-use crate::snowflake::SnowflakeGenerator;
+use crate::snowflake::{Snowflake, SnowflakeGenerator};
 use crate::types::{EntityId, EntityType, ShardId};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -90,6 +91,16 @@ pub trait Sharding: Send + Sync {
     async fn registration_events(
         &self,
     ) -> Pin<Box<dyn Stream<Item = ShardingRegistrationEvent> + Send>>;
+
+    /// Query stored replies for a given request ID.
+    ///
+    /// Used by workflow clients to poll for the result of a previously-started
+    /// workflow execution. Returns an empty vector if no storage is configured
+    /// or no replies exist.
+    async fn replies_for(&self, request_id: Snowflake) -> Result<Vec<Reply>, ClusterError> {
+        let _ = request_id;
+        Ok(vec![])
+    }
 
     /// Graceful shutdown.
     async fn shutdown(&self) -> Result<(), ClusterError>;

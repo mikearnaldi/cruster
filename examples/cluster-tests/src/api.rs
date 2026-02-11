@@ -203,12 +203,7 @@ async fn counter_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .counter_client
-        .get(
-            &entity_id,
-            &GetCounterRequest {
-                entity_id: id.clone(),
-            },
-        )
+        .get(&entity_id, &GetCounterRequest {})
         .await?;
     Ok(Json(value))
 }
@@ -223,13 +218,7 @@ async fn counter_increment(
     let entity_id = EntityId::new(&id);
     let value = state
         .counter_client
-        .increment(
-            &entity_id,
-            &IncrementRequest {
-                entity_id: id.clone(),
-                amount,
-            },
-        )
+        .increment(&entity_id, &IncrementRequest { amount })
         .await?;
     tracing::info!("counter_increment completed: id={}, value={}", id, value);
     Ok(Json(value))
@@ -244,13 +233,7 @@ async fn counter_decrement(
     let entity_id = EntityId::new(&id);
     let value = state
         .counter_client
-        .decrement(
-            &entity_id,
-            &DecrementRequest {
-                entity_id: id.clone(),
-                amount,
-            },
-        )
+        .decrement(&entity_id, &DecrementRequest { amount })
         .await?;
     Ok(Json(value))
 }
@@ -263,12 +246,7 @@ async fn counter_reset(
     let entity_id = EntityId::new(&id);
     state
         .counter_client
-        .reset(
-            &entity_id,
-            &ResetCounterRequest {
-                entity_id: id.clone(),
-            },
-        )
+        .reset(&entity_id, &ResetCounterRequest {})
         .await?;
     Ok(Json(()))
 }
@@ -298,7 +276,6 @@ async fn kv_set(
         .set(
             &entity_id,
             &SetRequest {
-                entity_id: id,
                 key: body.key,
                 value: body.value,
             },
@@ -315,7 +292,7 @@ async fn kv_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .kv_store_client
-        .get(&entity_id, &GetRequest { entity_id: id, key })
+        .get(&entity_id, &GetRequest { key })
         .await?;
     Ok(Json(value))
 }
@@ -328,7 +305,7 @@ async fn kv_delete(
     let entity_id = EntityId::new(&id);
     let deleted = state
         .kv_store_client
-        .delete(&entity_id, &DeleteRequest { entity_id: id, key })
+        .delete(&entity_id, &DeleteRequest { key })
         .await?;
     Ok(Json(deleted))
 }
@@ -341,7 +318,7 @@ async fn kv_list_keys(
     let entity_id = EntityId::new(&id);
     let keys = state
         .kv_store_client
-        .list_keys(&entity_id, &ListKeysRequest { entity_id: id })
+        .list_keys(&entity_id, &ListKeysRequest {})
         .await?;
     Ok(Json(keys))
 }
@@ -354,7 +331,7 @@ async fn kv_clear(
     let entity_id = EntityId::new(&id);
     state
         .kv_store_client
-        .clear(&entity_id, &ClearRequest { entity_id: id })
+        .clear(&entity_id, &ClearRequest {})
         .await?;
     Ok(Json(()))
 }
@@ -397,7 +374,7 @@ async fn workflow_run_simple(
     let result = state
         .simple_workflow_client
         .execute(&RunSimpleWorkflowRequest {
-            entity_id: id,
+            owner_id: id,
             exec_id: body.exec_id,
         })
         .await?;
@@ -413,7 +390,7 @@ async fn workflow_run_failing(
     let result = state
         .failing_workflow_client
         .execute(&RunFailingWorkflowRequest {
-            entity_id: id,
+            owner_id: id,
             exec_id: body.exec_id,
             fail_at: body.fail_at,
         })
@@ -430,7 +407,7 @@ async fn workflow_run_long(
     let result = state
         .long_workflow_client
         .execute(&RunLongWorkflowRequest {
-            entity_id: id,
+            owner_id: id,
             exec_id: body.exec_id,
             steps: body.steps,
         })
@@ -449,7 +426,7 @@ async fn workflow_get_execution(
         .get_execution(
             &entity_id,
             &GetExecutionRequest {
-                entity_id: id,
+                owner_id: id,
                 exec_id,
             },
         )
@@ -465,7 +442,7 @@ async fn workflow_list_executions(
     let entity_id = EntityId::new(&id);
     let executions = state
         .workflow_test_client
-        .list_executions(&entity_id, &ListExecutionsRequest { entity_id: id })
+        .list_executions(&entity_id, &ListExecutionsRequest { owner_id: id })
         .await?;
     Ok(Json(executions))
 }
@@ -490,7 +467,7 @@ async fn activity_run(
     let result = state
         .activity_workflow_client
         .execute(&RunWithActivitiesRequest {
-            entity_id: id,
+            owner_id: id,
             exec_id: body.exec_id,
         })
         .await?;
@@ -505,7 +482,7 @@ async fn activity_get_log(
     let entity_id = EntityId::new(&id);
     let log = state
         .activity_test_client
-        .get_activity_log(&entity_id, &GetActivityLogRequest { entity_id: id })
+        .get_activity_log(&entity_id, &GetActivityLogRequest { owner_id: id })
         .await?;
     Ok(Json(log))
 }
@@ -532,8 +509,8 @@ async fn sql_activity_transfer(
     let count = state
         .sql_transfer_workflow_client
         .execute(&TransferRequest {
-            entity_id: id,
-            to_entity: body.to_entity,
+            account_id: id,
+            to_account: body.to_entity,
             amount: body.amount,
         })
         .await?;
@@ -549,8 +526,8 @@ async fn sql_activity_failing_transfer(
     let count = state
         .sql_failing_transfer_workflow_client
         .execute(&FailingTransferRequest {
-            entity_id: id,
-            to_entity: body.to_entity,
+            account_id: id,
+            to_account: body.to_entity,
             amount: body.amount,
         })
         .await?;
@@ -565,7 +542,7 @@ async fn sql_activity_get_state(
     let entity_id = EntityId::new(&id);
     let entity_state = state
         .sql_activity_test_client
-        .get_state(&entity_id, &GetStateRequest { entity_id: id })
+        .get_state(&entity_id, &GetStateRequest { account_id: id })
         .await?;
     Ok(Json(entity_state))
 }
@@ -583,7 +560,7 @@ async fn sql_activity_get_sql_count(
     let count = state
         .sql_count_workflow_client
         .execute(&GetSqlCountRequest {
-            entity_id: id,
+            account_id: id,
             query_id,
         })
         .await?;
@@ -609,12 +586,7 @@ async fn trait_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .trait_test_client
-        .get(
-            &entity_id,
-            &GetTraitDataRequest {
-                entity_id: id.clone(),
-            },
-        )
+        .get(&entity_id, &GetTraitDataRequest {})
         .await?;
     Ok(Json(value))
 }
@@ -628,13 +600,7 @@ async fn trait_update(
     let entity_id = EntityId::new(&id);
     state
         .trait_test_client
-        .update(
-            &entity_id,
-            &UpdateRequest {
-                entity_id: id.clone(),
-                data: body.data,
-            },
-        )
+        .update(&entity_id, &UpdateRequest { data: body.data })
         .await?;
     Ok(Json(()))
 }
@@ -647,12 +613,7 @@ async fn trait_get_audit_log(
     let entity_id = EntityId::new(&id);
     let log = state
         .trait_test_client
-        .get_audit_log(
-            &entity_id,
-            &GetAuditLogRequest {
-                entity_id: id.clone(),
-            },
-        )
+        .get_audit_log(&entity_id, &GetAuditLogRequest {})
         .await?;
     Ok(Json(log))
 }
@@ -665,12 +626,7 @@ async fn trait_get_version(
     let entity_id = EntityId::new(&id);
     let version = state
         .trait_test_client
-        .get_version(
-            &entity_id,
-            &GetVersionRequest {
-                entity_id: id.clone(),
-            },
-        )
+        .get_version(&entity_id, &GetVersionRequest {})
         .await?;
     Ok(Json(version))
 }
@@ -706,7 +662,7 @@ async fn timer_schedule(
     state
         .schedule_timer_workflow_client
         .execute(&ScheduleTimerRequest {
-            entity_id: id,
+            owner_id: id,
             timer_id: body.timer_id,
             delay_ms: body.delay_ms,
         })
@@ -726,7 +682,6 @@ async fn timer_cancel(
         .cancel_timer(
             &entity_id,
             &CancelTimerRequest {
-                entity_id: id,
                 timer_id: body.timer_id,
             },
         )
@@ -742,7 +697,7 @@ async fn timer_get_fires(
     let entity_id = EntityId::new(&id);
     let fires = state
         .timer_test_client
-        .get_timer_fires(&entity_id, &GetTimerFiresRequest { entity_id: id })
+        .get_timer_fires(&entity_id, &GetTimerFiresRequest {})
         .await?;
     Ok(Json(fires))
 }
@@ -757,13 +712,7 @@ async fn timer_clear_fires(
     let request_id = format!("clear-{}-{}", id, chrono::Utc::now().timestamp_millis());
     state
         .timer_test_client
-        .clear_fires(
-            &entity_id,
-            &ClearFiresRequest {
-                entity_id: id,
-                request_id,
-            },
-        )
+        .clear_fires(&entity_id, &ClearFiresRequest { request_id })
         .await?;
     Ok(Json(()))
 }
@@ -776,7 +725,7 @@ async fn timer_get_pending(
     let entity_id = EntityId::new(&id);
     let pending = state
         .timer_test_client
-        .get_pending_timers(&entity_id, &GetPendingTimersRequest { entity_id: id })
+        .get_pending_timers(&entity_id, &GetPendingTimersRequest {})
         .await?;
     Ok(Json(pending))
 }
@@ -840,7 +789,6 @@ async fn cross_send(
         .receive(
             &target_entity_id,
             &ReceiveRequest {
-                entity_id: body.target_id.clone(),
                 from: id,
                 message: body.message,
             },
@@ -862,7 +810,6 @@ async fn cross_receive(
         .receive(
             &entity_id,
             &ReceiveRequest {
-                entity_id: id,
                 from: body.from,
                 message: body.message,
             },
@@ -879,7 +826,7 @@ async fn cross_get_messages(
     let entity_id = EntityId::new(&id);
     let messages = state
         .cross_entity_client
-        .get_messages(&entity_id, &GetMessagesRequest { entity_id: id })
+        .get_messages(&entity_id, &GetMessagesRequest {})
         .await?;
     Ok(Json(messages))
 }
@@ -892,7 +839,7 @@ async fn cross_clear_messages(
     let entity_id = EntityId::new(&id);
     state
         .cross_entity_client
-        .clear_messages(&entity_id, &ClearMessagesRequest { entity_id: id })
+        .clear_messages(&entity_id, &ClearMessagesRequest {})
         .await?;
     Ok(Json(()))
 }
@@ -916,21 +863,11 @@ async fn cross_ping_pong(
     // Reset both entities' ping counts
     state
         .cross_entity_client
-        .reset_ping_count(
-            &entity_a_id,
-            &ResetPingCountRequest {
-                entity_id: id.clone(),
-            },
-        )
+        .reset_ping_count(&entity_a_id, &ResetPingCountRequest {})
         .await?;
     state
         .cross_entity_client
-        .reset_ping_count(
-            &entity_b_id,
-            &ResetPingCountRequest {
-                entity_id: body.partner_id.clone(),
-            },
-        )
+        .reset_ping_count(&entity_b_id, &ResetPingCountRequest {})
         .await?;
 
     // Perform the ping-pong sequence
@@ -943,7 +880,6 @@ async fn cross_ping_pong(
             .ping(
                 &entity_b_id,
                 &PingRequest {
-                    entity_id: body.partner_id.clone(),
                     count: current_count,
                 },
             )
@@ -956,7 +892,6 @@ async fn cross_ping_pong(
             .ping(
                 &entity_a_id,
                 &PingRequest {
-                    entity_id: id.clone(),
                     count: current_count,
                 },
             )
@@ -1056,7 +991,7 @@ async fn stateless_counter_get(
     let entity_id = EntityId::new(&id);
     let value = state
         .stateless_counter_client
-        .get(&entity_id, &StatelessGetRequest { entity_id: id })
+        .get(&entity_id, &StatelessGetRequest {})
         .await?;
     Ok(Json(value))
 }
@@ -1070,13 +1005,7 @@ async fn stateless_counter_increment(
     let entity_id = EntityId::new(&id);
     let value = state
         .stateless_counter_client
-        .increment(
-            &entity_id,
-            &StatelessIncrementRequest {
-                entity_id: id,
-                amount,
-            },
-        )
+        .increment(&entity_id, &StatelessIncrementRequest { amount })
         .await?;
     Ok(Json(value))
 }
@@ -1090,13 +1019,7 @@ async fn stateless_counter_decrement(
     let entity_id = EntityId::new(&id);
     let value = state
         .stateless_counter_client
-        .decrement(
-            &entity_id,
-            &StatelessDecrementRequest {
-                entity_id: id,
-                amount,
-            },
-        )
+        .decrement(&entity_id, &StatelessDecrementRequest { amount })
         .await?;
     Ok(Json(value))
 }
@@ -1109,7 +1032,7 @@ async fn stateless_counter_reset(
     let entity_id = EntityId::new(&id);
     state
         .stateless_counter_client
-        .reset(&entity_id, &StatelessResetRequest { entity_id: id })
+        .reset(&entity_id, &StatelessResetRequest {})
         .await?;
     Ok(Json(()))
 }

@@ -32,8 +32,6 @@ pub struct KVStore {
 /// Request to set a key-value pair.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SetRequest {
-    /// Entity identifier (used as the DB namespace).
-    pub entity_id: String,
     /// Key to set.
     pub key: String,
     /// Value to set.
@@ -43,8 +41,6 @@ pub struct SetRequest {
 /// Request to get a value by key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetRequest {
-    /// Entity identifier (used as the DB namespace).
-    pub entity_id: String,
     /// Key to get.
     pub key: String,
 }
@@ -52,25 +48,17 @@ pub struct GetRequest {
 /// Request to delete a key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeleteRequest {
-    /// Entity identifier (used as the DB namespace).
-    pub entity_id: String,
     /// Key to delete.
     pub key: String,
 }
 
 /// Request to list all keys.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ListKeysRequest {
-    /// Entity identifier (used as the DB namespace).
-    pub entity_id: String,
-}
+pub struct ListKeysRequest {}
 
 /// Request to clear all data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClearRequest {
-    /// Entity identifier (used as the DB namespace).
-    pub entity_id: String,
-}
+pub struct ClearRequest {}
 
 #[entity_impl]
 impl KVStore {
@@ -90,7 +78,7 @@ impl KVStore {
              ON CONFLICT (entity_id, key)
              DO UPDATE SET value = $3",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(&request.key)
         .bind(&value_bytes)
         .execute(&self.pool)
@@ -112,7 +100,7 @@ impl KVStore {
     ) -> Result<Option<serde_json::Value>, ClusterError> {
         let result: Option<(Vec<u8>,)> =
             sqlx::query_as("SELECT value FROM kv_store_entries WHERE entity_id = $1 AND key = $2")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .bind(&request.key)
                 .fetch_optional(&self.pool)
                 .await
@@ -139,7 +127,7 @@ impl KVStore {
     #[rpc(persisted)]
     pub async fn delete(&self, request: DeleteRequest) -> Result<bool, ClusterError> {
         let result = sqlx::query("DELETE FROM kv_store_entries WHERE entity_id = $1 AND key = $2")
-            .bind(&request.entity_id)
+            .bind(self.entity_id())
             .bind(&request.key)
             .execute(&self.pool)
             .await
@@ -154,10 +142,10 @@ impl KVStore {
     ///
     /// Uses `#[rpc]` (non-persisted) since this is a read-only operation.
     #[rpc]
-    pub async fn list_keys(&self, request: ListKeysRequest) -> Result<Vec<String>, ClusterError> {
+    pub async fn list_keys(&self, _request: ListKeysRequest) -> Result<Vec<String>, ClusterError> {
         let rows: Vec<(String,)> =
             sqlx::query_as("SELECT key FROM kv_store_entries WHERE entity_id = $1 ORDER BY key")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| ClusterError::PersistenceError {
@@ -171,9 +159,9 @@ impl KVStore {
     ///
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
-    pub async fn clear(&self, request: ClearRequest) -> Result<(), ClusterError> {
+    pub async fn clear(&self, _request: ClearRequest) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM kv_store_entries WHERE entity_id = $1")
-            .bind(&request.entity_id)
+            .bind(self.entity_id())
             .execute(&self.pool)
             .await
             .map_err(|e| ClusterError::PersistenceError {
@@ -191,13 +179,11 @@ mod tests {
     #[test]
     fn test_set_request_serialization() {
         let req = SetRequest {
-            entity_id: "kv-1".to_string(),
             key: "key1".to_string(),
             value: serde_json::json!("value1"),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: SetRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "kv-1");
         assert_eq!(parsed.key, "key1");
         assert_eq!(parsed.value, serde_json::json!("value1"));
     }
@@ -205,44 +191,34 @@ mod tests {
     #[test]
     fn test_get_request_serialization() {
         let req = GetRequest {
-            entity_id: "kv-1".to_string(),
             key: "key1".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: GetRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "kv-1");
         assert_eq!(parsed.key, "key1");
     }
 
     #[test]
     fn test_delete_request_serialization() {
         let req = DeleteRequest {
-            entity_id: "kv-1".to_string(),
             key: "key1".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: DeleteRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "kv-1");
         assert_eq!(parsed.key, "key1");
     }
 
     #[test]
     fn test_list_keys_request_serialization() {
-        let req = ListKeysRequest {
-            entity_id: "kv-1".to_string(),
-        };
+        let req = ListKeysRequest {};
         let json = serde_json::to_string(&req).unwrap();
-        let parsed: ListKeysRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "kv-1");
+        let _parsed: ListKeysRequest = serde_json::from_str(&json).unwrap();
     }
 
     #[test]
     fn test_clear_request_serialization() {
-        let req = ClearRequest {
-            entity_id: "kv-1".to_string(),
-        };
+        let req = ClearRequest {};
         let json = serde_json::to_string(&req).unwrap();
-        let parsed: ClearRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "kv-1");
+        let _parsed: ClearRequest = serde_json::from_str(&json).unwrap();
     }
 }

@@ -31,8 +31,6 @@ pub struct Counter {
 /// Request to increment the counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IncrementRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
     /// Amount to increment by.
     pub amount: i64,
 }
@@ -40,25 +38,17 @@ pub struct IncrementRequest {
 /// Request to decrement the counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecrementRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
     /// Amount to decrement by.
     pub amount: i64,
 }
 
 /// Request to get the counter value.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetCounterRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
-}
+pub struct GetCounterRequest {}
 
 /// Request to reset the counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ResetCounterRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
-}
+pub struct ResetCounterRequest {}
 
 #[entity_impl]
 impl Counter {
@@ -74,7 +64,7 @@ impl Counter {
              DO UPDATE SET value = counter_values.value + $2
              RETURNING value",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(request.amount)
         .fetch_one(&self.pool)
         .await
@@ -97,7 +87,7 @@ impl Counter {
              DO UPDATE SET value = counter_values.value - $2
              RETURNING value",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(request.amount)
         .fetch_one(&self.pool)
         .await
@@ -112,10 +102,10 @@ impl Counter {
     ///
     /// Uses `#[rpc]` (non-persisted) since this is a read-only operation.
     #[rpc]
-    pub async fn get(&self, request: GetCounterRequest) -> Result<i64, ClusterError> {
+    pub async fn get(&self, _request: GetCounterRequest) -> Result<i64, ClusterError> {
         let result: Option<(i64,)> =
             sqlx::query_as("SELECT value FROM counter_values WHERE entity_id = $1")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| ClusterError::PersistenceError {
@@ -129,14 +119,14 @@ impl Counter {
     ///
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
-    pub async fn reset(&self, request: ResetCounterRequest) -> Result<(), ClusterError> {
+    pub async fn reset(&self, _request: ResetCounterRequest) -> Result<(), ClusterError> {
         sqlx::query(
             "INSERT INTO counter_values (entity_id, value)
              VALUES ($1, 0)
              ON CONFLICT (entity_id)
              DO UPDATE SET value = 0",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -153,45 +143,33 @@ mod tests {
 
     #[test]
     fn test_increment_request_serialization() {
-        let req = IncrementRequest {
-            entity_id: "counter-1".to_string(),
-            amount: 42,
-        };
+        let req = IncrementRequest { amount: 42 };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: IncrementRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
         assert_eq!(parsed.amount, 42);
     }
 
     #[test]
     fn test_decrement_request_serialization() {
-        let req = DecrementRequest {
-            entity_id: "counter-1".to_string(),
-            amount: 10,
-        };
+        let req = DecrementRequest { amount: 10 };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: DecrementRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
         assert_eq!(parsed.amount, 10);
     }
 
     #[test]
     fn test_get_request_serialization() {
-        let req = GetCounterRequest {
-            entity_id: "counter-1".to_string(),
-        };
+        let req = GetCounterRequest {};
         let json = serde_json::to_string(&req).unwrap();
         let parsed: GetCounterRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
+        let _ = parsed; // empty struct, just verify round-trip
     }
 
     #[test]
     fn test_reset_request_serialization() {
-        let req = ResetCounterRequest {
-            entity_id: "counter-1".to_string(),
-        };
+        let req = ResetCounterRequest {};
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ResetCounterRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
+        let _ = parsed; // empty struct, just verify round-trip
     }
 }

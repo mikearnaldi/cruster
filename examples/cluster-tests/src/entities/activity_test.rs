@@ -36,7 +36,7 @@ pub struct ActivityRecord {
 /// via the `activity_test_logs` table.
 ///
 /// ## RPCs
-/// - `get_activity_log(entity_id)` - Get the activity log for an entity
+/// - `get_activity_log(owner_id)` - Get the activity log for an owner
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
 pub struct ActivityTest {
@@ -44,11 +44,11 @@ pub struct ActivityTest {
     pub pool: PgPool,
 }
 
-/// Request to get the activity log for an entity.
+/// Request to get the activity log for an owner.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetActivityLogRequest {
-    /// Entity ID to get logs for.
-    pub entity_id: String,
+    /// Owner ID to get logs for.
+    pub owner_id: String,
 }
 
 #[entity_impl]
@@ -64,7 +64,7 @@ impl ActivityTest {
              WHERE entity_id = $1
              ORDER BY timestamp ASC",
         )
-        .bind(&request.entity_id)
+        .bind(&request.owner_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -90,8 +90,8 @@ impl ActivityTest {
 /// Request to run a workflow with activities.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunWithActivitiesRequest {
-    /// Entity ID (scoping key for activity logs).
-    pub entity_id: String,
+    /// Owner ID (scoping key for activity logs).
+    pub owner_id: String,
     /// Unique execution ID.
     pub exec_id: String,
 }
@@ -99,8 +99,8 @@ pub struct RunWithActivitiesRequest {
 /// Request to log an activity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogActivityRequest {
-    /// Entity ID to log activity for.
-    pub entity_id: String,
+    /// Owner ID to log activity for.
+    pub owner_id: String,
     /// Activity ID.
     pub id: String,
     /// Action performed.
@@ -121,19 +121,19 @@ pub struct ExternalCallRequest {
 #[derive(Clone)]
 pub struct ActivityWorkflow;
 
-#[workflow_impl(key = |req: &RunWithActivitiesRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+#[workflow_impl(key = |req: &RunWithActivitiesRequest| format!("{}/{}", req.owner_id, req.exec_id), hash = false)]
 impl ActivityWorkflow {
     async fn execute(
         &self,
         request: RunWithActivitiesRequest,
     ) -> Result<Vec<String>, ClusterError> {
-        let entity_id = request.entity_id.clone();
+        let owner_id = request.owner_id.clone();
         let exec_id = request.exec_id.clone();
         let mut results = Vec::new();
 
         // Activity 1: Log the start of the workflow
         self.log_activity(LogActivityRequest {
-            entity_id: entity_id.clone(),
+            owner_id: owner_id.clone(),
             id: format!("{}-start", exec_id),
             action: "workflow_started".to_string(),
         })
@@ -150,7 +150,7 @@ impl ActivityWorkflow {
 
         // Activity 3: Log a processing step
         self.log_activity(LogActivityRequest {
-            entity_id: entity_id.clone(),
+            owner_id: owner_id.clone(),
             id: format!("{}-process", exec_id),
             action: "data_processed".to_string(),
         })
@@ -167,7 +167,7 @@ impl ActivityWorkflow {
 
         // Activity 5: Log the completion
         self.log_activity(LogActivityRequest {
-            entity_id: entity_id.clone(),
+            owner_id: owner_id.clone(),
             id: format!("{}-complete", exec_id),
             action: "workflow_completed".to_string(),
         })
@@ -189,7 +189,7 @@ impl ActivityWorkflow {
              ON CONFLICT (entity_id, id) DO NOTHING",
         )
         .bind(&request.id)
-        .bind(&request.entity_id)
+        .bind(&request.owner_id)
         .bind(&request.action)
         .execute(&self.tx)
         .await
@@ -233,12 +233,12 @@ mod tests {
     #[test]
     fn test_run_with_activities_request_serialization() {
         let req = RunWithActivitiesRequest {
-            entity_id: "act-1".to_string(),
+            owner_id: "act-1".to_string(),
             exec_id: "exec-1".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RunWithActivitiesRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "act-1");
+        assert_eq!(parsed.owner_id, "act-1");
         assert_eq!(parsed.exec_id, "exec-1");
     }
 }

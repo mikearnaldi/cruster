@@ -4,10 +4,10 @@
 //!
 //! ## Architecture
 //! - `TimerTest` entity: pure-RPC for reads and simple mutations
-//!   - `get_timer_fires(entity_id)` — read fired timers from PG
-//!   - `get_pending_timers(entity_id)` — read pending timers from PG
-//!   - `cancel_timer(entity_id, timer_id)` — mark timer cancelled in PG
-//!   - `clear_fires(entity_id, request_id)` — clear fire history in PG
+//!   - `get_timer_fires()` — read fired timers from PG (uses `self.entity_id()`)
+//!   - `get_pending_timers()` — read pending timers from PG (uses `self.entity_id()`)
+//!   - `cancel_timer(timer_id)` — mark timer cancelled in PG (uses `self.entity_id()`)
+//!   - `clear_fires(request_id)` — clear fire history in PG (uses `self.entity_id()`)
 //! - `ScheduleTimerWorkflow`: standalone workflow with durable sleep
 //!   - Adds pending timer, sleeps for delay, checks cancellation, records fire
 //!
@@ -57,10 +57,10 @@ pub struct PendingTimer {
 /// via the `timer_test_fires` and `timer_test_pending` tables.
 ///
 /// ## RPCs
-/// - `get_timer_fires(entity_id)` - Get fired timer history
-/// - `get_pending_timers(entity_id)` - Get pending timers
-/// - `cancel_timer(entity_id, timer_id)` - Cancel a pending timer
-/// - `clear_fires(entity_id, request_id)` - Clear fire history
+/// - `get_timer_fires()` - Get fired timer history
+/// - `get_pending_timers()` - Get pending timers
+/// - `cancel_timer(timer_id)` - Cancel a pending timer
+/// - `clear_fires(request_id)` - Clear fire history
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
 pub struct TimerTest {
@@ -70,23 +70,15 @@ pub struct TimerTest {
 
 /// Request to get timer fires for an entity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetTimerFiresRequest {
-    /// Entity ID to query.
-    pub entity_id: String,
-}
+pub struct GetTimerFiresRequest {}
 
 /// Request to get pending timers for an entity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetPendingTimersRequest {
-    /// Entity ID to query.
-    pub entity_id: String,
-}
+pub struct GetPendingTimersRequest {}
 
 /// Request to cancel a timer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CancelTimerRequest {
-    /// Entity ID that owns the timer.
-    pub entity_id: String,
     /// Timer ID to cancel.
     pub timer_id: String,
 }
@@ -94,8 +86,6 @@ pub struct CancelTimerRequest {
 /// Request to clear timer fires (includes unique ID for deduplication).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClearFiresRequest {
-    /// Entity ID to clear fires for.
-    pub entity_id: String,
     /// Unique request ID to ensure each clear is a separate execution.
     pub request_id: String,
 }
@@ -106,14 +96,14 @@ impl TimerTest {
     #[rpc]
     pub async fn get_timer_fires(
         &self,
-        request: GetTimerFiresRequest,
+        _request: GetTimerFiresRequest,
     ) -> Result<Vec<TimerFire>, ClusterError> {
         let rows: Vec<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
             "SELECT timer_id, scheduled_at, fired_at FROM timer_test_fires
              WHERE entity_id = $1
              ORDER BY fired_at",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -135,14 +125,14 @@ impl TimerTest {
     #[rpc]
     pub async fn get_pending_timers(
         &self,
-        request: GetPendingTimersRequest,
+        _request: GetPendingTimersRequest,
     ) -> Result<Vec<PendingTimer>, ClusterError> {
         let rows: Vec<(String, DateTime<Utc>, i64, bool)> = sqlx::query_as(
             "SELECT timer_id, scheduled_at, delay_ms, cancelled FROM timer_test_pending
              WHERE entity_id = $1
              ORDER BY scheduled_at",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -173,7 +163,7 @@ impl TimerTest {
             "UPDATE timer_test_pending SET cancelled = true
              WHERE entity_id = $1 AND timer_id = $2 AND cancelled = false",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(&request.timer_id)
         .execute(&self.pool)
         .await
@@ -187,9 +177,9 @@ impl TimerTest {
 
     /// Clear the timer fire history.
     #[rpc(persisted)]
-    pub async fn clear_fires(&self, request: ClearFiresRequest) -> Result<(), ClusterError> {
+    pub async fn clear_fires(&self, _request: ClearFiresRequest) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM timer_test_fires WHERE entity_id = $1")
-            .bind(&request.entity_id)
+            .bind(self.entity_id())
             .execute(&self.pool)
             .await
             .map_err(|e| ClusterError::PersistenceError {
@@ -207,8 +197,8 @@ impl TimerTest {
 /// Request to schedule a timer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScheduleTimerRequest {
-    /// Entity ID that owns the timer.
-    pub entity_id: String,
+    /// ID of the TimerTest entity that owns this timer.
+    pub owner_id: String,
     /// Unique timer identifier.
     pub timer_id: String,
     /// Delay in milliseconds.
@@ -226,17 +216,17 @@ pub struct ScheduleTimerRequest {
 #[derive(Clone)]
 pub struct ScheduleTimerWorkflow;
 
-#[workflow_impl(key = |req: &ScheduleTimerRequest| format!("{}/{}", req.entity_id, req.timer_id), hash = false)]
+#[workflow_impl(key = |req: &ScheduleTimerRequest| format!("{}/{}", req.owner_id, req.timer_id), hash = false)]
 impl ScheduleTimerWorkflow {
     async fn execute(&self, request: ScheduleTimerRequest) -> Result<(), ClusterError> {
-        let entity_id = request.entity_id.clone();
+        let owner_id = request.owner_id.clone();
         let timer_id = request.timer_id.clone();
         let delay_ms = request.delay_ms;
         let scheduled_at = Utc::now();
 
         // Record the pending timer
         self.add_pending_timer(
-            entity_id.clone(),
+            owner_id.clone(),
             timer_id.clone(),
             scheduled_at,
             delay_ms as i64,
@@ -248,17 +238,17 @@ impl ScheduleTimerWorkflow {
 
         // After sleep completes, check if timer was cancelled
         let was_cancelled = self
-            .check_cancelled(entity_id.clone(), timer_id.clone())
+            .check_cancelled(owner_id.clone(), timer_id.clone())
             .await?;
 
         if !was_cancelled {
             // Record the fire and remove from pending
             let fired_at = Utc::now();
-            self.record_timer_fire(entity_id, timer_id, scheduled_at, fired_at)
+            self.record_timer_fire(owner_id, timer_id, scheduled_at, fired_at)
                 .await?;
         } else {
             // Remove cancelled timer from pending
-            self.remove_pending_timer(entity_id, timer_id).await?;
+            self.remove_pending_timer(owner_id, timer_id).await?;
         }
 
         Ok(())
@@ -267,7 +257,7 @@ impl ScheduleTimerWorkflow {
     #[activity]
     async fn add_pending_timer(
         &self,
-        entity_id: String,
+        owner_id: String,
         timer_id: String,
         scheduled_at: DateTime<Utc>,
         delay_ms: i64,
@@ -277,7 +267,7 @@ impl ScheduleTimerWorkflow {
              VALUES ($1, $2, $3, $4, false)
              ON CONFLICT (entity_id, timer_id) DO NOTHING",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&timer_id)
         .bind(scheduled_at)
         .bind(delay_ms)
@@ -293,14 +283,14 @@ impl ScheduleTimerWorkflow {
     #[activity]
     async fn check_cancelled(
         &self,
-        entity_id: String,
+        owner_id: String,
         timer_id: String,
     ) -> Result<bool, ClusterError> {
         let row: Option<(bool,)> = sqlx::query_as(
             "SELECT cancelled FROM timer_test_pending
              WHERE entity_id = $1 AND timer_id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&timer_id)
         .fetch_optional(&self.tx)
         .await
@@ -315,7 +305,7 @@ impl ScheduleTimerWorkflow {
     #[activity]
     async fn record_timer_fire(
         &self,
-        entity_id: String,
+        owner_id: String,
         timer_id: String,
         scheduled_at: DateTime<Utc>,
         fired_at: DateTime<Utc>,
@@ -326,7 +316,7 @@ impl ScheduleTimerWorkflow {
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (entity_id, timer_id) DO NOTHING",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&timer_id)
         .bind(scheduled_at)
         .bind(fired_at)
@@ -339,7 +329,7 @@ impl ScheduleTimerWorkflow {
 
         // Remove from pending
         sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
-            .bind(&entity_id)
+            .bind(&owner_id)
             .bind(&timer_id)
             .execute(&self.tx)
             .await
@@ -354,11 +344,11 @@ impl ScheduleTimerWorkflow {
     #[activity]
     async fn remove_pending_timer(
         &self,
-        entity_id: String,
+        owner_id: String,
         timer_id: String,
     ) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM timer_test_pending WHERE entity_id = $1 AND timer_id = $2")
-            .bind(&entity_id)
+            .bind(&owner_id)
             .bind(&timer_id)
             .execute(&self.tx)
             .await
@@ -408,13 +398,13 @@ mod tests {
     #[test]
     fn test_schedule_timer_request_serialization() {
         let req = ScheduleTimerRequest {
-            entity_id: "timer-entity-1".to_string(),
+            owner_id: "timer-entity-1".to_string(),
             timer_id: "t1".to_string(),
             delay_ms: 1000,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ScheduleTimerRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "timer-entity-1");
+        assert_eq!(parsed.owner_id, "timer-entity-1");
         assert_eq!(parsed.timer_id, "t1");
         assert_eq!(parsed.delay_ms, 1000);
     }
@@ -422,24 +412,20 @@ mod tests {
     #[test]
     fn test_cancel_timer_request_serialization() {
         let req = CancelTimerRequest {
-            entity_id: "timer-entity-1".to_string(),
             timer_id: "t1".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: CancelTimerRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "timer-entity-1");
         assert_eq!(parsed.timer_id, "t1");
     }
 
     #[test]
     fn test_clear_fires_request_serialization() {
         let req = ClearFiresRequest {
-            entity_id: "timer-entity-1".to_string(),
             request_id: "clear-1".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ClearFiresRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "timer-entity-1");
         assert_eq!(parsed.request_id, "clear-1");
     }
 }

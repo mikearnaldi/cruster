@@ -32,8 +32,6 @@ pub struct AuditEntry {
 /// Request to log an audit action.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogActionRequest {
-    /// Entity ID for the audit log.
-    pub entity_id: String,
     /// The action to log.
     pub action: String,
     /// The actor performing the action.
@@ -44,10 +42,7 @@ pub struct LogActionRequest {
 
 /// Request to get the audit log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetAuditLogRequest {
-    /// Entity ID to get the audit log for.
-    pub entity_id: String,
-}
+pub struct GetAuditLogRequest {}
 
 /// Auditable RPC group - provides audit logging for entities.
 ///
@@ -71,7 +66,7 @@ impl Auditable {
              VALUES ($1, $2, $3, NOW(), $4)
              RETURNING id",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(&request.action)
         .bind(&request.actor)
         .bind(&request.details)
@@ -95,7 +90,7 @@ impl Auditable {
     #[rpc]
     pub async fn get_audit_log(
         &self,
-        request: GetAuditLogRequest,
+        _request: GetAuditLogRequest,
     ) -> Result<Vec<AuditEntry>, ClusterError> {
         let rows = sqlx::query_as::<_, (i64, String, String, DateTime<Utc>, Option<String>)>(
             "SELECT id, action, actor, timestamp, details
@@ -103,7 +98,7 @@ impl Auditable {
              WHERE entity_id = $1
              ORDER BY id ASC",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -128,23 +123,15 @@ impl Auditable {
 
 /// Request to get the current version.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetVersionRequest {
-    /// Entity ID to get the version for.
-    pub entity_id: String,
-}
+pub struct GetVersionRequest {}
 
 /// Request to bump the version.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BumpVersionRequest {
-    /// Entity ID to bump the version for.
-    pub entity_id: String,
-}
+pub struct BumpVersionRequest {}
 
 /// Request to check a version.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckVersionRequest {
-    /// Entity ID to check the version for.
-    pub entity_id: String,
     /// The expected version.
     pub expected: u64,
 }
@@ -165,10 +152,10 @@ pub struct Versioned {
 impl Versioned {
     /// Get the current version.
     #[rpc]
-    pub async fn get_version(&self, request: GetVersionRequest) -> Result<u64, ClusterError> {
+    pub async fn get_version(&self, _request: GetVersionRequest) -> Result<u64, ClusterError> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT version FROM trait_test_versions WHERE entity_id = $1")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| ClusterError::PersistenceError {
@@ -181,7 +168,7 @@ impl Versioned {
 
     /// Bump the version and return the new version.
     #[rpc(persisted)]
-    pub async fn bump_version(&self, request: BumpVersionRequest) -> Result<u64, ClusterError> {
+    pub async fn bump_version(&self, _request: BumpVersionRequest) -> Result<u64, ClusterError> {
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO trait_test_versions (entity_id, version)
              VALUES ($1, 1)
@@ -189,7 +176,7 @@ impl Versioned {
              DO UPDATE SET version = trait_test_versions.version + 1
              RETURNING version",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -205,7 +192,7 @@ impl Versioned {
     pub async fn check_version(&self, request: CheckVersionRequest) -> Result<bool, ClusterError> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT version FROM trait_test_versions WHERE entity_id = $1")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| ClusterError::PersistenceError {
@@ -242,18 +229,13 @@ pub struct TraitTest {
 /// Request to update the data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpdateRequest {
-    /// Entity ID (used as the DB key).
-    pub entity_id: String,
     /// The new data value.
     pub data: String,
 }
 
 /// Request to get the current data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetTraitDataRequest {
-    /// Entity ID (used as the DB key).
-    pub entity_id: String,
-}
+pub struct GetTraitDataRequest {}
 
 #[entity_impl(rpc_groups(Auditable, Versioned))]
 impl TraitTest {
@@ -274,7 +256,7 @@ impl TraitTest {
              ON CONFLICT (entity_id)
              DO UPDATE SET data = $2",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(&request.data)
         .execute(&self.pool)
         .await
@@ -288,7 +270,7 @@ impl TraitTest {
             "INSERT INTO trait_test_audit_log (entity_id, action, actor, timestamp, details)
              VALUES ($1, 'update', 'system', NOW(), $2)",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(format!("Updated data to: {}", request.data))
         .execute(&self.pool)
         .await
@@ -304,7 +286,7 @@ impl TraitTest {
              ON CONFLICT (entity_id)
              DO UPDATE SET version = trait_test_versions.version + 1",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -317,10 +299,10 @@ impl TraitTest {
 
     /// Get the current data value.
     #[rpc]
-    pub async fn get(&self, request: GetTraitDataRequest) -> Result<String, ClusterError> {
+    pub async fn get(&self, _request: GetTraitDataRequest) -> Result<String, ClusterError> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data FROM trait_test_data WHERE entity_id = $1")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| ClusterError::PersistenceError {
@@ -358,14 +340,12 @@ mod tests {
     #[test]
     fn test_update_request_serialization() {
         let req = UpdateRequest {
-            entity_id: "e1".to_string(),
             data: "hello".to_string(),
         };
 
         let json = serde_json::to_string(&req).unwrap();
         let parsed: UpdateRequest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.entity_id, "e1");
         assert_eq!(parsed.data, "hello");
     }
 }

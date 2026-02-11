@@ -1305,12 +1305,13 @@ fn generate_deferred_key_consts(
 ///
 /// Pure-RPC entities have no `#[state]`, no `#[workflow]`, no `#[activity]`,
 /// and no `&mut self` methods. The generated Handler is minimal:
-/// - `__entity`: the user struct (methods called directly via Deref)
+/// - `__entity`: the user struct (accessed via RpcView Deref)
 /// - `ctx`: EntityContext
 /// - `__sharding`, `__entity_address`: for inter-entity communication
 /// - `__message_storage`: for persisted RPCs
 ///
-/// No view structs, no ArcSwap, no write locks, no workflow engine.
+/// An `__<Name>RpcView` wraps the handler and provides `self.entity_id()`,
+/// `self.entity_address()`, and `self.sharding()` to RPC method bodies.
 #[allow(clippy::too_many_arguments)]
 fn generate_pure_rpc_entity(
     krate: &syn::Path,
@@ -1323,6 +1324,7 @@ fn generate_pure_rpc_entity(
 ) -> syn::Result<proc_macro2::TokenStream> {
     let has_rpc_groups = !rpc_group_infos.is_empty();
     let struct_name_str = struct_name.to_string();
+    let rpc_view_name = format_ident!("__{}RpcView", struct_name);
 
     // --- Entity trait impl (only when no rpc_groups — groups generate their own) ---
     let entity_impl = if has_rpc_groups {
@@ -1369,7 +1371,7 @@ fn generate_pure_rpc_entity(
         }
     };
 
-    // --- Dispatch arms: call methods directly on __entity ---
+    // --- Dispatch arms: call methods via RpcView ---
     let dispatch_arms: Vec<proc_macro2::TokenStream> = rpcs
         .iter()
         .filter(|rpc| rpc.is_dispatchable())
@@ -1407,10 +1409,11 @@ fn generate_pure_rpc_entity(
                 call_args.push(quote! { #name });
             }
             let call_args = quote! { #(#call_args),* };
-            let method_call = quote! { self.__entity.#method_name(#call_args).await? };
+            let method_call = quote! { __view.#method_name(#call_args).await? };
 
             quote! {
                 #tag => {
+                    let __view = #rpc_view_name { __handler: self };
                     #deserialize_request
                     let response = { #method_call };
                     rmp_serde::to_vec(&response)
@@ -1450,7 +1453,7 @@ fn generate_pure_rpc_entity(
         .map(|info| {
             let field = &info.field;
             let wrapper_path = &info.wrapper_path;
-            quote! { #field: #wrapper_path::new(#field), }
+            quote! { #field: #wrapper_path::new(#field, __entity_address.clone()), }
         })
         .collect();
 
@@ -1577,9 +1580,9 @@ fn generate_pure_rpc_entity(
                     __entity: entity,
                     ctx,
                     __sharding,
-                    __entity_address,
                     __message_storage,
                     #(#rpc_group_field_inits)*
+                    __entity_address,
                 })
             }
         }
@@ -1728,11 +1731,6 @@ fn generate_pure_rpc_entity(
     Ok(quote! {
         #(#rpc_group_use_tokens)*
 
-        // Method implementations directly on the entity struct
-        impl #struct_name {
-            #(#method_impls)*
-        }
-
         #with_rpc_groups_impl
         #entity_impl
 
@@ -1760,6 +1758,54 @@ fn generate_pure_rpc_entity(
             #new_with_rpc_groups_fn
 
             #sharding_builtin_impls
+        }
+
+        /// Generated RPC view for the entity.
+        ///
+        /// Wraps the handler and provides access to entity context (entity_id, address, sharding)
+        /// while dereferencing to the user's entity struct for field access (e.g., `self.pool`).
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        struct #rpc_view_name<'a> {
+            __handler: &'a #handler_name,
+        }
+
+        impl ::std::ops::Deref for #rpc_view_name<'_> {
+            type Target = #struct_name;
+            fn deref(&self) -> &Self::Target {
+                &self.__handler.__entity
+            }
+        }
+
+        impl #rpc_view_name<'_> {
+            /// Get the entity ID (from the routing address).
+            #[inline]
+            fn entity_id(&self) -> &str {
+                &self.__handler.__entity_address.entity_id.0
+            }
+
+            /// Get the entity's own address.
+            #[inline]
+            fn entity_address(&self) -> &#krate::types::EntityAddress {
+                &self.__handler.__entity_address
+            }
+
+            /// Get the sharding interface for inter-entity communication.
+            #[inline]
+            fn sharding(&self) -> ::std::option::Option<&::std::sync::Arc<dyn #krate::sharding::Sharding>> {
+                self.__handler.__sharding.as_ref()
+            }
+
+            /// Create an entity client for this entity type.
+            #[inline]
+            fn self_client(&self) -> ::std::option::Option<#krate::entity_client::EntityClient> {
+                self.__handler.__sharding.as_ref().map(|s| {
+                    ::std::sync::Arc::clone(s).make_client(self.__handler.__entity_address.entity_type.clone())
+                })
+            }
+
+            // RPC method implementations (user's original method bodies)
+            #(#method_impls)*
         }
 
         #[async_trait::async_trait]
@@ -3475,6 +3521,7 @@ fn rpc_group_impl_inner(
         #[allow(non_camel_case_types)]
         pub struct #rpc_view_name<'a> {
             __group: &'a #struct_name,
+            __entity_address: &'a #krate::types::EntityAddress,
         }
 
         impl ::std::ops::Deref for #rpc_view_name<'_> {
@@ -3485,6 +3532,18 @@ fn rpc_group_impl_inner(
         }
 
         impl #rpc_view_name<'_> {
+            /// Get the entity ID (from the routing address).
+            #[inline]
+            fn entity_id(&self) -> &str {
+                &self.__entity_address.entity_id.0
+            }
+
+            /// Get the entity's own address.
+            #[inline]
+            fn entity_address(&self) -> &#krate::types::EntityAddress {
+                self.__entity_address
+            }
+
             #(#rpc_view_methods)*
             #(#helper_view_methods)*
         }
@@ -3510,7 +3569,7 @@ fn rpc_group_impl_inner(
                     &self,
                     #(#param_defs),*
                 ) -> ::std::result::Result<#resp_type, #krate::error::ClusterError> {
-                    let __view = #rpc_view_name { __group: &self.__group };
+                    let __view = #rpc_view_name { __group: &self.__group, __entity_address: &self.__entity_address };
                     __view.#method_name(#(#param_names),*).await
                 }
             }
@@ -3587,12 +3646,13 @@ fn rpc_group_impl_inner(
         #[doc(hidden)]
         pub struct #wrapper_name {
             __group: #struct_name,
+            __entity_address: #krate::types::EntityAddress,
         }
 
         impl #wrapper_name {
-            /// Create a new wrapper with the group instance.
-            pub fn new(group: #struct_name) -> Self {
-                Self { __group: group }
+            /// Create a new wrapper with the group instance and entity address.
+            pub fn new(group: #struct_name, entity_address: #krate::types::EntityAddress) -> Self {
+                Self { __group: group, __entity_address: entity_address }
             }
 
             /// Get a reference to the group instance.

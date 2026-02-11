@@ -36,8 +36,8 @@ pub struct WorkflowExecution {
 /// via the `workflow_test_executions` table.
 ///
 /// ## RPCs
-/// - `get_execution(entity_id, exec_id)` - Get a specific execution
-/// - `list_executions(entity_id)` - List all executions for an entity
+/// - `get_execution(owner_id, exec_id)` - Get a specific execution
+/// - `list_executions(owner_id)` - List all executions for an owner
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
 pub struct WorkflowTest {
@@ -48,17 +48,17 @@ pub struct WorkflowTest {
 /// Request to get a specific execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetExecutionRequest {
-    /// Entity ID that owns the execution.
-    pub entity_id: String,
+    /// Owner ID that groups executions.
+    pub owner_id: String,
     /// Execution ID to retrieve.
     pub exec_id: String,
 }
 
-/// Request to list all executions for an entity.
+/// Request to list all executions for an owner.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ListExecutionsRequest {
-    /// Entity ID to list executions for.
-    pub entity_id: String,
+    /// Owner ID to list executions for.
+    pub owner_id: String,
 }
 
 #[entity_impl]
@@ -73,7 +73,7 @@ impl WorkflowTest {
             "SELECT id, steps_completed, result FROM workflow_test_executions
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&request.entity_id)
+        .bind(&request.owner_id)
         .bind(&request.exec_id)
         .fetch_optional(&self.pool)
         .await
@@ -100,7 +100,7 @@ impl WorkflowTest {
              WHERE entity_id = $1
              ORDER BY id",
         )
-        .bind(&request.entity_id)
+        .bind(&request.owner_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -126,8 +126,8 @@ impl WorkflowTest {
 /// Request to run a simple workflow.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunSimpleWorkflowRequest {
-    /// Entity ID (scoping key for executions).
-    pub entity_id: String,
+    /// Owner ID (scoping key for executions).
+    pub owner_id: String,
     /// Unique execution ID.
     pub exec_id: String,
 }
@@ -139,27 +139,27 @@ pub struct RunSimpleWorkflowRequest {
 #[derive(Clone)]
 pub struct SimpleWorkflow;
 
-#[workflow_impl(key = |req: &RunSimpleWorkflowRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+#[workflow_impl(key = |req: &RunSimpleWorkflowRequest| format!("{}/{}", req.owner_id, req.exec_id), hash = false)]
 impl SimpleWorkflow {
     async fn execute(&self, request: RunSimpleWorkflowRequest) -> Result<String, ClusterError> {
-        let entity_id = request.entity_id.clone();
+        let owner_id = request.owner_id.clone();
         let exec_id = request.exec_id.clone();
 
         // Create execution record
-        self.create_execution(entity_id.clone(), exec_id.clone())
+        self.create_execution(owner_id.clone(), exec_id.clone())
             .await?;
 
         // Execute steps 1-3
-        self.complete_step(entity_id.clone(), exec_id.clone(), "step1".to_string())
+        self.complete_step(owner_id.clone(), exec_id.clone(), "step1".to_string())
             .await?;
-        self.complete_step(entity_id.clone(), exec_id.clone(), "step2".to_string())
+        self.complete_step(owner_id.clone(), exec_id.clone(), "step2".to_string())
             .await?;
-        self.complete_step(entity_id.clone(), exec_id.clone(), "step3".to_string())
+        self.complete_step(owner_id.clone(), exec_id.clone(), "step3".to_string())
             .await?;
 
         // Mark as completed
         let result = format!("completed:{}", exec_id);
-        self.mark_completed(entity_id, exec_id, result.clone())
+        self.mark_completed(owner_id, exec_id, result.clone())
             .await?;
 
         Ok(result)
@@ -168,7 +168,7 @@ impl SimpleWorkflow {
     #[activity]
     async fn create_execution(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
         sqlx::query(
@@ -177,7 +177,7 @@ impl SimpleWorkflow {
              ON CONFLICT (entity_id, id) DO NOTHING",
         )
         .bind(&exec_id)
-        .bind(&entity_id)
+        .bind(&owner_id)
         .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -190,7 +190,7 @@ impl SimpleWorkflow {
     #[activity]
     async fn complete_step(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
         step_name: String,
     ) -> Result<(), ClusterError> {
@@ -199,7 +199,7 @@ impl SimpleWorkflow {
              SET steps_completed = array_append(steps_completed, $3)
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&exec_id)
         .bind(&step_name)
         .execute(&self.tx)
@@ -214,7 +214,7 @@ impl SimpleWorkflow {
     #[activity]
     async fn mark_completed(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
         result: String,
     ) -> Result<(), ClusterError> {
@@ -222,7 +222,7 @@ impl SimpleWorkflow {
             "UPDATE workflow_test_executions SET result = $3
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&exec_id)
         .bind(&result)
         .execute(&self.tx)
@@ -242,8 +242,8 @@ impl SimpleWorkflow {
 /// Request to run a workflow that fails at a specific step.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunFailingWorkflowRequest {
-    /// Entity ID (scoping key for executions).
-    pub entity_id: String,
+    /// Owner ID (scoping key for executions).
+    pub owner_id: String,
     /// Unique execution ID.
     pub exec_id: String,
     /// Step number to fail at (0-indexed).
@@ -257,35 +257,35 @@ pub struct RunFailingWorkflowRequest {
 #[derive(Clone)]
 pub struct FailingWorkflow;
 
-#[workflow_impl(key = |req: &RunFailingWorkflowRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+#[workflow_impl(key = |req: &RunFailingWorkflowRequest| format!("{}/{}", req.owner_id, req.exec_id), hash = false)]
 impl FailingWorkflow {
     async fn execute(&self, request: RunFailingWorkflowRequest) -> Result<String, ClusterError> {
-        let entity_id = request.entity_id.clone();
+        let owner_id = request.owner_id.clone();
         let exec_id = request.exec_id.clone();
         let fail_at = request.fail_at;
 
         // Create execution record
-        self.create_execution(entity_id.clone(), exec_id.clone())
+        self.create_execution(owner_id.clone(), exec_id.clone())
             .await?;
 
         // Execute steps until failure
         for i in 0..3 {
             if i == fail_at {
                 // Mark as failed
-                self.mark_failed(entity_id.clone(), exec_id.clone(), i)
+                self.mark_failed(owner_id.clone(), exec_id.clone(), i)
                     .await?;
                 return Err(ClusterError::MalformedMessage {
                     reason: format!("Intentional failure at step {}", i),
                     source: None,
                 });
             }
-            self.complete_step(entity_id.clone(), exec_id.clone(), format!("step{}", i))
+            self.complete_step(owner_id.clone(), exec_id.clone(), format!("step{}", i))
                 .await?;
         }
 
         // Mark as completed
         let result = format!("completed:{}", exec_id);
-        self.mark_completed(entity_id, exec_id, result.clone())
+        self.mark_completed(owner_id, exec_id, result.clone())
             .await?;
 
         Ok(result)
@@ -294,7 +294,7 @@ impl FailingWorkflow {
     #[activity]
     async fn create_execution(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
         sqlx::query(
@@ -303,7 +303,7 @@ impl FailingWorkflow {
              ON CONFLICT (entity_id, id) DO NOTHING",
         )
         .bind(&exec_id)
-        .bind(&entity_id)
+        .bind(&owner_id)
         .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -316,7 +316,7 @@ impl FailingWorkflow {
     #[activity]
     async fn complete_step(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
         step_name: String,
     ) -> Result<(), ClusterError> {
@@ -325,7 +325,7 @@ impl FailingWorkflow {
              SET steps_completed = array_append(steps_completed, $3)
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&exec_id)
         .bind(&step_name)
         .execute(&self.tx)
@@ -340,7 +340,7 @@ impl FailingWorkflow {
     #[activity]
     async fn mark_completed(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
         result: String,
     ) -> Result<(), ClusterError> {
@@ -348,7 +348,7 @@ impl FailingWorkflow {
             "UPDATE workflow_test_executions SET result = $3
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&exec_id)
         .bind(&result)
         .execute(&self.tx)
@@ -363,7 +363,7 @@ impl FailingWorkflow {
     #[activity]
     async fn mark_failed(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
         step: usize,
     ) -> Result<(), ClusterError> {
@@ -371,7 +371,7 @@ impl FailingWorkflow {
             "UPDATE workflow_test_executions SET result = $3
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&exec_id)
         .bind(format!("failed:step{}", step))
         .execute(&self.tx)
@@ -391,8 +391,8 @@ impl FailingWorkflow {
 /// Request to run a long workflow with N steps.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunLongWorkflowRequest {
-    /// Entity ID (scoping key for executions).
-    pub entity_id: String,
+    /// Owner ID (scoping key for executions).
+    pub owner_id: String,
     /// Unique execution ID.
     pub exec_id: String,
     /// Number of steps to execute.
@@ -406,26 +406,26 @@ pub struct RunLongWorkflowRequest {
 #[derive(Clone)]
 pub struct LongWorkflow;
 
-#[workflow_impl(key = |req: &RunLongWorkflowRequest| format!("{}/{}", req.entity_id, req.exec_id), hash = false)]
+#[workflow_impl(key = |req: &RunLongWorkflowRequest| format!("{}/{}", req.owner_id, req.exec_id), hash = false)]
 impl LongWorkflow {
     async fn execute(&self, request: RunLongWorkflowRequest) -> Result<String, ClusterError> {
-        let entity_id = request.entity_id.clone();
+        let owner_id = request.owner_id.clone();
         let exec_id = request.exec_id.clone();
         let steps = request.steps;
 
         // Create execution record
-        self.create_execution(entity_id.clone(), exec_id.clone())
+        self.create_execution(owner_id.clone(), exec_id.clone())
             .await?;
 
         // Execute all steps
         for i in 0..steps {
-            self.complete_step(entity_id.clone(), exec_id.clone(), format!("step{}", i))
+            self.complete_step(owner_id.clone(), exec_id.clone(), format!("step{}", i))
                 .await?;
         }
 
         // Mark as completed
         let result = format!("completed:{}", exec_id);
-        self.mark_completed(entity_id, exec_id, result.clone())
+        self.mark_completed(owner_id, exec_id, result.clone())
             .await?;
 
         Ok(result)
@@ -434,7 +434,7 @@ impl LongWorkflow {
     #[activity]
     async fn create_execution(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
     ) -> Result<(), ClusterError> {
         sqlx::query(
@@ -443,7 +443,7 @@ impl LongWorkflow {
              ON CONFLICT (entity_id, id) DO NOTHING",
         )
         .bind(&exec_id)
-        .bind(&entity_id)
+        .bind(&owner_id)
         .execute(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -456,7 +456,7 @@ impl LongWorkflow {
     #[activity]
     async fn complete_step(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
         step_name: String,
     ) -> Result<(), ClusterError> {
@@ -465,7 +465,7 @@ impl LongWorkflow {
              SET steps_completed = array_append(steps_completed, $3)
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&exec_id)
         .bind(&step_name)
         .execute(&self.tx)
@@ -480,7 +480,7 @@ impl LongWorkflow {
     #[activity]
     async fn mark_completed(
         &self,
-        entity_id: String,
+        owner_id: String,
         exec_id: String,
         result: String,
     ) -> Result<(), ClusterError> {
@@ -488,7 +488,7 @@ impl LongWorkflow {
             "UPDATE workflow_test_executions SET result = $3
              WHERE entity_id = $1 AND id = $2",
         )
-        .bind(&entity_id)
+        .bind(&owner_id)
         .bind(&exec_id)
         .bind(&result)
         .execute(&self.tx)
@@ -524,25 +524,25 @@ mod tests {
     #[test]
     fn test_run_simple_workflow_request_serialization() {
         let req = RunSimpleWorkflowRequest {
-            entity_id: "wf-1".to_string(),
+            owner_id: "wf-1".to_string(),
             exec_id: "exec-1".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RunSimpleWorkflowRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "wf-1");
+        assert_eq!(parsed.owner_id, "wf-1");
         assert_eq!(parsed.exec_id, "exec-1");
     }
 
     #[test]
     fn test_run_failing_workflow_request_serialization() {
         let req = RunFailingWorkflowRequest {
-            entity_id: "wf-1".to_string(),
+            owner_id: "wf-1".to_string(),
             exec_id: "exec-1".to_string(),
             fail_at: 2,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RunFailingWorkflowRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "wf-1");
+        assert_eq!(parsed.owner_id, "wf-1");
         assert_eq!(parsed.exec_id, "exec-1");
         assert_eq!(parsed.fail_at, 2);
     }
@@ -550,13 +550,13 @@ mod tests {
     #[test]
     fn test_run_long_workflow_request_serialization() {
         let req = RunLongWorkflowRequest {
-            entity_id: "wf-1".to_string(),
+            owner_id: "wf-1".to_string(),
             exec_id: "exec-1".to_string(),
             steps: 10,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RunLongWorkflowRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "wf-1");
+        assert_eq!(parsed.owner_id, "wf-1");
         assert_eq!(parsed.exec_id, "exec-1");
         assert_eq!(parsed.steps, 10);
     }

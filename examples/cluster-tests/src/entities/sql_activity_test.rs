@@ -23,9 +23,9 @@ use sqlx::PgPool;
 /// State for SqlActivityTest entity (stored in PG `sql_activity_test_state` table).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SqlActivityTestState {
-    /// The entity ID.
-    pub entity_id: String,
-    /// Number of transfers made by this entity.
+    /// The account ID.
+    pub account_id: String,
+    /// Number of transfers made by this account.
     pub transfer_count: i64,
     /// Total amount transferred.
     pub total_transferred: i64,
@@ -41,7 +41,7 @@ pub struct SqlActivityTestState {
 /// via the `sql_activity_test_state` table.
 ///
 /// ## RPCs
-/// - `get_state(entity_id)` - Get the transfer state for an entity
+/// - `get_state(account_id)` - Get the transfer state for an account
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
 pub struct SqlActivityTest {
@@ -49,11 +49,11 @@ pub struct SqlActivityTest {
     pub pool: PgPool,
 }
 
-/// Request to get state for an entity.
+/// Request to get state for an account.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetStateRequest {
-    /// Entity ID to get state for.
-    pub entity_id: String,
+    /// Account ID to get state for.
+    pub account_id: String,
 }
 
 #[entity_impl]
@@ -68,7 +68,7 @@ impl SqlActivityTest {
             "SELECT transfer_count, total_transferred FROM sql_activity_test_state
              WHERE entity_id = $1",
         )
-        .bind(&request.entity_id)
+        .bind(&request.account_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -78,12 +78,12 @@ impl SqlActivityTest {
 
         match row {
             Some((transfer_count, total_transferred)) => Ok(SqlActivityTestState {
-                entity_id: request.entity_id,
+                account_id: request.account_id,
                 transfer_count,
                 total_transferred,
             }),
             None => Ok(SqlActivityTestState {
-                entity_id: request.entity_id,
+                account_id: request.account_id,
                 transfer_count: 0,
                 total_transferred: 0,
             }),
@@ -98,10 +98,10 @@ impl SqlActivityTest {
 /// Request to make a transfer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransferRequest {
-    /// Source entity ID.
-    pub entity_id: String,
-    /// Target entity ID.
-    pub to_entity: String,
+    /// Source account ID.
+    pub account_id: String,
+    /// Target account ID.
+    pub to_account: String,
     /// Amount to transfer.
     pub amount: i64,
 }
@@ -114,10 +114,10 @@ pub struct TransferRequest {
 #[derive(Clone)]
 pub struct SqlTransferWorkflow;
 
-#[workflow_impl(key = |req: &TransferRequest| format!("{}/transfer/{}/{}", req.entity_id, req.to_entity, req.amount))]
+#[workflow_impl(key = |req: &TransferRequest| format!("{}/transfer/{}/{}", req.account_id, req.to_account, req.amount))]
 impl SqlTransferWorkflow {
     async fn execute(&self, request: TransferRequest) -> Result<i64, ClusterError> {
-        self.do_transfer(request.entity_id, request.to_entity, request.amount)
+        self.do_transfer(request.account_id, request.to_account, request.amount)
             .await
     }
 
@@ -129,8 +129,8 @@ impl SqlTransferWorkflow {
     #[activity]
     async fn do_transfer(
         &self,
-        entity_id: String,
-        to_entity: String,
+        account_id: String,
+        to_account: String,
         amount: i64,
     ) -> Result<i64, ClusterError> {
         // Upsert state
@@ -147,7 +147,7 @@ impl SqlTransferWorkflow {
                total_transferred = sql_activity_test_state.total_transferred + $2
              RETURNING transfer_count",
         )
-        .bind(&entity_id)
+        .bind(&account_id)
         .bind(amount)
         .fetch_one(&self.tx)
         .await
@@ -161,8 +161,8 @@ impl SqlTransferWorkflow {
             "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
              VALUES ($1, $2, $3, NOW())",
         )
-        .bind(&entity_id)
-        .bind(&to_entity)
+        .bind(&account_id)
+        .bind(&to_account)
         .bind(amount)
         .execute(&self.tx)
         .await
@@ -182,10 +182,10 @@ impl SqlTransferWorkflow {
 /// Request to make a transfer that will fail.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FailingTransferRequest {
-    /// Source entity ID.
-    pub entity_id: String,
-    /// Target entity ID.
-    pub to_entity: String,
+    /// Source account ID.
+    pub account_id: String,
+    /// Target account ID.
+    pub to_account: String,
     /// Amount to transfer.
     pub amount: i64,
 }
@@ -195,10 +195,10 @@ pub struct FailingTransferRequest {
 #[derive(Clone)]
 pub struct SqlFailingTransferWorkflow;
 
-#[workflow_impl(key = |req: &FailingTransferRequest| format!("{}/failing/{}/{}", req.entity_id, req.to_entity, req.amount))]
+#[workflow_impl(key = |req: &FailingTransferRequest| format!("{}/failing/{}/{}", req.account_id, req.to_account, req.amount))]
 impl SqlFailingTransferWorkflow {
     async fn execute(&self, request: FailingTransferRequest) -> Result<i64, ClusterError> {
-        self.do_failing_transfer(request.entity_id, request.to_entity, request.amount)
+        self.do_failing_transfer(request.account_id, request.to_account, request.amount)
             .await
     }
 
@@ -207,8 +207,8 @@ impl SqlFailingTransferWorkflow {
     #[activity]
     async fn do_failing_transfer(
         &self,
-        entity_id: String,
-        to_entity: String,
+        account_id: String,
+        to_account: String,
         amount: i64,
     ) -> Result<i64, ClusterError> {
         // Upsert state (should be rolled back)
@@ -219,7 +219,7 @@ impl SqlFailingTransferWorkflow {
                transfer_count = sql_activity_test_state.transfer_count + 1,
                total_transferred = sql_activity_test_state.total_transferred + $2",
         )
-        .bind(&entity_id)
+        .bind(&account_id)
         .bind(amount)
         .execute(&self.tx)
         .await
@@ -233,8 +233,8 @@ impl SqlFailingTransferWorkflow {
             "INSERT INTO sql_activity_test_transfers (from_entity, to_entity, amount, created_at)
              VALUES ($1, $2, $3, NOW())",
         )
-        .bind(&entity_id)
-        .bind(&to_entity)
+        .bind(&account_id)
+        .bind(&to_account)
         .bind(amount)
         .execute(&self.tx)
         .await
@@ -258,8 +258,8 @@ impl SqlFailingTransferWorkflow {
 /// Request to query SQL count.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetSqlCountRequest {
-    /// Source entity ID.
-    pub entity_id: String,
+    /// Source account ID.
+    pub account_id: String,
     /// Unique query ID to prevent caching.
     pub query_id: String,
 }
@@ -269,15 +269,15 @@ pub struct GetSqlCountRequest {
 #[derive(Clone)]
 pub struct SqlCountWorkflow;
 
-#[workflow_impl(key = |req: &GetSqlCountRequest| format!("{}/count/{}", req.entity_id, req.query_id), hash = false)]
+#[workflow_impl(key = |req: &GetSqlCountRequest| format!("{}/count/{}", req.account_id, req.query_id), hash = false)]
 impl SqlCountWorkflow {
     async fn execute(&self, request: GetSqlCountRequest) -> Result<i64, ClusterError> {
-        self.do_get_transfer_count(request.entity_id).await
+        self.do_get_transfer_count(request.account_id).await
     }
 
     /// Activity that queries the transfers table within a SQL transaction.
     #[activity]
-    async fn do_get_transfer_count(&self, entity_id: String) -> Result<i64, ClusterError> {
+    async fn do_get_transfer_count(&self, account_id: String) -> Result<i64, ClusterError> {
         #[derive(sqlx::FromRow)]
         struct CountResult {
             count: i64,
@@ -286,7 +286,7 @@ impl SqlCountWorkflow {
         let result: CountResult = sqlx::query_as(
             "SELECT COUNT(*) as count FROM sql_activity_test_transfers WHERE from_entity = $1",
         )
-        .bind(&entity_id)
+        .bind(&account_id)
         .fetch_one(&self.tx)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -305,13 +305,13 @@ mod tests {
     #[test]
     fn test_state_serialization() {
         let state = SqlActivityTestState {
-            entity_id: "test-entity-1".to_string(),
+            account_id: "test-entity-1".to_string(),
             transfer_count: 5,
             total_transferred: 500,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: SqlActivityTestState = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "test-entity-1");
+        assert_eq!(parsed.account_id, "test-entity-1");
         assert_eq!(parsed.transfer_count, 5);
         assert_eq!(parsed.total_transferred, 500);
     }
@@ -319,27 +319,27 @@ mod tests {
     #[test]
     fn test_transfer_request_serialization() {
         let req = TransferRequest {
-            entity_id: "src-1".to_string(),
-            to_entity: "dst-1".to_string(),
+            account_id: "src-1".to_string(),
+            to_account: "dst-1".to_string(),
             amount: 100,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: TransferRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "src-1");
-        assert_eq!(parsed.to_entity, "dst-1");
+        assert_eq!(parsed.account_id, "src-1");
+        assert_eq!(parsed.to_account, "dst-1");
         assert_eq!(parsed.amount, 100);
     }
 
     #[test]
     fn test_failing_transfer_request_serialization() {
         let req = FailingTransferRequest {
-            entity_id: "src-1".to_string(),
-            to_entity: "dst-1".to_string(),
+            account_id: "src-1".to_string(),
+            to_account: "dst-1".to_string(),
             amount: 999,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: FailingTransferRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "src-1");
+        assert_eq!(parsed.account_id, "src-1");
         assert_eq!(parsed.amount, 999);
     }
 }

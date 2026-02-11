@@ -8,8 +8,8 @@
 //! The counter value lives in a `stateless_counter_values` table,
 //! demonstrating that entities can manage their own persistence.
 //!
-//! Since pure-RPC entity methods only receive `&self` and request parameters
-//! (no `EntityContext`), the entity ID is passed through request structs.
+//! The entity ID is available via `self.entity_id()` from the framework context,
+//! so request structs only contain operation-specific parameters.
 
 use cruster::error::ClusterError;
 use cruster::prelude::*;
@@ -21,7 +21,7 @@ use sqlx::PgPool;
 /// ## RPCs
 /// - `increment(amount)` - Add to counter, return new value (persisted)
 /// - `decrement(amount)` - Subtract from counter, return new value (persisted)
-/// - `get(entity_id)` - Get current value (non-persisted, read-only)
+/// - `get()` - Get current value (non-persisted, read-only)
 /// - `reset()` - Reset to zero (persisted)
 #[entity(max_idle_time_secs = 5)]
 #[derive(Clone)]
@@ -33,8 +33,6 @@ pub struct StatelessCounter {
 /// Request to increment the stateless counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatelessIncrementRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
     /// Amount to increment by.
     pub amount: i64,
 }
@@ -42,25 +40,17 @@ pub struct StatelessIncrementRequest {
 /// Request to decrement the stateless counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatelessDecrementRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
     /// Amount to decrement by.
     pub amount: i64,
 }
 
 /// Request to get the stateless counter value.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StatelessGetRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
-}
+pub struct StatelessGetRequest {}
 
 /// Request to reset the stateless counter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StatelessResetRequest {
-    /// Entity identifier (used as the DB key).
-    pub entity_id: String,
-}
+pub struct StatelessResetRequest {}
 
 #[entity_impl]
 impl StatelessCounter {
@@ -76,7 +66,7 @@ impl StatelessCounter {
              DO UPDATE SET value = stateless_counter_values.value + $2
              RETURNING value",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(request.amount)
         .fetch_one(&self.pool)
         .await
@@ -99,7 +89,7 @@ impl StatelessCounter {
              DO UPDATE SET value = stateless_counter_values.value - $2
              RETURNING value",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(request.amount)
         .fetch_one(&self.pool)
         .await
@@ -114,10 +104,10 @@ impl StatelessCounter {
     ///
     /// Uses `#[rpc]` (non-persisted) since this is a read-only operation.
     #[rpc]
-    pub async fn get(&self, request: StatelessGetRequest) -> Result<i64, ClusterError> {
+    pub async fn get(&self, _request: StatelessGetRequest) -> Result<i64, ClusterError> {
         let result: Option<(i64,)> =
             sqlx::query_as("SELECT value FROM stateless_counter_values WHERE entity_id = $1")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| ClusterError::PersistenceError {
@@ -131,14 +121,14 @@ impl StatelessCounter {
     ///
     /// Uses `#[rpc(persisted)]` for at-least-once delivery (writes).
     #[rpc(persisted)]
-    pub async fn reset(&self, request: StatelessResetRequest) -> Result<(), ClusterError> {
+    pub async fn reset(&self, _request: StatelessResetRequest) -> Result<(), ClusterError> {
         sqlx::query(
             "INSERT INTO stateless_counter_values (entity_id, value)
              VALUES ($1, 0)
              ON CONFLICT (entity_id)
              DO UPDATE SET value = 0",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -155,45 +145,33 @@ mod tests {
 
     #[test]
     fn test_increment_request_serialization() {
-        let req = StatelessIncrementRequest {
-            entity_id: "counter-1".to_string(),
-            amount: 42,
-        };
+        let req = StatelessIncrementRequest { amount: 42 };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: StatelessIncrementRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
         assert_eq!(parsed.amount, 42);
     }
 
     #[test]
     fn test_decrement_request_serialization() {
-        let req = StatelessDecrementRequest {
-            entity_id: "counter-1".to_string(),
-            amount: 10,
-        };
+        let req = StatelessDecrementRequest { amount: 10 };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: StatelessDecrementRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
         assert_eq!(parsed.amount, 10);
     }
 
     #[test]
     fn test_get_request_serialization() {
-        let req = StatelessGetRequest {
-            entity_id: "counter-1".to_string(),
-        };
+        let req = StatelessGetRequest {};
         let json = serde_json::to_string(&req).unwrap();
         let parsed: StatelessGetRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
+        let _ = parsed; // empty struct, just verify round-trip
     }
 
     #[test]
     fn test_reset_request_serialization() {
-        let req = StatelessResetRequest {
-            entity_id: "counter-1".to_string(),
-        };
+        let req = StatelessResetRequest {};
         let json = serde_json::to_string(&req).unwrap();
         let parsed: StatelessResetRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.entity_id, "counter-1");
+        let _ = parsed; // empty struct, just verify round-trip
     }
 }

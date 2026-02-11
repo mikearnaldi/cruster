@@ -51,8 +51,6 @@ pub struct CrossEntity {
 /// Request to receive a message from another entity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReceiveRequest {
-    /// Entity ID of the recipient (used as the DB key).
-    pub entity_id: String,
     /// The entity that sent the message.
     pub from: String,
     /// The message content.
@@ -62,39 +60,25 @@ pub struct ReceiveRequest {
 /// Request for ping operation in ping-pong.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PingRequest {
-    /// Entity ID of the recipient (used as the DB key).
-    pub entity_id: String,
     /// Current ping count.
     pub count: u32,
 }
 
 /// Request to clear messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClearMessagesRequest {
-    /// Entity ID whose messages to clear.
-    pub entity_id: String,
-}
+pub struct ClearMessagesRequest {}
 
 /// Request to reset ping count.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ResetPingCountRequest {
-    /// Entity ID whose ping count to reset.
-    pub entity_id: String,
-}
+pub struct ResetPingCountRequest {}
 
 /// Request to get messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetMessagesRequest {
-    /// Entity ID to get messages for.
-    pub entity_id: String,
-}
+pub struct GetMessagesRequest {}
 
 /// Request to get ping count.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GetPingCountRequest {
-    /// Entity ID to get ping count for.
-    pub entity_id: String,
-}
+pub struct GetPingCountRequest {}
 
 #[entity_impl]
 impl CrossEntity {
@@ -108,7 +92,7 @@ impl CrossEntity {
             "INSERT INTO cross_entity_messages (entity_id, from_entity, content, timestamp)
              VALUES ($1, $2, $3, $4)",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(&request.from)
         .bind(&request.message)
         .bind(now)
@@ -127,14 +111,14 @@ impl CrossEntity {
     #[rpc]
     pub async fn get_messages(
         &self,
-        request: GetMessagesRequest,
+        _request: GetMessagesRequest,
     ) -> Result<Vec<Message>, ClusterError> {
         let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
             "SELECT from_entity, content, timestamp FROM cross_entity_messages
              WHERE entity_id = $1
              ORDER BY timestamp ASC",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -158,9 +142,9 @@ impl CrossEntity {
     /// twice should clear any messages that arrived between calls. Persisted RPCs
     /// deduplicate by payload hash, which would skip the second clear.
     #[rpc]
-    pub async fn clear_messages(&self, request: ClearMessagesRequest) -> Result<(), ClusterError> {
+    pub async fn clear_messages(&self, _request: ClearMessagesRequest) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM cross_entity_messages WHERE entity_id = $1")
-            .bind(&request.entity_id)
+            .bind(self.entity_id())
             .execute(&self.pool)
             .await
             .map_err(|e| ClusterError::PersistenceError {
@@ -184,7 +168,7 @@ impl CrossEntity {
              ON CONFLICT (entity_id)
              DO UPDATE SET ping_count = $2",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .bind(request.count as i32)
         .execute(&self.pool)
         .await
@@ -199,10 +183,10 @@ impl CrossEntity {
     ///
     /// Uses `#[rpc]` (non-persisted) since this is a read-only operation.
     #[rpc]
-    pub async fn get_ping_count(&self, request: GetPingCountRequest) -> Result<u32, ClusterError> {
+    pub async fn get_ping_count(&self, _request: GetPingCountRequest) -> Result<u32, ClusterError> {
         let result: Option<(i32,)> =
             sqlx::query_as("SELECT ping_count FROM cross_entity_ping_counts WHERE entity_id = $1")
-                .bind(&request.entity_id)
+                .bind(self.entity_id())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| ClusterError::PersistenceError {
@@ -218,7 +202,7 @@ impl CrossEntity {
     #[rpc(persisted)]
     pub async fn reset_ping_count(
         &self,
-        request: ResetPingCountRequest,
+        _request: ResetPingCountRequest,
     ) -> Result<(), ClusterError> {
         sqlx::query(
             "INSERT INTO cross_entity_ping_counts (entity_id, ping_count)
@@ -226,7 +210,7 @@ impl CrossEntity {
              ON CONFLICT (entity_id)
              DO UPDATE SET ping_count = 0",
         )
-        .bind(&request.entity_id)
+        .bind(self.entity_id())
         .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -259,7 +243,6 @@ mod tests {
     #[test]
     fn test_receive_request_serialization() {
         let req = ReceiveRequest {
-            entity_id: "cross-1".to_string(),
             from: "sender".to_string(),
             message: "hello".to_string(),
         };
@@ -267,70 +250,61 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ReceiveRequest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.entity_id, "cross-1");
         assert_eq!(parsed.from, "sender");
         assert_eq!(parsed.message, "hello");
     }
 
     #[test]
     fn test_ping_request_serialization() {
-        let req = PingRequest {
-            entity_id: "cross-1".to_string(),
-            count: 42,
-        };
+        let req = PingRequest { count: 42 };
 
         let json = serde_json::to_string(&req).unwrap();
         let parsed: PingRequest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.entity_id, "cross-1");
         assert_eq!(parsed.count, 42);
     }
 
     #[test]
     fn test_clear_messages_request_serialization() {
-        let req = ClearMessagesRequest {
-            entity_id: "cross-1".to_string(),
-        };
+        let req = ClearMessagesRequest {};
 
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ClearMessagesRequest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.entity_id, "cross-1");
+        assert_eq!(json, "{}");
+        let _ = parsed;
     }
 
     #[test]
     fn test_reset_ping_count_request_serialization() {
-        let req = ResetPingCountRequest {
-            entity_id: "cross-1".to_string(),
-        };
+        let req = ResetPingCountRequest {};
 
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ResetPingCountRequest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.entity_id, "cross-1");
+        assert_eq!(json, "{}");
+        let _ = parsed;
     }
 
     #[test]
     fn test_get_messages_request_serialization() {
-        let req = GetMessagesRequest {
-            entity_id: "cross-1".to_string(),
-        };
+        let req = GetMessagesRequest {};
 
         let json = serde_json::to_string(&req).unwrap();
         let parsed: GetMessagesRequest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.entity_id, "cross-1");
+        assert_eq!(json, "{}");
+        let _ = parsed;
     }
 
     #[test]
     fn test_get_ping_count_request_serialization() {
-        let req = GetPingCountRequest {
-            entity_id: "cross-1".to_string(),
-        };
+        let req = GetPingCountRequest {};
 
         let json = serde_json::to_string(&req).unwrap();
         let parsed: GetPingCountRequest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.entity_id, "cross-1");
+        assert_eq!(json, "{}");
+        let _ = parsed;
     }
 }

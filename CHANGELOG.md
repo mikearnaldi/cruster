@@ -1,3 +1,19 @@
+## 0.0.19 (2026-02-16)
+
+### Fixes
+
+#### feat: derive `Clone` on `EntityClient` and generated entity/workflow clients
+
+All clients are now `Clone`. They are lightweight handles (`Arc` + `String`),
+so cloning is cheap and `Arc` wrapping is no longer necessary.
+
+#### feat: add `join()` to workflow clients
+
+Workflow clients now support `join(execution_id)` which blocks until the
+workflow result is available, unlike `poll()` which returns `Option`
+immediately. Backed by a new `await_reply` method on `Sharding` that
+uses `register_reply_handler` for real-time push notification.
+
 ## 0.0.18 (2026-02-16)
 
 ### Fixes

@@ -102,6 +102,21 @@ pub trait Sharding: Send + Sync {
         Ok(vec![])
     }
 
+    /// Subscribe to the reply for a given request ID and await it.
+    ///
+    /// If the reply already exists in storage, it is returned immediately.
+    /// Otherwise, registers a live handler and waits for the reply to arrive.
+    ///
+    /// Returns a [`ReplyReceiver`] that will yield the reply when available.
+    /// Used by workflow clients for `join` — like `poll` but blocking.
+    async fn await_reply(&self, request_id: Snowflake) -> Result<ReplyReceiver, ClusterError> {
+        let _ = request_id;
+        Err(ClusterError::PersistenceError {
+            reason: "await_reply not supported by this sharding implementation".into(),
+            source: None,
+        })
+    }
+
     /// Graceful shutdown.
     async fn shutdown(&self) -> Result<(), ClusterError>;
 }

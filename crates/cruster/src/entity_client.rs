@@ -19,6 +19,9 @@ use tracing::instrument;
 ///
 /// Created via `Sharding::make_client`. Handles shard resolution,
 /// envelope construction, and response deserialization.
+///
+/// Cloning is cheap — the inner sharding handle is an `Arc`.
+#[derive(Clone)]
 pub struct EntityClient {
     sharding: Arc<dyn Sharding>,
     entity_type: EntityType,
@@ -475,6 +478,57 @@ impl EntityClient {
         }
 
         Ok(None)
+    }
+
+    /// Join (await) the result of a previously-started persisted request.
+    ///
+    /// Like [`poll_reply`](Self::poll_reply) but blocks until the result is
+    /// available instead of returning `Option`. If the reply already exists in
+    /// storage it is returned immediately; otherwise a live handler is
+    /// registered and the call awaits the reply in real-time.
+    ///
+    /// The `key_bytes` are the same bytes used by `send_persisted`/`notify_persisted`
+    /// for deterministic request ID derivation (typically the entity_id bytes for
+    /// workflow executions).
+    #[instrument(skip(self, key_bytes), fields(entity_type = %self.entity_type, entity_id = %entity_id))]
+    pub async fn join_reply<Res>(
+        &self,
+        entity_id: &EntityId,
+        tag: &str,
+        key_bytes: &[u8],
+    ) -> Result<Res, ClusterError>
+    where
+        Res: DeserializeOwned,
+    {
+        let request_id = persisted_request_id(&self.entity_type, entity_id, tag, key_bytes);
+        let mut reply_rx = self.sharding.await_reply(request_id).await?;
+
+        let reply = reply_rx
+            .recv()
+            .await
+            .ok_or_else(|| ClusterError::MalformedMessage {
+                reason: "reply channel closed without response".into(),
+                source: None,
+            })?;
+
+        match reply {
+            Reply::WithExit(r) => match r.exit {
+                ExitResult::Success(bytes) => {
+                    rmp_serde::from_slice(&bytes).map_err(|e| ClusterError::MalformedMessage {
+                        reason: format!("failed to deserialize join response: {e}"),
+                        source: Some(Box::new(e)),
+                    })
+                }
+                ExitResult::Failure(msg) => Err(ClusterError::MalformedMessage {
+                    reason: msg,
+                    source: None,
+                }),
+            },
+            Reply::Chunk(_) => Err(ClusterError::MalformedMessage {
+                reason: "expected WithExit reply, got Chunk".into(),
+                source: None,
+            }),
+        }
     }
 
     /// Get the entity type this client targets.

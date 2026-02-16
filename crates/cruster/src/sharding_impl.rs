@@ -2607,6 +2607,35 @@ impl Sharding for ShardingImpl {
         }
     }
 
+    async fn await_reply(&self, request_id: Snowflake) -> Result<ReplyReceiver, ClusterError> {
+        let storage =
+            self.message_storage
+                .as_ref()
+                .ok_or_else(|| ClusterError::PersistenceError {
+                    reason: "await_reply requires message storage".into(),
+                    source: None,
+                })?;
+
+        let (tx, rx) = mpsc::channel(16);
+
+        // Check if the reply already exists in storage.
+        let replies = storage.replies_for(request_id).await?;
+        for reply in replies {
+            let is_exit = matches!(reply, Reply::WithExit(_));
+            let _ = tx.send(reply).await;
+            if is_exit {
+                return Ok(rx);
+            }
+        }
+
+        // Reply not yet available — register a live handler so that when
+        // `save_reply` is called for this request_id, the reply is pushed
+        // through the channel in real-time.
+        storage.register_reply_handler(request_id, tx);
+
+        Ok(rx)
+    }
+
     #[instrument(skip(self))]
     async fn shutdown(&self) -> Result<(), ClusterError> {
         self.shutdown.store(true, Ordering::Release);

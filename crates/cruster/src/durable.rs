@@ -4,16 +4,14 @@
 //! `#[workflow]` can call `sleep`, `await_deferred`, `resolve_deferred`, and `on_interrupt`.
 
 use crate::entity_client::persisted_request_id;
-use crate::envelope::EnvelopeRequest;
 use crate::error::ClusterError;
-use crate::message_storage::{MessageStorage, SaveResult};
+use crate::message_storage::MessageStorage;
 use crate::reply::ExitResult;
-use crate::types::{EntityAddress, EntityId, EntityType, ShardId};
+use crate::types::{EntityId, EntityType};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -369,74 +367,31 @@ impl DurableContext {
 
     /// Check the journal for a cached activity result.
     ///
-    /// This performs the duplicate-detection check against `MessageStorage` and
-    /// looks up the cached result in `WorkflowStorage`.
+    /// Checks `WorkflowStorage` for a previously cached activity result.
     ///
     /// Returns `Ok(Some(T))` if a cached result exists (replay hit),
-    /// `Ok(None)` if this is a first execution or re-execution after crash,
-    /// or if no `MessageStorage` is configured (backward-compatible mode).
+    /// `Ok(None)` if this is a first execution or re-execution after crash.
     pub async fn check_journal<T: DeserializeOwned>(
         &self,
         name: &str,
         key_bytes: &[u8],
     ) -> Result<Option<T>, ClusterError> {
-        let msg_storage = match &self.message_storage {
+        let wf_storage = match &self.workflow_storage {
             Some(s) => s,
-            None => return Ok(None), // No journal — caller should execute directly
+            None => return Ok(None),
         };
 
-        let journal_tag = format!("__journal/{name}");
-        let request_id =
-            persisted_request_id(&self.entity_type, &self.entity_id, &journal_tag, key_bytes);
+        let storage_key =
+            Self::journal_storage_key(name, key_bytes, &self.entity_type, &self.entity_id);
 
-        // Build an envelope for duplicate detection
-        let envelope = EnvelopeRequest {
-            request_id,
-            address: EntityAddress {
-                shard_id: ShardId::new("default", 0),
-                entity_type: self.entity_type.clone(),
-                entity_id: self.entity_id.clone(),
-            },
-            tag: journal_tag,
-            payload: vec![],
-            headers: HashMap::new(),
-            span_id: None,
-            trace_id: None,
-            sampled: None,
-            persisted: true,
-            uninterruptible: Default::default(),
-            deliver_at: None,
-        };
-
-        match msg_storage.save_request(&envelope).await? {
-            SaveResult::Duplicate { .. } => {
-                // Duplicate request — check WorkflowStorage for the cached result.
-                // The result lives in WorkflowStorage (not MessageStorage) because
-                // it is written atomically with state changes in the ActivityScope
-                // transaction.
-                if let Some(wf_storage) = &self.workflow_storage {
-                    let storage_key = Self::journal_storage_key(
-                        name,
-                        key_bytes,
-                        &self.entity_type,
-                        &self.entity_id,
-                    );
-                    if let Some(bytes) = wf_storage.load(&storage_key).await? {
-                        // Register key for completion even on replay hits
-                        WorkflowScope::register_journal_key(storage_key);
-                        let result: T = Self::deserialize_journal_result(&bytes)?;
-                        return Ok(Some(result));
-                    }
-                }
-                // Duplicate request but no stored result — crash happened after
-                // save_request but before the ActivityScope committed. Re-execute.
-                Ok(None)
-            }
-            SaveResult::Success => {
-                // First execution
-                Ok(None)
-            }
+        if let Some(bytes) = wf_storage.load(&storage_key).await? {
+            // Register key for completion even on replay hits
+            WorkflowScope::register_journal_key(storage_key);
+            let result: T = Self::deserialize_journal_result(&bytes)?;
+            return Ok(Some(result));
         }
+
+        Ok(None)
     }
 
     /// Compute the WorkflowStorage key for a journal entry.

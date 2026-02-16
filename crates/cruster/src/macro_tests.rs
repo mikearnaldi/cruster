@@ -959,6 +959,20 @@ mod tests {
                 .cloned()
                 .unwrap_or_default())
         }
+        async fn await_reply(&self, request_id: Snowflake) -> Result<ReplyReceiver, ClusterError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let replies = self
+                .replies
+                .lock()
+                .unwrap()
+                .get(&request_id)
+                .cloned()
+                .unwrap_or_default();
+            for reply in replies {
+                let _ = tx.send(reply).await;
+            }
+            Ok(rx)
+        }
         async fn shutdown(&self) -> Result<(), ClusterError> {
             Ok(())
         }
@@ -1024,6 +1038,58 @@ mod tests {
         }
         fn _assert_poll_with_key(_c: &NewSimpleWorkflowClientWithKey<'_>) {
             // client_with_key.poll() should exist
+        }
+    }
+
+    // --- Workflow join tests ---
+
+    #[tokio::test]
+    async fn new_workflow_join_returns_result_after_execute() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "join-test".to_string(),
+        };
+
+        // Execute the workflow (which stores the reply)
+        let result: String = client.execute(&req).await.unwrap();
+        assert_eq!(result, "ok");
+
+        // Now join for the same execution — derive entity_id the same way
+        let key_bytes = rmp_serde::to_vec(&req).unwrap();
+        let entity_id = crate::hash::sha256_hex(&key_bytes);
+        let join_result: String = client.join(&entity_id).await.unwrap();
+        assert_eq!(join_result, "ok");
+    }
+
+    #[tokio::test]
+    async fn new_workflow_join_with_key_returns_result() {
+        let sharding: Arc<dyn Sharding> = Arc::new(PollableSharding::new());
+        let client = NewSimpleWorkflowClient::new(Arc::clone(&sharding));
+
+        let req = NewWfRequest {
+            name: "join-keyed".to_string(),
+        };
+
+        // Execute with a raw key
+        let keyed = client.with_key_raw("join-exec-1");
+        let _: String = keyed.execute(&req).await.unwrap();
+
+        // Join on the ClientWithKey view
+        let keyed_again = client.with_key_raw("join-exec-1");
+        let join_result: String = keyed_again.join().await.unwrap();
+        assert_eq!(join_result, "ok");
+    }
+
+    #[test]
+    fn new_workflow_join_method_exists() {
+        // Compile-time check that join exists on both client types
+        fn _assert_join(_c: &NewSimpleWorkflowClient) {
+            // client.join(execution_id) should exist
+        }
+        fn _assert_join_with_key(_c: &NewSimpleWorkflowClientWithKey<'_>) {
+            // client_with_key.join() should exist
         }
     }
 

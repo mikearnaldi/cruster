@@ -1828,6 +1828,9 @@ fn generate_pure_rpc_entity(
         #register_impl
 
         /// Generated typed client for the entity.
+        ///
+        /// Cloning is cheap — the inner handle is reference-counted.
+        #[derive(Clone)]
         pub struct #client_name {
             inner: #krate::entity_client::EntityClient,
         }
@@ -5338,6 +5341,9 @@ fn workflow_impl_inner(
 
     let client_impl = quote! {
         /// Generated typed client for the standalone workflow.
+        ///
+        /// Cloning is cheap — the inner handle is reference-counted.
+        #[derive(Clone)]
         pub struct #client_name {
             inner: #krate::entity_client::EntityClient,
         }
@@ -5442,6 +5448,24 @@ fn workflow_impl_inner(
                     key_bytes,
                 ).await
             }
+
+            /// Join (await) the result of a previously-started workflow execution.
+            ///
+            /// Like [`poll`](Self::poll) but blocks until the result is available
+            /// instead of returning immediately with `Option`. If the workflow has
+            /// already completed, returns the result instantly.
+            pub async fn join(
+                &self,
+                execution_id: &str,
+            ) -> ::std::result::Result<#response_type, #krate::error::ClusterError> {
+                let entity_id = #krate::types::EntityId::new(execution_id);
+                let key_bytes = entity_id.0.as_bytes();
+                self.inner.join_reply::<#response_type>(
+                    &entity_id,
+                    "execute",
+                    key_bytes,
+                ).await
+            }
         }
 
         impl #krate::entity_client::EntityClientAccessor for #client_name {
@@ -5502,6 +5526,22 @@ fn workflow_impl_inner(
             ) -> ::std::result::Result<::std::option::Option<#response_type>, #krate::error::ClusterError> {
                 let key_bytes = self.entity_id.0.as_bytes();
                 self.inner.poll_reply::<#response_type>(
+                    &self.entity_id,
+                    "execute",
+                    key_bytes,
+                ).await
+            }
+
+            /// Join (await) the result of the workflow execution using the baked-in key.
+            ///
+            /// Like [`poll`](Self::poll) but blocks until the result is available
+            /// instead of returning immediately with `Option`. If the workflow has
+            /// already completed, returns the result instantly.
+            pub async fn join(
+                &self,
+            ) -> ::std::result::Result<#response_type, #krate::error::ClusterError> {
+                let key_bytes = self.entity_id.0.as_bytes();
+                self.inner.join_reply::<#response_type>(
                     &self.entity_id,
                     "execute",
                     key_bytes,

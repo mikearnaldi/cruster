@@ -2949,7 +2949,7 @@ fn activity_group_impl_inner(
                     1 => {
                         let name = &wire_param_names[0];
                         quote! {
-                            let __journal_key = (#persist_key)(#name);
+                            let __journal_key = (#persist_key)(&#name);
                             let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
                                 .map_err(|e| #krate::error::ClusterError::PersistenceError {
                                     reason: ::std::format!("failed to serialize journal key: {e}"),
@@ -4436,7 +4436,7 @@ fn workflow_impl_inner(
                     1 => {
                         let name = &wire_param_names[0];
                         quote! {
-                            let __journal_key = (#persist_key)(#name);
+                            let __journal_key = (#persist_key)(&#name);
                             let __journal_key_bytes = rmp_serde::to_vec(&__journal_key)
                                 .map_err(|e| #krate::error::ClusterError::PersistenceError {
                                     reason: ::std::format!("failed to serialize journal key: {e}"),

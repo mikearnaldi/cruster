@@ -536,6 +536,7 @@ impl EntityClient {
         &self.entity_type
     }
 
+    #[instrument(skip(self, request), fields(entity_type = %self.entity_type, entity_id = %entity_id))]
     async fn build_envelope(
         &self,
         entity_id: &EntityId,

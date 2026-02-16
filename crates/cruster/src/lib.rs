@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod cron;
+
 pub mod detachment;
 pub mod entity;
 pub mod entity_client;
@@ -17,6 +18,8 @@ pub mod hash;
 pub mod message;
 pub mod message_storage;
 pub mod metrics;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod reply;
 pub mod resource_map;
 pub mod runner;

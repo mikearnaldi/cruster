@@ -543,6 +543,7 @@ impl EntityManager {
 
     /// Reap idle entities that have exceeded their max idle time.
     /// Returns the number of entities reaped.
+    #[instrument(skip(self), fields(entity_type = %self.entity.entity_type()))]
     pub async fn reap_idle(&self, max_idle: Duration) -> usize {
         let now_ms = now_millis();
         let max_idle_ms = max_idle.as_millis() as i64;
@@ -786,6 +787,7 @@ impl EntityManager {
     /// (handler swap). On panic, the handler is replaced and the panicked
     /// request is replayed against the fresh handler.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(entity_address = %address))]
     async fn process_mailbox(
         instance: Arc<EntityInstance>,
         mut mailbox_rx: mpsc::UnboundedReceiver<IncomingMessage>,
@@ -973,6 +975,11 @@ impl EntityManager {
     /// Returns `(None, true)` on success, `(None, true)` on successful recovery,
     /// or `(Some(snapshot), false)` if recovery was exhausted.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(
+        entity_address = %address,
+        request_id = %msg.envelope().request_id,
+        tag = %msg.envelope().tag,
+    ))]
     async fn handle_message_with_recovery(
         instance: &Arc<EntityInstance>,
         msg: IncomingMessage,
@@ -1075,6 +1082,11 @@ impl EntityManager {
 
     /// Attempt to handle a request, respawning the handler on panic.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(
+        entity_address = %address,
+        request_id = %snapshot.request.request_id,
+        tag = %snapshot.request.tag,
+    ))]
     async fn try_handle_with_recovery(
         instance: &Arc<EntityInstance>,
         snapshot: RequestSnapshot,
@@ -1223,6 +1235,11 @@ impl EntityManager {
 
     /// Attempt to handle a streaming request, respawning the handler on panic.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(
+        entity_address = %address,
+        request_id = %snapshot.request.request_id,
+        tag = %snapshot.request.tag,
+    ))]
     async fn try_handle_stream_with_recovery(
         instance: &Arc<EntityInstance>,
         snapshot: RequestSnapshot,
@@ -1361,6 +1378,10 @@ impl EntityManager {
     /// Acquires a read lock on the handler to get an `Arc` clone, then releases
     /// the lock before executing. This allows concurrent requests to proceed
     /// simultaneously. Crash recovery takes a write lock to swap the handler.
+    #[instrument(skip(instance, snapshot), fields(
+        request_id = %snapshot.request.request_id,
+        tag = %snapshot.request.tag,
+    ))]
     async fn try_handle_request(
         instance: &Arc<EntityInstance>,
         snapshot: &RequestSnapshot,
@@ -1406,6 +1427,10 @@ impl EntityManager {
     }
 
     /// Try to execute a handler stream, catching panics.
+    #[instrument(skip(instance, snapshot, snowflake, message_storage), fields(
+        request_id = %snapshot.request.request_id,
+        tag = %snapshot.request.tag,
+    ))]
     async fn try_handle_stream(
         instance: &Arc<EntityInstance>,
         snapshot: &RequestSnapshot,

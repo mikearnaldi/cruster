@@ -167,6 +167,7 @@ impl ShardAssigner {
     ///
     /// The assignment algorithm is determined by the `strategy` parameter.
     /// Use [`ShardAssignmentStrategy::default()`] for the recommended algorithm.
+    #[tracing::instrument(skip(runners, shard_groups), fields(num_runners = runners.len(), num_groups = shard_groups.len(), shards_per_group))]
     pub fn compute_assignments(
         runners: &[Runner],
         shard_groups: &[String],

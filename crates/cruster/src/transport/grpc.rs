@@ -70,6 +70,7 @@ impl GrpcRunners {
     ///
     /// Uses a per-address lock to prevent duplicate connection creation when
     /// multiple concurrent callers target the same new runner address.
+    #[instrument(skip(self), fields(runner_address = %address))]
     async fn client_for(
         &self,
         address: &RunnerAddress,

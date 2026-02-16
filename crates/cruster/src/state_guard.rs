@@ -176,6 +176,7 @@ impl ActivityScope {
     /// During execution, the activity can:
     /// - Buffer writes via `ActivityScope::buffer_write()` (committed atomically)
     /// - Execute arbitrary SQL via `ActivityScope::sql_transaction()` (if using SQL storage)
+    #[tracing::instrument(skip(storage, f))]
     pub async fn run<F, Fut, T>(storage: &Arc<dyn WorkflowStorage>, f: F) -> Result<T, ClusterError>
     where
         F: FnOnce() -> Fut,

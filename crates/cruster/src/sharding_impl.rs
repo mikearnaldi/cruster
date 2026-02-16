@@ -309,6 +309,7 @@ impl ShardingImpl {
     ///
     /// Requires `runner_storage` to be provided at construction.
     /// For single-node mode, use `acquire_all_shards()` instead.
+    #[instrument(skip(self))]
     pub async fn start(self: &Arc<Self>) -> Result<(), ClusterError> {
         let runner_storage = match &self.runner_storage {
             Some(storage) => Arc::clone(storage),
@@ -471,6 +472,7 @@ impl ShardingImpl {
     ///
     /// This clears owned shards and interrupts all entities to prevent split-brain.
     /// Returns `true` if this call caused the transition from attached to detached.
+    #[instrument(skip(self))]
     pub async fn detach(&self, reason: DetachmentReason) {
         if !self.config.detachment_enabled {
             tracing::debug!(
@@ -513,6 +515,7 @@ impl ShardingImpl {
     /// Handle the transition to detached state.
     ///
     /// Clears owned shards and interrupts all entities to prevent split-brain.
+    #[instrument(skip(self))]
     async fn handle_detachment(&self) {
         self.metrics.sharding_detached.set(1);
 
@@ -555,6 +558,11 @@ impl ShardingImpl {
     /// If the entity type is not yet registered, waits up to
     /// `entity_registration_timeout` for it to appear (matching the TS
     /// `waitForEntityManager` pattern in `Sharding.ts:440-476`).
+    #[instrument(skip(self, envelope, reply_tx), fields(
+        entity_type = %envelope.address.entity_type,
+        entity_id = %envelope.address.entity_id,
+        request_id = %envelope.request_id,
+    ))]
     async fn route_local(
         &self,
         envelope: EnvelopeRequest,
@@ -605,6 +613,10 @@ impl ShardingImpl {
         manager.send_local(msg).await
     }
 
+    #[instrument(skip(self, interrupt), fields(
+        entity_address = %interrupt.address,
+        request_id = %interrupt.request_id,
+    ))]
     async fn handle_interrupt_local(&self, interrupt: &Interrupt) {
         if let Some(engine) = &self.workflow_engine {
             if let Err(e) = engine
@@ -636,6 +648,7 @@ impl ShardingImpl {
     /// When a rebalance actually acquires or releases shards, applies
     /// `shard_rebalance_debounce` as an additional delay before the next
     /// rebalance cycle to avoid thrashing during rapid topology changes.
+    #[instrument(skip(self))]
     async fn shard_acquisition_loop(&self) {
         let runner_storage = match &self.runner_storage {
             Some(s) => Arc::clone(s),
@@ -906,6 +919,7 @@ impl ShardingImpl {
     /// `shard_lock_refresh_max_failures` consecutive failures, it is removed
     /// from owned shards and its entities are interrupted to prevent split-brain
     /// (another runner may have already acquired the expired lock).
+    #[instrument(skip(self))]
     async fn lock_refresh_loop(&self) {
         let runner_storage = match &self.runner_storage {
             Some(s) => Arc::clone(s),
@@ -1059,6 +1073,7 @@ impl ShardingImpl {
     ///
     /// Listens to `LeaseHealth` updates from the runner storage and triggers
     /// detachment when the failure streak exceeds `keepalive_failure_threshold`.
+    #[instrument(skip(self, health_rx))]
     async fn lease_health_loop(
         &self,
         mut health_rx: tokio::sync::broadcast::Receiver<LeaseHealth>,
@@ -1115,6 +1130,7 @@ impl ShardingImpl {
     }
 
     /// Background loop that polls message storage for unprocessed messages.
+    #[instrument(skip(self))]
     async fn storage_poll_loop(&self) {
         loop {
             tokio::select! {
@@ -1135,6 +1151,7 @@ impl ShardingImpl {
     }
 
     /// Internal implementation of storage polling.
+    #[instrument(skip(self))]
     async fn poll_storage_inner(&self) -> Result<(), ClusterError> {
         // Check cancellation early
         if self.cancel.is_cancelled() {
@@ -1347,6 +1364,7 @@ impl ShardingImpl {
 
     /// Internal resumption loop for a single entity.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(entity_address = %address))]
     async fn run_resumption(
         address: &crate::types::EntityAddress,
         storage: &Arc<dyn MessageStorage>,
@@ -1572,6 +1590,7 @@ impl ShardingImpl {
     }
 
     /// Perform one round of runner health checks.
+    #[instrument(skip(self, runner_storage, runner_health, cancel))]
     async fn check_runner_health(
         &self,
         runner_storage: &Arc<dyn RunnerStorage>,
@@ -1797,6 +1816,7 @@ impl ShardingImpl {
     /// mutable access to apply state changes. This avoids holding DashMap shard locks
     /// across `.await` points which would cause contention with concurrent
     /// `register_singleton`, `shutdown`, or other `sync_singletons` calls.
+    #[instrument(skip(self))]
     async fn sync_singletons(&self) {
         // Check cancellation early
         if self.cancel.is_cancelled() {
@@ -1966,6 +1986,7 @@ impl ShardingImpl {
     /// node may process it and save the reply there.
     ///
     /// Polls at `storage_poll_interval` until an exit reply is found.
+    #[instrument(skip(self))]
     async fn reply_from_storage(
         &self,
         request_id: Snowflake,
@@ -2600,6 +2621,7 @@ impl Sharding for ShardingImpl {
         )
     }
 
+    #[instrument(skip(self))]
     async fn replies_for(&self, request_id: Snowflake) -> Result<Vec<Reply>, ClusterError> {
         match &self.message_storage {
             Some(storage) => storage.replies_for(request_id).await,
@@ -2607,6 +2629,7 @@ impl Sharding for ShardingImpl {
         }
     }
 
+    #[instrument(skip(self))]
     async fn await_reply(&self, request_id: Snowflake) -> Result<ReplyReceiver, ClusterError> {
         let storage =
             self.message_storage

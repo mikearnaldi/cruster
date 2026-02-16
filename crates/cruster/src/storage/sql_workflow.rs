@@ -80,6 +80,7 @@ impl SqlWorkflowStorage {
 
 #[async_trait]
 impl WorkflowStorage for SqlWorkflowStorage {
+    #[tracing::instrument(skip(self))]
     async fn load(&self, key: &str) -> Result<Option<Vec<u8>>, ClusterError> {
         let row = sqlx::query("SELECT value FROM cluster_workflow_journal WHERE key = $1")
             .bind(key)
@@ -106,6 +107,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
         }
     }
 
+    #[tracing::instrument(skip(self, value))]
     async fn save(&self, key: &str, value: &[u8]) -> Result<(), ClusterError> {
         sqlx::query(
             "INSERT INTO cluster_workflow_journal (key, value, updated_at)
@@ -124,6 +126,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete(&self, key: &str) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM cluster_workflow_journal WHERE key = $1")
             .bind(key)
@@ -137,6 +140,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn mark_completed(&self, key: &str) -> Result<(), ClusterError> {
         sqlx::query("UPDATE cluster_workflow_journal SET completed_at = NOW() WHERE key = $1")
             .bind(key)
@@ -149,6 +153,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn cleanup(&self, older_than: std::time::Duration) -> Result<u64, ClusterError> {
         let cutoff =
             Utc::now() - chrono::Duration::from_std(older_than).unwrap_or(chrono::TimeDelta::MAX);
@@ -165,6 +170,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
         Ok(result.rows_affected())
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, ClusterError> {
         // Use a range query instead of LIKE for reliable btree index usage.
         // LIKE with bind parameters and ESCAPE may not use text_pattern_ops
@@ -210,6 +216,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
             .collect()
     }
 
+    #[tracing::instrument(skip(self))]
     async fn begin_transaction(&self) -> Result<Box<dyn StorageTransaction>, ClusterError> {
         let tx = self
             .pool

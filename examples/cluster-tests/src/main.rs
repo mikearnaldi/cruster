@@ -26,7 +26,9 @@ use cruster::storage::sql_workflow::SqlWorkflowStorage;
 use cruster::storage::sql_workflow_engine::SqlWorkflowEngine;
 use cruster::transport::grpc::{GrpcRunnerHealth, GrpcRunnerServer, GrpcRunners};
 use cruster::types::RunnerAddress;
+use opentelemetry::trace::TracerProvider;
 use sqlx::postgres::PgPoolOptions;
+use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod api;
@@ -201,9 +203,26 @@ async fn create_cluster(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Initialize tracing with optional OpenTelemetry export.
+    // Set OTEL_EXPORTER_OTLP_ENDPOINT to enable (e.g. http://localhost:4317).
+    let otel_layer = if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .build()
+            .expect("failed to build OTLP span exporter");
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .build();
+        let tracer = provider.tracer("cluster-tests");
+        opentelemetry::global::set_tracer_provider(provider);
+        Some(OpenTelemetryLayer::new(tracer))
+    } else {
+        None
+    };
+
     tracing_subscriber::registry()
         .with(fmt::layer())
+        .with(otel_layer)
         .with(EnvFilter::from_default_env().add_directive("cluster_tests=info".parse()?))
         .init();
 

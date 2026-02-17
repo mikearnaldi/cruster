@@ -44,6 +44,8 @@ cron = "0.13"
 
 # Tracing
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
 
 # Macros
 cruster-macros = { workspace = true }

@@ -93,7 +93,10 @@ impl EntityClient {
         Req: Serialize,
         Res: DeserializeOwned,
     {
-        let envelope = self.build_envelope(entity_id, tag, request).await?;
+        let trace_ctx = Self::capture_trace_context();
+        let envelope = self
+            .build_envelope(entity_id, tag, request, trace_ctx)
+            .await?;
         let mut reply_rx = self.sharding.send(envelope).await?;
 
         let reply = reply_rx
@@ -151,7 +154,10 @@ impl EntityClient {
             }
         }
 
-        let mut envelope = self.build_envelope(entity_id, tag, request).await?;
+        let trace_ctx = Self::capture_trace_context();
+        let mut envelope = self
+            .build_envelope(entity_id, tag, request, trace_ctx)
+            .await?;
         envelope.headers.insert(
             STREAM_HEADER_KEY.to_string(),
             STREAM_HEADER_VALUE.to_string(),
@@ -264,7 +270,10 @@ impl EntityClient {
         tag: &str,
         request: &Req,
     ) -> Result<(), ClusterError> {
-        let envelope = self.build_envelope(entity_id, tag, request).await?;
+        let trace_ctx = Self::capture_trace_context();
+        let envelope = self
+            .build_envelope(entity_id, tag, request, trace_ctx)
+            .await?;
         self.sharding.notify(envelope).await
     }
 
@@ -305,7 +314,10 @@ impl EntityClient {
         Req: Serialize,
         Res: DeserializeOwned,
     {
-        let mut envelope = self.build_envelope(entity_id, tag, request).await?;
+        let trace_ctx = Self::capture_trace_context();
+        let mut envelope = self
+            .build_envelope(entity_id, tag, request, trace_ctx)
+            .await?;
         envelope.persisted = true;
         envelope.uninterruptible = uninterruptible;
         let key_bytes = key_bytes.unwrap_or_else(|| envelope.payload.clone());
@@ -362,7 +374,10 @@ impl EntityClient {
         request: &Req,
         key_bytes: Option<Vec<u8>>,
     ) -> Result<(), ClusterError> {
-        let mut envelope = self.build_envelope(entity_id, tag, request).await?;
+        let trace_ctx = Self::capture_trace_context();
+        let mut envelope = self
+            .build_envelope(entity_id, tag, request, trace_ctx)
+            .await?;
         envelope.persisted = true;
         let key_bytes = key_bytes.unwrap_or_else(|| envelope.payload.clone());
         envelope.request_id = persisted_request_id(&self.entity_type, entity_id, tag, &key_bytes);
@@ -386,7 +401,10 @@ impl EntityClient {
         Req: Serialize,
         Res: DeserializeOwned,
     {
-        let mut envelope = self.build_envelope(entity_id, tag, request).await?;
+        let trace_ctx = Self::capture_trace_context();
+        let mut envelope = self
+            .build_envelope(entity_id, tag, request, trace_ctx)
+            .await?;
         envelope.persisted = true;
         envelope.deliver_at = Some(deliver_at);
         let mut reply_rx = self.sharding.send(envelope).await?;
@@ -431,7 +449,10 @@ impl EntityClient {
         request: &Req,
         deliver_at: DateTime<Utc>,
     ) -> Result<(), ClusterError> {
-        let mut envelope = self.build_envelope(entity_id, tag, request).await?;
+        let trace_ctx = Self::capture_trace_context();
+        let mut envelope = self
+            .build_envelope(entity_id, tag, request, trace_ctx)
+            .await?;
         envelope.persisted = true;
         envelope.deliver_at = Some(deliver_at);
         self.sharding.notify(envelope).await
@@ -538,12 +559,34 @@ impl EntityClient {
         &self.entity_type
     }
 
-    #[instrument(level = "debug", skip(self, request), fields(entity_type = %self.entity_type, entity_id = %entity_id))]
+    /// Capture the current OTel trace context from the caller's span.
+    ///
+    /// This must be called **before** entering `build_envelope`'s debug-level
+    /// `#[instrument]` span, because per-layer filters (e.g. `Targets` set to
+    /// INFO) may reject the debug span, making it invisible to the OTel layer.
+    /// The caller's span (at INFO level) is always visible.
+    fn capture_trace_context() -> (Option<String>, Option<String>, Option<bool>) {
+        let context = tracing::Span::current().context();
+        let span_ref = context.span();
+        let sc = span_ref.span_context();
+        if sc.is_valid() {
+            (
+                Some(sc.trace_id().to_string()),
+                Some(sc.span_id().to_string()),
+                Some(sc.trace_flags().is_sampled()),
+            )
+        } else {
+            (None, None, None)
+        }
+    }
+
+    #[instrument(level = "debug", skip(self, request, trace_ctx), fields(entity_type = %self.entity_type, entity_id = %entity_id))]
     async fn build_envelope(
         &self,
         entity_id: &EntityId,
         tag: &str,
         request: &impl Serialize,
+        trace_ctx: (Option<String>, Option<String>, Option<bool>),
     ) -> Result<EnvelopeRequest, ClusterError> {
         let shard_id = self.sharding.get_shard_id(&self.entity_type, entity_id);
 
@@ -552,23 +595,7 @@ impl EntityClient {
             source: Some(Box::new(e)),
         })?;
 
-        // Extract OTel trace context from the current span so that the
-        // receiver can link its processing span as a child of the sender.
-        // This works for all delivery paths (local, gRPC, persisted via Postgres).
-        let (trace_id, span_id, sampled) = {
-            let context = tracing::Span::current().context();
-            let span_ref = context.span();
-            let sc = span_ref.span_context();
-            if sc.is_valid() {
-                (
-                    Some(sc.trace_id().to_string()),
-                    Some(sc.span_id().to_string()),
-                    Some(sc.trace_flags().is_sampled()),
-                )
-            } else {
-                (None, None, None)
-            }
-        };
+        let (trace_id, span_id, sampled) = trace_ctx;
 
         Ok(EnvelopeRequest {
             request_id: self.sharding.snowflake().next_async().await?,
@@ -1016,7 +1043,7 @@ mod tests {
 
         let entity_id = EntityId::new("u-123");
         let envelope = client
-            .build_envelope(&entity_id, "getProfile", &())
+            .build_envelope(&entity_id, "getProfile", &(), (None, None, None))
             .await
             .unwrap();
 
@@ -1312,7 +1339,7 @@ mod tests {
 
         let entity_id = EntityId::new("u-1");
         let envelope = client
-            .build_envelope(&entity_id, "test", &())
+            .build_envelope(&entity_id, "test", &(), (None, None, None))
             .await
             .unwrap();
 
@@ -1350,7 +1377,12 @@ mod tests {
         let _span_guard = span.enter();
 
         let envelope = client
-            .build_envelope(&entity_id, "test_tag", &42i32)
+            .build_envelope(
+                &entity_id,
+                "test_tag",
+                &42i32,
+                EntityClient::capture_trace_context(),
+            )
             .await
             .unwrap();
 
@@ -1414,7 +1446,12 @@ mod tests {
             let span = tracing::info_span!("sender_workflow");
             let _span_guard = span.enter();
             client
-                .build_envelope(&entity_id, "do_work", &())
+                .build_envelope(
+                    &entity_id,
+                    "do_work",
+                    &(),
+                    EntityClient::capture_trace_context(),
+                )
                 .await
                 .unwrap()
         };
@@ -1472,6 +1509,79 @@ mod tests {
             injected_trace_id,
             "parent trace_id must propagate"
         );
+
+        provider.shutdown().unwrap();
+    }
+
+    /// Reproduces the exact autopilot-cruster scenario: the OTel layer has a
+    /// per-layer `Targets` filter set to INFO for the `cruster` target.
+    /// `build_envelope` is `#[instrument(level = "debug")]`, so its span is
+    /// invisible to the OTel layer. Before the fix, `Span::current().context()`
+    /// inside `build_envelope` returned an invalid context and trace_id/span_id
+    /// were `None`, producing disconnected traces.
+    ///
+    /// After the fix, `capture_trace_context()` runs in the caller's INFO-level
+    /// span (before entering `build_envelope`), so the context is always valid.
+    #[tokio::test]
+    async fn trace_context_injected_despite_info_level_otel_filter() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetryLayer;
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("test");
+
+        // Replicate the production filter: only INFO+ spans from cruster
+        // are visible to the OTel layer. This filters out build_envelope's
+        // debug-level span.
+        let otel_filter = Targets::new().with_target("cruster", tracing::Level::INFO);
+        let otel_layer = OpenTelemetryLayer::new(tracer).with_filter(otel_filter);
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = EntityClient::new(Arc::clone(&sharding), EntityType::new("User"));
+        let entity_id = EntityId::new("u-1");
+
+        // Simulate the caller: an INFO-level span (like send_persisted_with_key).
+        let span = tracing::info_span!(target: "cruster", "send_persisted_with_key");
+        let _span_guard = span.enter();
+
+        // capture_trace_context runs HERE, in the INFO-level span (visible to OTel).
+        // Then build_envelope enters its debug-level span (invisible to OTel),
+        // but the context was already captured.
+        let trace_ctx = EntityClient::capture_trace_context();
+        let envelope = client
+            .build_envelope(&entity_id, "scale_deployment", &(), trace_ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            envelope.trace_id.is_some(),
+            "trace_id must be set even when OTel filter is INFO-only"
+        );
+        assert!(
+            envelope.span_id.is_some(),
+            "span_id must be set even when OTel filter is INFO-only"
+        );
+        assert!(
+            envelope.sampled.is_some(),
+            "sampled must be set even when OTel filter is INFO-only"
+        );
+
+        let trace_id = envelope.trace_id.unwrap();
+        let span_id = envelope.span_id.unwrap();
+        assert_eq!(trace_id.len(), 32);
+        assert_eq!(span_id.len(), 16);
+        assert!(trace_id != "00000000000000000000000000000000");
+        assert!(span_id != "0000000000000000");
 
         provider.shutdown().unwrap();
     }

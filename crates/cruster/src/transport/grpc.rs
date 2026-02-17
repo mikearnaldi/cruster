@@ -159,8 +159,6 @@ impl Runners for GrpcRunners {
     ) -> Result<ReplyReceiver, ClusterError> {
         let mut client = self.client_for(address).await?;
 
-        let envelope = inject_trace_context(envelope);
-
         let request_id = envelope.request_id;
 
         let envelope_bytes = rmp_serde::to_vec(&Envelope::Request(envelope)).map_err(|e| {
@@ -252,11 +250,6 @@ impl Runners for GrpcRunners {
     ) -> Result<(), ClusterError> {
         let mut client = self.client_for(address).await?;
 
-        let envelope = match envelope {
-            Envelope::Request(envelope) => Envelope::Request(inject_trace_context(envelope)),
-            other => other,
-        };
-
         let envelope_bytes =
             rmp_serde::to_vec(&envelope).map_err(|e| ClusterError::MalformedMessage {
                 reason: "failed to serialize envelope".into(),
@@ -318,7 +311,7 @@ impl RunnerService for GrpcRunnerServer {
 
     type SendStream = tokio_stream::wrappers::ReceiverStream<Result<proto::ReplyMessage, Status>>;
 
-    #[instrument(skip_all, fields(remote_trace_id, remote_span_id, remote_sampled))]
+    #[instrument(skip_all)]
     async fn send(
         &self,
         request: Request<proto::SendRequest>,
@@ -334,8 +327,6 @@ impl RunnerService for GrpcRunnerServer {
             Err(_) => rmp_serde::from_slice(&envelope_bytes)
                 .map_err(|e| Status::invalid_argument(format!("malformed envelope: {e}")))?,
         };
-
-        extract_trace_context(&envelope);
 
         let mut reply_rx = self
             .sharding
@@ -371,7 +362,7 @@ impl RunnerService for GrpcRunnerServer {
         )))
     }
 
-    #[instrument(skip_all, fields(remote_trace_id, remote_span_id, remote_sampled))]
+    #[instrument(skip_all)]
     async fn notify(
         &self,
         request: Request<proto::NotifyRequest>,
@@ -388,7 +379,6 @@ impl RunnerService for GrpcRunnerServer {
 
         match envelope {
             Envelope::Request(envelope) => {
-                extract_trace_context(&envelope);
                 self.sharding
                     .notify(envelope)
                     .await
@@ -436,47 +426,6 @@ impl RunnerHealth for GrpcRunnerHealth {
             Err(ClusterError::RunnerUnavailable { .. }) => Ok(false),
             Err(e) => Err(e),
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Trace context propagation helpers
-// ---------------------------------------------------------------------------
-
-/// Inject the current tracing span's ID into the envelope's trace context fields.
-///
-/// When `tracing-opentelemetry` is configured as a subscriber layer, the span
-/// ID corresponds to the OpenTelemetry span/trace IDs, enabling distributed
-/// tracing across runner-to-runner gRPC calls. Without OpenTelemetry, the
-/// numeric `tracing::Id` is injected as a string for correlation in logs.
-fn inject_trace_context(mut envelope: EnvelopeRequest) -> EnvelopeRequest {
-    let span = tracing::Span::current();
-    if let Some(id) = span.id() {
-        // Use the tracing span ID as span_id. The trace_id field requires
-        // OpenTelemetry integration to populate meaningfully; without it we
-        // propagate whatever was already set on the envelope.
-        if envelope.span_id.is_none() {
-            envelope.span_id = Some(format!("{}", id.into_u64()));
-        }
-    }
-    envelope
-}
-
-/// Record the remote trace context from an incoming envelope on the current span.
-///
-/// When `tracing-opentelemetry` is configured as a subscriber layer, these
-/// fields enable distributed trace correlation across runner-to-runner gRPC
-/// calls. Without OpenTelemetry, they appear in structured log output.
-fn extract_trace_context(envelope: &EnvelopeRequest) {
-    let span = tracing::Span::current();
-    if let Some(ref trace_id) = envelope.trace_id {
-        span.record("remote_trace_id", trace_id.as_str());
-    }
-    if let Some(ref span_id) = envelope.span_id {
-        span.record("remote_span_id", span_id.as_str());
-    }
-    if let Some(sampled) = envelope.sampled {
-        span.record("remote_sampled", sampled);
     }
 }
 
@@ -695,8 +644,42 @@ mod tests {
         assert_eq!(runners.channels.len(), 1);
     }
 
-    #[tokio::test]
-    async fn grpc_inject_trace_context_populates_span_id() {
+    #[test]
+    fn trace_context_survives_envelope_serde_roundtrip() {
+        // Verify that OTel trace context fields survive MessagePack
+        // serialization (the path taken by both gRPC and Postgres persistence).
+        let envelope = EnvelopeRequest {
+            request_id: Snowflake(999),
+            address: EntityAddress {
+                shard_id: crate::types::ShardId::new("default", 0),
+                entity_type: EntityType::new("Test"),
+                entity_id: EntityId::new("t-1"),
+            },
+            tag: "test".into(),
+            payload: vec![],
+            headers: HashMap::new(),
+            span_id: Some("e457b5a2e4d86bd1".into()),
+            trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
+            sampled: Some(true),
+            persisted: false,
+            uninterruptible: Default::default(),
+            deliver_at: None,
+        };
+
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let decoded: EnvelopeRequest = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            decoded.trace_id.as_deref(),
+            Some("0af7651916cd43dd8448eb211c80319c")
+        );
+        assert_eq!(decoded.span_id.as_deref(), Some("e457b5a2e4d86bd1"));
+        assert_eq!(decoded.sampled, Some(true));
+    }
+
+    #[test]
+    fn trace_context_none_survives_envelope_serde_roundtrip() {
+        // Verify that None trace context fields survive serialization.
         let envelope = EnvelopeRequest {
             request_id: Snowflake(999),
             address: EntityAddress {
@@ -715,64 +698,12 @@ mod tests {
             deliver_at: None,
         };
 
-        // inject_trace_context should not panic and should return the envelope
-        let result = super::inject_trace_context(envelope);
-        // span_id may or may not be set depending on whether there's an active span
-        // but the function should not panic
-        assert_eq!(result.tag, "test");
-    }
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let decoded: EnvelopeRequest = rmp_serde::from_slice(&bytes).unwrap();
 
-    #[tokio::test]
-    async fn grpc_extract_trace_context_does_not_panic() {
-        let envelope = EnvelopeRequest {
-            request_id: Snowflake(999),
-            address: EntityAddress {
-                shard_id: crate::types::ShardId::new("default", 0),
-                entity_type: EntityType::new("Test"),
-                entity_id: EntityId::new("t-1"),
-            },
-            tag: "test".into(),
-            payload: vec![],
-            headers: HashMap::new(),
-            span_id: Some("12345".into()),
-            trace_id: Some("abcdef".into()),
-            sampled: Some(true),
-            persisted: false,
-            uninterruptible: Default::default(),
-            deliver_at: None,
-        };
-
-        // Should not panic even without an active subscriber
-        super::extract_trace_context(&envelope);
-    }
-
-    #[tokio::test]
-    async fn grpc_trace_context_roundtrip() {
-        // Verify that trace context set on an envelope is preserved through
-        // inject (which doesn't overwrite existing values)
-        let envelope = EnvelopeRequest {
-            request_id: Snowflake(999),
-            address: EntityAddress {
-                shard_id: crate::types::ShardId::new("default", 0),
-                entity_type: EntityType::new("Test"),
-                entity_id: EntityId::new("t-1"),
-            },
-            tag: "test".into(),
-            payload: vec![],
-            headers: HashMap::new(),
-            span_id: Some("existing-span".into()),
-            trace_id: Some("existing-trace".into()),
-            sampled: Some(true),
-            persisted: false,
-            uninterruptible: Default::default(),
-            deliver_at: None,
-        };
-
-        let result = super::inject_trace_context(envelope);
-        // Existing values should not be overwritten
-        assert_eq!(result.span_id.as_deref(), Some("existing-span"));
-        assert_eq!(result.trace_id.as_deref(), Some("existing-trace"));
-        assert_eq!(result.sampled, Some(true));
+        assert_eq!(decoded.trace_id, None);
+        assert_eq!(decoded.span_id, None);
+        assert_eq!(decoded.sampled, None);
     }
 
     #[tokio::test]

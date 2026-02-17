@@ -35,9 +35,13 @@ clap = { version = "4", features = ["derive", "env"] }
 # Configuration
 figment = { version = "0.10", features = ["env", "toml"] }
 
-# Logging
+# Logging / tracing
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
 
 # Errors
 thiserror = { workspace = true }

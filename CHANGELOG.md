@@ -1,3 +1,22 @@
+## 0.0.21 (2026-02-17)
+
+### Fixes
+
+#### fix: reduce OpenTelemetry span noise by tiering #[instrument] levels
+
+Background loop drivers (shard acquisition, lock refresh, storage poll, runner health,
+lease health) had their #[instrument] removed entirely -- these created infinite-lifetime
+spans that never exported properly, appearing as "(missing)" parents in trace backends.
+
+Internal mechanics (rebalancing, singleton sync, storage CRUD, workflow engine, entity
+reaping, health checks) downgraded from INFO to DEBUG. User-facing operations (entity
+client API, message routing, gRPC transport, activity execution, lifecycle events) remain
+at INFO.
+
+#### Remove otel.rs init/setup module from the library crate
+
+OpenTelemetry tracing pipeline initialization (`OtelConfig`, `OtelGuard`, `init_tracing`) is the consumer's responsibility. The library should only emit `tracing` spans (via `#[instrument]`), not dictate how they are collected. All `#[instrument]` annotations and trace-context propagation remain intact.
+
 ## 0.0.20 (2026-02-16)
 
 ### Fixes

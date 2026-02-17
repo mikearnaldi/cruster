@@ -2,10 +2,12 @@
 default: patch
 ---
 
-test: add OTel trace context propagation tests
+fix: capture OTel trace context before debug-level span filtering
 
-Add tests that verify trace context injection and extraction work end-to-end
-with an active OpenTelemetry subscriber, using `InMemorySpanExporter` from
-`opentelemetry_sdk`. These tests catch regressions where the envelope's
-`trace_id`/`span_id` fields would silently remain `None` and traces would
-appear disconnected in collectors.
+Move trace context extraction out of `build_envelope` (debug-level span) into
+a `capture_trace_context()` call in each public caller (INFO-level span). This
+fixes disconnected traces when per-layer `Targets` filters reject debug spans
+from the OTel layer — the exact configuration used in autopilot-cruster.
+
+Add regression tests with `InMemorySpanExporter` that verify trace context
+injection works even under INFO-only OTel filters.

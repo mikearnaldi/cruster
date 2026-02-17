@@ -1321,4 +1321,158 @@ mod tests {
         assert_eq!(envelope.span_id, None);
         assert_eq!(envelope.sampled, None);
     }
+
+    #[tokio::test]
+    async fn build_envelope_with_otel_injects_valid_trace_context() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetryLayer;
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("test");
+        let otel_layer = OpenTelemetryLayer::new(tracer);
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        // Use the Dispatch-based API so we can hold the guard across await points.
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = EntityClient::new(Arc::clone(&sharding), EntityType::new("User"));
+        let entity_id = EntityId::new("u-1");
+
+        // Create an active span so that build_envelope has OTel context.
+        let span = tracing::info_span!("test_sender_span");
+        let _span_guard = span.enter();
+
+        let envelope = client
+            .build_envelope(&entity_id, "test_tag", &42i32)
+            .await
+            .unwrap();
+
+        // The envelope must carry valid OTel hex IDs.
+        assert!(
+            envelope.trace_id.is_some(),
+            "trace_id should be set when OTel subscriber is active"
+        );
+        assert!(
+            envelope.span_id.is_some(),
+            "span_id should be set when OTel subscriber is active"
+        );
+        assert!(
+            envelope.sampled.is_some(),
+            "sampled should be set when OTel subscriber is active"
+        );
+
+        // Validate they are proper hex strings of the right length.
+        let trace_id = envelope.trace_id.unwrap();
+        let span_id = envelope.span_id.unwrap();
+        assert_eq!(trace_id.len(), 32, "trace_id should be 32 hex chars");
+        assert_eq!(span_id.len(), 16, "span_id should be 16 hex chars");
+        assert!(
+            trace_id != "00000000000000000000000000000000",
+            "trace_id must not be all zeros"
+        );
+        assert!(
+            span_id != "0000000000000000",
+            "span_id must not be all zeros"
+        );
+
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn trace_context_propagation_links_sender_and_receiver() {
+        use opentelemetry::trace::{
+            SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider,
+        };
+        use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetryLayer;
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("test");
+        let otel_layer = OpenTelemetryLayer::new(tracer);
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let sharding: Arc<dyn Sharding> = Arc::new(MockSharding::new());
+        let client = EntityClient::new(Arc::clone(&sharding), EntityType::new("User"));
+        let entity_id = EntityId::new("u-1");
+
+        // Step 1: Inject — build an envelope inside an OTel-traced span.
+        let envelope = {
+            let span = tracing::info_span!("sender_workflow");
+            let _span_guard = span.enter();
+            client
+                .build_envelope(&entity_id, "do_work", &())
+                .await
+                .unwrap()
+        };
+
+        let injected_trace_id = envelope.trace_id.clone().unwrap();
+        let injected_span_id = envelope.span_id.clone().unwrap();
+
+        // Step 2: Simulate serialization roundtrip (as happens via gRPC or Postgres).
+        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let deserialized: crate::envelope::EnvelopeRequest = rmp_serde::from_slice(&bytes).unwrap();
+
+        // Verify context survived serialization.
+        assert_eq!(
+            deserialized.trace_id.as_deref(),
+            Some(injected_trace_id.as_str())
+        );
+        assert_eq!(
+            deserialized.span_id.as_deref(),
+            Some(injected_span_id.as_str())
+        );
+
+        // Step 3: Extract — reconstruct the remote SpanContext (as handle_message_with_recovery does).
+        let tid = TraceId::from_hex(&injected_trace_id).expect("valid trace_id");
+        let sid = SpanId::from_hex(&injected_span_id).expect("valid span_id");
+        let flags = if deserialized.sampled.unwrap_or(false) {
+            TraceFlags::SAMPLED
+        } else {
+            TraceFlags::default()
+        };
+        let remote_ctx = SpanContext::new(tid, sid, flags, true, TraceState::default());
+
+        assert!(
+            remote_ctx.is_valid(),
+            "reconstructed SpanContext must be valid"
+        );
+        assert!(remote_ctx.is_remote(), "context must be marked remote");
+        assert_eq!(
+            remote_ctx.trace_id().to_string(),
+            injected_trace_id,
+            "trace_id must match the sender's"
+        );
+        assert_eq!(
+            remote_ctx.span_id().to_string(),
+            injected_span_id,
+            "span_id must match the sender's"
+        );
+
+        // Step 4: Verify the parent link can be set (as handle_message_with_recovery does).
+        let otel_context = opentelemetry::Context::current().with_remote_span_context(remote_ctx);
+        let span_ref = otel_context.span();
+        let parent_sc = span_ref.span_context();
+        assert!(parent_sc.is_valid(), "parent context must be valid");
+        assert_eq!(
+            parent_sc.trace_id().to_string(),
+            injected_trace_id,
+            "parent trace_id must propagate"
+        );
+
+        provider.shutdown().unwrap();
+    }
 }

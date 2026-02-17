@@ -70,7 +70,7 @@ impl GrpcRunners {
     ///
     /// Uses a per-address lock to prevent duplicate connection creation when
     /// multiple concurrent callers target the same new runner address.
-    #[instrument(skip(self), fields(runner_address = %address))]
+    #[instrument(level = "debug", skip(self), fields(runner_address = %address))]
     async fn client_for(
         &self,
         address: &RunnerAddress,
@@ -138,7 +138,7 @@ impl Default for GrpcRunners {
 
 #[async_trait]
 impl Runners for GrpcRunners {
-    #[instrument(skip(self), fields(runner_address = %address))]
+    #[instrument(level = "debug", skip(self), fields(runner_address = %address))]
     async fn ping(&self, address: &RunnerAddress) -> Result<(), ClusterError> {
         let mut client = self.client_for(address).await?;
         client
@@ -308,7 +308,7 @@ impl GrpcRunnerServer {
 
 #[tonic::async_trait]
 impl RunnerService for GrpcRunnerServer {
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     async fn ping(
         &self,
         _request: Request<proto::PingRequest>,

@@ -151,7 +151,7 @@ impl SqlWorkflowEngine {
     ///
     /// Deletes timers that have fired and deferred values that have been resolved
     /// older than the specified duration.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn cleanup(&self, older_than: Duration) -> Result<u64, ClusterError> {
         let cutoff =
             Utc::now() - chrono::Duration::from_std(older_than).unwrap_or(chrono::TimeDelta::MAX);
@@ -188,7 +188,7 @@ impl SqlWorkflowEngine {
 
 #[async_trait]
 impl WorkflowEngine for SqlWorkflowEngine {
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn sleep(
         &self,
         workflow_name: &str,
@@ -256,7 +256,7 @@ impl WorkflowEngine for SqlWorkflowEngine {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn await_deferred(
         &self,
         workflow_name: &str,
@@ -370,7 +370,7 @@ impl WorkflowEngine for SqlWorkflowEngine {
         }
     }
 
-    #[tracing::instrument(skip(self, value))]
+    #[tracing::instrument(level = "debug", skip(self, value))]
     async fn resolve_deferred(
         &self,
         workflow_name: &str,
@@ -409,7 +409,7 @@ impl WorkflowEngine for SqlWorkflowEngine {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn on_interrupt(
         &self,
         workflow_name: &str,
@@ -425,7 +425,7 @@ impl WorkflowEngine for SqlWorkflowEngine {
 
 impl SqlWorkflowEngine {
     /// Wait for a timer to fire, polling the database.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn wait_for_timer(
         &self,
         workflow_name: &str,

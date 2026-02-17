@@ -94,7 +94,7 @@ impl SqlMessageStorage {
 
     /// Save an envelope (request or fire-and-forget) to the database.
     /// Returns `SaveResult::Duplicate` if the request_id already exists.
-    #[tracing::instrument(skip(self, envelope), fields(
+    #[tracing::instrument(level = "debug", skip(self, envelope), fields(
         request_id = %envelope.request_id,
         entity_type = %envelope.address.entity_type,
         entity_id = %envelope.address.entity_id,
@@ -164,17 +164,17 @@ impl SqlMessageStorage {
 
 #[async_trait]
 impl MessageStorage for SqlMessageStorage {
-    #[tracing::instrument(skip(self, envelope), fields(request_id = %envelope.request_id))]
+    #[tracing::instrument(level = "debug", skip(self, envelope), fields(request_id = %envelope.request_id))]
     async fn save_request(&self, envelope: &EnvelopeRequest) -> Result<SaveResult, ClusterError> {
         self.save_envelope_inner(envelope, true).await
     }
 
-    #[tracing::instrument(skip(self, envelope), fields(request_id = %envelope.request_id))]
+    #[tracing::instrument(level = "debug", skip(self, envelope), fields(request_id = %envelope.request_id))]
     async fn save_envelope(&self, envelope: &EnvelopeRequest) -> Result<SaveResult, ClusterError> {
         self.save_envelope_inner(envelope, false).await
     }
 
-    #[tracing::instrument(skip(self, reply), fields(request_id = %reply.request_id()))]
+    #[tracing::instrument(level = "debug", skip(self, reply), fields(request_id = %reply.request_id()))]
     async fn save_reply(&self, reply: &Reply) -> Result<(), ClusterError> {
         let (request_id, id, sequence, payload, is_exit) = match reply {
             Reply::WithExit(r) => {
@@ -267,7 +267,7 @@ impl MessageStorage for SqlMessageStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn clear_replies(&self, request_id: Snowflake) -> Result<(), ClusterError> {
         sqlx::query("DELETE FROM cluster_replies WHERE request_id = $1")
             .bind(request_id.0)
@@ -280,7 +280,7 @@ impl MessageStorage for SqlMessageStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn replies_for(&self, request_id: Snowflake) -> Result<Vec<Reply>, ClusterError> {
         let rows = sqlx::query(
             r#"
@@ -306,7 +306,7 @@ impl MessageStorage for SqlMessageStorage {
         decode_reply_rows(reply_rows)
     }
 
-    #[tracing::instrument(skip(self, shard_ids), fields(shard_count = shard_ids.len()))]
+    #[tracing::instrument(level = "debug", skip(self, shard_ids), fields(shard_count = shard_ids.len()))]
     async fn unprocessed_messages(
         &self,
         shard_ids: &[ShardId],
@@ -472,7 +472,7 @@ impl MessageStorage for SqlMessageStorage {
         Ok(messages)
     }
 
-    #[tracing::instrument(skip(self, shard_ids), fields(shard_count = shard_ids.len()))]
+    #[tracing::instrument(level = "debug", skip(self, shard_ids), fields(shard_count = shard_ids.len()))]
     async fn reset_shards(&self, shard_ids: &[ShardId]) -> Result<(), ClusterError> {
         if shard_ids.is_empty() {
             return Ok(());
@@ -527,7 +527,7 @@ impl MessageStorage for SqlMessageStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, request_ids), fields(count = request_ids.len()))]
+    #[tracing::instrument(level = "debug", skip(self, request_ids), fields(count = request_ids.len()))]
     async fn unprocessed_messages_by_id(
         &self,
         request_ids: &[Snowflake],
@@ -581,7 +581,7 @@ impl MessageStorage for SqlMessageStorage {
         self.reply_handlers.remove(&request_id);
     }
 
-    #[tracing::instrument(skip(self), fields(request_id = %ack.request_id, sequence = ack.sequence))]
+    #[tracing::instrument(level = "debug", skip(self), fields(request_id = %ack.request_id, sequence = ack.sequence))]
     async fn ack_chunk(&self, ack: &AckChunk) -> Result<(), ClusterError> {
         sqlx::query(
             "DELETE FROM cluster_replies WHERE request_id = $1 AND sequence = $2 AND id = $3 AND is_exit = FALSE",

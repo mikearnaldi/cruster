@@ -319,7 +319,7 @@ impl DurableContext {
     }
 
     /// Durable sleep that survives restarts.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn sleep(&self, name: &str, duration: Duration) -> Result<(), ClusterError> {
         self.engine
             .sleep(&self.workflow_name, &self.execution_id, name, duration)
@@ -327,7 +327,7 @@ impl DurableContext {
     }
 
     /// Wait for an external signal to resolve a typed value.
-    #[tracing::instrument(skip(self, key))]
+    #[tracing::instrument(level = "debug", skip(self, key))]
     pub async fn await_deferred<T, K>(&self, key: K) -> Result<T, ClusterError>
     where
         T: Serialize + DeserializeOwned,
@@ -345,7 +345,7 @@ impl DurableContext {
     }
 
     /// Resolve a deferred value, resuming any entity method waiting on it.
-    #[tracing::instrument(skip(self, key, value))]
+    #[tracing::instrument(level = "debug", skip(self, key, value))]
     pub async fn resolve_deferred<T, K>(&self, key: K, value: &T) -> Result<(), ClusterError>
     where
         T: Serialize,
@@ -362,7 +362,7 @@ impl DurableContext {
     }
 
     /// Wait for an interrupt signal.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn on_interrupt(&self) -> Result<(), ClusterError> {
         self.engine
             .on_interrupt(&self.workflow_name, &self.execution_id)
@@ -375,7 +375,7 @@ impl DurableContext {
     ///
     /// Returns `Ok(Some(T))` if a cached result exists (replay hit),
     /// `Ok(None)` if this is a first execution or re-execution after crash.
-    #[tracing::instrument(skip(self, key_bytes))]
+    #[tracing::instrument(level = "debug", skip(self, key_bytes))]
     pub async fn check_journal<T: DeserializeOwned>(
         &self,
         name: &str,

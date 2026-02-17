@@ -114,7 +114,7 @@ impl EntityReaper {
     }
 
     /// Perform a single reap pass across all registered managers.
-    #[instrument(skip(self))]
+    #[instrument(level = "debug", skip(self))]
     pub async fn reap_all(&self) -> usize {
         let managers = self.managers.read().await;
         let mut total_reaped = 0;

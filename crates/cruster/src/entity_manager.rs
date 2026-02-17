@@ -375,7 +375,7 @@ impl EntityManager {
     /// Entities are given `entity_termination_timeout` to finish processing
     /// active requests before being forcefully cancelled. The timeout applies
     /// to the entire shard's entities collectively.
-    #[instrument(skip(self), fields(shard_id = %shard_id))]
+    #[instrument(level = "debug", skip(self), fields(shard_id = %shard_id))]
     pub async fn interrupt_shard(&self, shard_id: &ShardId) {
         // Mark shard as interrupting BEFORE collecting instances, so
         // concurrent get_or_spawn calls reject spawns on this shard.
@@ -477,7 +477,7 @@ impl EntityManager {
     ///
     /// Gives the entity a grace period to finish active requests, then cancels
     /// the mailbox task and waits briefly for it to exit.
-    #[instrument(skip(self), fields(entity_address = %address))]
+    #[instrument(level = "debug", skip(self), fields(entity_address = %address))]
     pub async fn interrupt_entity(&self, address: &EntityAddress) {
         let Some((_, instance)) = self.instances.remove(address) else {
             return;
@@ -543,7 +543,7 @@ impl EntityManager {
 
     /// Reap idle entities that have exceeded their max idle time.
     /// Returns the number of entities reaped.
-    #[instrument(skip(self), fields(entity_type = %self.entity.entity_type()))]
+    #[instrument(level = "debug", skip(self), fields(entity_type = %self.entity.entity_type()))]
     pub async fn reap_idle(&self, max_idle: Duration) -> usize {
         let now_ms = now_millis();
         let max_idle_ms = max_idle.as_millis() as i64;
@@ -634,7 +634,7 @@ impl EntityManager {
         self.entity.as_ref()
     }
 
-    #[instrument(skip(self), fields(entity_address = %address))]
+    #[instrument(level = "debug", skip(self), fields(entity_address = %address))]
     async fn get_or_spawn(
         &self,
         address: &EntityAddress,
@@ -787,7 +787,7 @@ impl EntityManager {
     /// (handler swap). On panic, the handler is replaced and the panicked
     /// request is replayed against the fresh handler.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip_all, fields(entity_address = %address))]
+    #[instrument(level = "debug", skip_all, fields(entity_address = %address))]
     async fn process_mailbox(
         instance: Arc<EntityInstance>,
         mut mailbox_rx: mpsc::UnboundedReceiver<IncomingMessage>,
@@ -1082,7 +1082,7 @@ impl EntityManager {
 
     /// Attempt to handle a request, respawning the handler on panic.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip_all, fields(
+    #[instrument(level = "debug", skip_all, fields(
         entity_address = %address,
         request_id = %snapshot.request.request_id,
         tag = %snapshot.request.tag,
@@ -1235,7 +1235,7 @@ impl EntityManager {
 
     /// Attempt to handle a streaming request, respawning the handler on panic.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip_all, fields(
+    #[instrument(level = "debug", skip_all, fields(
         entity_address = %address,
         request_id = %snapshot.request.request_id,
         tag = %snapshot.request.tag,
@@ -1378,7 +1378,7 @@ impl EntityManager {
     /// Acquires a read lock on the handler to get an `Arc` clone, then releases
     /// the lock before executing. This allows concurrent requests to proceed
     /// simultaneously. Crash recovery takes a write lock to swap the handler.
-    #[instrument(skip(instance, snapshot), fields(
+    #[instrument(level = "debug", skip(instance, snapshot), fields(
         request_id = %snapshot.request.request_id,
         tag = %snapshot.request.tag,
     ))]
@@ -1427,7 +1427,7 @@ impl EntityManager {
     }
 
     /// Try to execute a handler stream, catching panics.
-    #[instrument(skip(instance, snapshot, snowflake, message_storage), fields(
+    #[instrument(level = "debug", skip(instance, snapshot, snowflake, message_storage), fields(
         request_id = %snapshot.request.request_id,
         tag = %snapshot.request.tag,
     ))]

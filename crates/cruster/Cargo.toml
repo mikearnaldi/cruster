@@ -45,13 +45,6 @@ cron = "0.13"
 # Tracing
 tracing = { workspace = true }
 
-# OpenTelemetry (optional)
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
-
 # Macros
 cruster-macros = { workspace = true }
 
@@ -72,7 +65,6 @@ default = []
 etcd = ["dep:etcd-client"]
 consistent-hash = ["dep:hashring"]
 parallel = ["dep:rayon"]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tracing-subscriber"]
 
 [build-dependencies]
 tonic-build = "0.12"

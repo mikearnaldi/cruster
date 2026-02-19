@@ -7,7 +7,6 @@ use crate::sharding::Sharding;
 use crate::snowflake::Snowflake;
 use crate::types::{EntityId, EntityType};
 use chrono::{DateTime, Utc};
-use opentelemetry::trace::TraceContextExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -15,7 +14,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
 use tracing::instrument;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Client for sending messages to a specific entity type.
 ///
@@ -552,24 +550,6 @@ impl EntityClient {
             source: Some(Box::new(e)),
         })?;
 
-        // Extract OTel trace context from the current span so that the
-        // receiver can link its processing span as a child of the sender.
-        // This works for all delivery paths (local, gRPC, persisted via Postgres).
-        let (trace_id, span_id, sampled) = {
-            let context = tracing::Span::current().context();
-            let span_ref = context.span();
-            let sc = span_ref.span_context();
-            if sc.is_valid() {
-                (
-                    Some(sc.trace_id().to_string()),
-                    Some(sc.span_id().to_string()),
-                    Some(sc.trace_flags().is_sampled()),
-                )
-            } else {
-                (None, None, None)
-            }
-        };
-
         Ok(EnvelopeRequest {
             request_id: self.sharding.snowflake().next_async().await?,
             address: crate::types::EntityAddress {
@@ -580,9 +560,9 @@ impl EntityClient {
             tag: tag.to_string(),
             payload,
             headers: HashMap::new(),
-            span_id,
-            trace_id,
-            sampled,
+            span_id: None,
+            trace_id: None,
+            sampled: None,
             persisted: false,
             uninterruptible: Default::default(),
             deliver_at: None,

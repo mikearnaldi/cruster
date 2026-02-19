@@ -8,10 +8,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 use tracing::{self, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::envelope::{Envelope, EnvelopeRequest};
 use crate::error::ClusterError;
@@ -151,15 +153,28 @@ impl Runners for GrpcRunners {
         Ok(())
     }
 
-    #[instrument(skip(self, envelope), fields(runner_address = %address))]
+    #[instrument(name = "deliver", skip(self, envelope), fields(runner_address = %address))]
     async fn send(
         &self,
         address: &RunnerAddress,
-        envelope: EnvelopeRequest,
+        mut envelope: EnvelopeRequest,
     ) -> Result<ReplyReceiver, ClusterError> {
         let mut client = self.client_for(address).await?;
 
         let request_id = envelope.request_id;
+
+        // Overwrite the trace context with the deliver span's ID so that
+        // the receiving side's `receive` span becomes a child of `deliver`.
+        {
+            let context = tracing::Span::current().context();
+            let span_ref = context.span();
+            let sc = span_ref.span_context();
+            if sc.is_valid() {
+                envelope.trace_id = Some(sc.trace_id().to_string());
+                envelope.span_id = Some(sc.span_id().to_string());
+                envelope.sampled = Some(sc.trace_flags().is_sampled());
+            }
+        }
 
         let envelope_bytes = rmp_serde::to_vec(&Envelope::Request(envelope)).map_err(|e| {
             ClusterError::MalformedMessage {
@@ -311,7 +326,7 @@ impl RunnerService for GrpcRunnerServer {
 
     type SendStream = tokio_stream::wrappers::ReceiverStream<Result<proto::ReplyMessage, Status>>;
 
-    #[instrument(skip_all)]
+    #[instrument(name = "receive", skip_all)]
     async fn send(
         &self,
         request: Request<proto::SendRequest>,
@@ -327,6 +342,25 @@ impl RunnerService for GrpcRunnerServer {
             Err(_) => rmp_serde::from_slice(&envelope_bytes)
                 .map_err(|e| Status::invalid_argument(format!("malformed envelope: {e}")))?,
         };
+
+        // Link this span to the sender's trace context so that the
+        // receive span appears as a child of the sender's deliver span.
+        if let (Some(trace_id_str), Some(span_id_str)) = (&envelope.trace_id, &envelope.span_id) {
+            if let (Ok(tid), Ok(sid)) = (
+                TraceId::from_hex(trace_id_str),
+                SpanId::from_hex(span_id_str),
+            ) {
+                let flags = if envelope.sampled.unwrap_or(false) {
+                    TraceFlags::SAMPLED
+                } else {
+                    TraceFlags::default()
+                };
+                let remote_context = SpanContext::new(tid, sid, flags, true, TraceState::default());
+                let otel_context =
+                    opentelemetry::Context::current().with_remote_span_context(remote_context);
+                tracing::Span::current().set_parent(otel_context);
+            }
+        }
 
         let mut reply_rx = self
             .sharding

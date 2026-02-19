@@ -7,9 +7,11 @@ use std::time::Instant;
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
 use futures::future::BoxFuture;
+use opentelemetry::trace::TraceContextExt;
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio_stream::Stream;
 use tracing::instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::config::ShardingConfig;
 use crate::detachment::{DetachedState, DetachmentReason};
@@ -2252,14 +2254,27 @@ impl Sharding for ShardingImpl {
         EntityClient::new(self, entity_type)
     }
 
-    #[instrument(skip(self, envelope), fields(
+    #[instrument(name = "route", skip(self, envelope), fields(
         entity_type = %envelope.address.entity_type,
         entity_id = %envelope.address.entity_id,
         shard_id = %envelope.address.shard_id,
         request_id = %envelope.request_id,
         tag = %envelope.tag,
     ))]
-    async fn send(&self, envelope: EnvelopeRequest) -> Result<ReplyReceiver, ClusterError> {
+    async fn send(&self, mut envelope: EnvelopeRequest) -> Result<ReplyReceiver, ClusterError> {
+        // Stamp OTel trace context from the current (route) span so that the
+        // receiver's handle_message_with_recovery becomes a child of route.
+        {
+            let context = tracing::Span::current().context();
+            let span_ref = context.span();
+            let sc = span_ref.span_context();
+            if sc.is_valid() {
+                envelope.trace_id = Some(sc.trace_id().to_string());
+                envelope.span_id = Some(sc.span_id().to_string());
+                envelope.sampled = Some(sc.trace_flags().is_sampled());
+            }
+        }
+
         if self.is_shutdown() {
             return Err(ClusterError::ShuttingDown);
         }

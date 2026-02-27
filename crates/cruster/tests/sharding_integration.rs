@@ -24,7 +24,6 @@ use cruster::sharding_impl::ShardingImpl;
 use cruster::snowflake::Snowflake;
 use cruster::storage::noop_runners::NoopRunners;
 use cruster::storage::sql_message::SqlMessageStorage;
-use cruster::storage::sql_workflow::SqlWorkflowStorage;
 use cruster::types::{EntityId, EntityType, ShardId};
 
 use testcontainers::runners::AsyncRunner;
@@ -53,8 +52,9 @@ async fn setup_postgres() -> (testcontainers::ContainerAsync<Postgres>, sqlx::Pg
         .await
         .expect("failed to connect to postgres");
 
-    let wf_storage = SqlWorkflowStorage::new(pool.clone());
-    wf_storage.migrate().await.expect("migration failed");
+    cruster::storage::migrate(&pool)
+        .await
+        .expect("migration failed");
 
     (container, pool)
 }

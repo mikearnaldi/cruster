@@ -1,4 +1,4 @@
-//! SQL-backed workflow storage using PostgreSQL via sqlx.
+//! SQL-backed workflow journal storage using PostgreSQL via sqlx.
 //!
 //! Persists workflow journal entries (idempotency cache) so that
 //! workflow execution results and deferred values survive entity
@@ -48,32 +48,22 @@ fn increment_last_byte(prefix: &str) -> Option<String> {
     None
 }
 
-/// PostgreSQL-backed workflow storage.
-pub struct SqlWorkflowStorage {
+/// PostgreSQL-backed workflow journal storage.
+pub struct SqlWorkflowJournalStorage {
     pool: PgPool,
 }
 
-impl SqlWorkflowStorage {
-    /// Create a new SQL workflow storage with the given connection pool.
+impl SqlWorkflowJournalStorage {
+    /// Create a new SQL workflow journal storage with the given connection pool.
     ///
-    /// **Important:** You must call [`migrate()`](Self::migrate) before using this storage,
-    /// or ensure that [`SqlMessageStorage::migrate()`](super::sql_message::SqlMessageStorage::migrate)
-    /// has already been called (it runs all cluster migrations including the workflow journal table).
+    /// Run [`crate::storage::migrate`] before using SQL storage backends.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
-    }
-
-    /// Run database migrations to create the `cluster_workflow_journal` table.
-    ///
-    /// This runs all cluster migrations (shared with `SqlMessageStorage`).
-    /// It is safe to call multiple times — migrations are idempotent.
-    pub async fn migrate(&self) -> Result<(), ClusterError> {
-        super::sql_migrations::run_cruster_migrations(&self.pool).await
     }
 }
 
 #[async_trait]
-impl WorkflowStorage for SqlWorkflowStorage {
+impl WorkflowStorage for SqlWorkflowJournalStorage {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn load(&self, key: &str) -> Result<Option<Vec<u8>>, ClusterError> {
         let row = sqlx::query("SELECT value FROM cluster_workflow_journal WHERE key = $1")
@@ -221,7 +211,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
                 source: Some(Box::new(e)),
             })?;
 
-        Ok(Box::new(SqlTransaction {
+        Ok(Box::new(SqlJournalTransaction {
             tx: Arc::new(Mutex::new(Some(tx))),
         }))
     }
@@ -229,7 +219,7 @@ impl WorkflowStorage for SqlWorkflowStorage {
     fn as_arc(&self) -> Arc<dyn WorkflowStorage> {
         // This is only called by the default begin_transaction impl,
         // which we override above. So this should never be called.
-        panic!("SqlWorkflowStorage::as_arc() should not be called")
+        panic!("SqlWorkflowJournalStorage::as_arc() should not be called")
     }
 
     fn sql_pool(&self) -> Option<&PgPool> {
@@ -242,12 +232,12 @@ impl WorkflowStorage for SqlWorkflowStorage {
 /// All operations are performed within the transaction and only become
 /// visible when `commit()` is called. If the transaction is dropped
 /// without committing, all operations are rolled back.
-pub struct SqlTransaction {
+pub struct SqlJournalTransaction {
     tx: Arc<Mutex<Option<Transaction<'static, Postgres>>>>,
 }
 
 #[async_trait]
-impl StorageTransaction for SqlTransaction {
+impl StorageTransaction for SqlJournalTransaction {
     async fn save(&mut self, key: &str, value: &[u8]) -> Result<(), ClusterError> {
         let mut guard = self.tx.lock().await;
         let tx = guard
@@ -334,7 +324,7 @@ impl StorageTransaction for SqlTransaction {
     }
 }
 
-impl SqlTransaction {
+impl SqlJournalTransaction {
     /// Execute a raw SQL query within this transaction.
     ///
     /// This allows activities to run arbitrary SQL statements that will be
@@ -488,7 +478,7 @@ mod tests {
     #[test]
     fn sql_workflow_storage_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<SqlWorkflowStorage>();
+        assert_send_sync::<SqlWorkflowJournalStorage>();
     }
 
     #[test]

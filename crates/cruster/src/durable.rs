@@ -122,7 +122,7 @@ pub trait WorkflowStorage: Send + Sync {
 
     /// Get the underlying SQL connection pool, if this is a SQL-backed storage.
     ///
-    /// Returns `Some(&PgPool)` for `SqlWorkflowStorage`, `None` for others.
+    /// Returns `Some(&PgPool)` for `SqlWorkflowJournalStorage`, `None` for others.
     /// Used by the framework to open transactions for activity execution
     /// and to provide `self.db` in activity views.
     fn sql_pool(&self) -> Option<&sqlx::PgPool> {

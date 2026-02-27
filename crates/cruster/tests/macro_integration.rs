@@ -18,7 +18,7 @@ use cruster::error::ClusterError;
 use cruster::prelude::*;
 use cruster::snowflake::SnowflakeGenerator;
 use cruster::storage::sql_message::SqlMessageStorage;
-use cruster::storage::sql_workflow::SqlWorkflowStorage;
+use cruster::storage::sql_workflow_journal::SqlWorkflowJournalStorage as SqlWorkflowStorage;
 
 use cruster::types::{EntityAddress, EntityId, EntityType, RunnerAddress, ShardId};
 
@@ -48,8 +48,9 @@ async fn setup_postgres() -> (testcontainers::ContainerAsync<Postgres>, sqlx::Pg
         .await
         .expect("failed to connect to postgres");
 
-    let wf_storage = SqlWorkflowStorage::new(pool.clone());
-    wf_storage.migrate().await.expect("migration failed");
+    cruster::storage::migrate(&pool)
+        .await
+        .expect("migration failed");
 
     (container, pool)
 }

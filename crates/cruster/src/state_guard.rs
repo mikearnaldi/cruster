@@ -300,7 +300,7 @@ impl ActivityScope {
         let mut guard = transaction.lock().await;
         let is_sql = guard
             .as_any_mut()
-            .downcast_ref::<crate::storage::sql_workflow::SqlTransaction>()
+            .downcast_ref::<crate::storage::sql_workflow_journal::SqlJournalTransaction>()
             .is_some();
         drop(guard);
 
@@ -330,7 +330,7 @@ impl SqlTransactionHandle {
         let mut guard = self.transaction.lock().await;
         let tx = guard
             .as_any_mut()
-            .downcast_mut::<crate::storage::sql_workflow::SqlTransaction>()
+            .downcast_mut::<crate::storage::sql_workflow_journal::SqlJournalTransaction>()
             .ok_or_else(|| ClusterError::PersistenceError {
                 reason: "transaction is not a SQL transaction".to_string(),
                 source: None,
@@ -349,7 +349,7 @@ impl SqlTransactionHandle {
         let mut guard = self.transaction.lock().await;
         let tx = guard
             .as_any_mut()
-            .downcast_mut::<crate::storage::sql_workflow::SqlTransaction>()
+            .downcast_mut::<crate::storage::sql_workflow_journal::SqlJournalTransaction>()
             .ok_or_else(|| ClusterError::PersistenceError {
                 reason: "transaction is not a SQL transaction".to_string(),
                 source: None,
@@ -368,7 +368,7 @@ impl SqlTransactionHandle {
         let mut guard = self.transaction.lock().await;
         let tx = guard
             .as_any_mut()
-            .downcast_mut::<crate::storage::sql_workflow::SqlTransaction>()
+            .downcast_mut::<crate::storage::sql_workflow_journal::SqlJournalTransaction>()
             .ok_or_else(|| ClusterError::PersistenceError {
                 reason: "transaction is not a SQL transaction".to_string(),
                 source: None,
@@ -387,7 +387,7 @@ impl SqlTransactionHandle {
         let mut guard = self.transaction.lock().await;
         let tx = guard
             .as_any_mut()
-            .downcast_mut::<crate::storage::sql_workflow::SqlTransaction>()
+            .downcast_mut::<crate::storage::sql_workflow_journal::SqlJournalTransaction>()
             .ok_or_else(|| ClusterError::PersistenceError {
                 reason: "transaction is not a SQL transaction".to_string(),
                 source: None,

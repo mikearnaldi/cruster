@@ -1,9 +1,9 @@
 //! Integration tests for SQL storage backends using testcontainers.
 //!
 //! These tests spin up a real PostgreSQL container and exercise:
-//! - `SqlWorkflowStorage`: journal save/load/delete/list_keys/cleanup
+//! - `SqlWorkflowJournalStorage`: journal save/load/delete/list_keys/cleanup
 //! - `SqlMessageStorage`: save/ack/poll/dead-letter/reset_shards
-//! - `SqlWorkflowEngine`: sleep/deferred/resolve/cleanup
+//! - `SqlWorkflowRuntimeEngine`: sleep/deferred/resolve/cleanup
 //! - Transaction atomicity: journal + user SQL commit/rollback
 //! - Concurrent dispatch: `FOR UPDATE SKIP LOCKED` correctness
 //!
@@ -21,8 +21,8 @@ use cruster::message_storage::{MessageStorage, SaveResult};
 use cruster::reply::{ExitResult, Reply, ReplyChunk, ReplyWithExit};
 use cruster::snowflake::{Snowflake, SnowflakeGenerator};
 use cruster::storage::sql_message::SqlMessageStorage;
-use cruster::storage::sql_workflow::SqlWorkflowStorage;
-use cruster::storage::sql_workflow_engine::SqlWorkflowEngine;
+use cruster::storage::sql_workflow_journal::SqlWorkflowJournalStorage as SqlWorkflowStorage;
+use cruster::storage::sql_workflow_runtime::SqlWorkflowRuntimeEngine as SqlWorkflowEngine;
 use cruster::types::{EntityAddress, EntityId, EntityType, ShardId};
 
 use sqlx::Row;
@@ -52,9 +52,10 @@ async fn setup_postgres() -> (testcontainers::ContainerAsync<Postgres>, sqlx::Pg
         .await
         .expect("failed to connect to postgres");
 
-    // Run migrations (all three storage types share the same migration set)
-    let wf_storage = SqlWorkflowStorage::new(pool.clone());
-    wf_storage.migrate().await.expect("migration failed");
+    // Run migrations once for all SQL backends.
+    cruster::storage::migrate(&pool)
+        .await
+        .expect("migration failed");
 
     (container, pool)
 }

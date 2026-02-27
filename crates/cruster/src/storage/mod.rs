@@ -1,6 +1,8 @@
 pub mod noop_health;
 pub mod noop_runners;
 
+pub(crate) mod sql_migrations;
+
 pub mod sql_message;
 
 pub mod sql_workflow;

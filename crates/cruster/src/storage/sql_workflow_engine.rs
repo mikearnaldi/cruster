@@ -102,13 +102,7 @@ impl SqlWorkflowEngine {
     /// This runs all cluster migrations (shared with other SQL storage types).
     /// It is safe to call multiple times - migrations are idempotent.
     pub async fn migrate(&self) -> Result<(), ClusterError> {
-        sqlx::migrate!()
-            .run(&self.pool)
-            .await
-            .map_err(|e| ClusterError::PersistenceError {
-                reason: format!("workflow engine migration failed: {e}"),
-                source: Some(Box::new(e)),
-            })
+        super::sql_migrations::run_cruster_migrations(&self.pool).await
     }
 
     /// Get or create a notifier for a deferred key.

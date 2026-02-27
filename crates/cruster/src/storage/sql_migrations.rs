@@ -58,10 +58,26 @@ async fn run_sqlx_migrations_with_table(
     migrator: &Migrator,
     options: PostgresMigrationOptions<'_>,
 ) -> Result<MigrationStatus, ClusterError> {
+    let mut lock_conn = if options.advisory_lock {
+        Some(
+            pool.acquire()
+                .await
+                .map_err(|e| ClusterError::PersistenceError {
+                    reason: format!("failed to acquire migration lock connection: {e}"),
+                    source: Some(Box::new(e)),
+                })?,
+        )
+    } else {
+        None
+    };
+
     if options.advisory_lock {
+        let lock_conn = lock_conn
+            .as_mut()
+            .expect("lock connection must exist when advisory lock is enabled");
         sqlx::query("SELECT pg_advisory_lock(hashtext($1)::bigint)")
             .bind(options.tracking_table)
-            .execute(pool)
+            .execute(&mut **lock_conn)
             .await
             .map_err(|e| ClusterError::PersistenceError {
                 reason: format!("failed to acquire migration advisory lock: {e}"),
@@ -72,9 +88,12 @@ async fn run_sqlx_migrations_with_table(
     let run_result = run_locked(pool, migrator, options).await;
 
     if options.advisory_lock {
+        let lock_conn = lock_conn
+            .as_mut()
+            .expect("lock connection must exist when advisory lock is enabled");
         sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
             .bind(options.tracking_table)
-            .execute(pool)
+            .execute(&mut **lock_conn)
             .await
             .map_err(|e| ClusterError::PersistenceError {
                 reason: format!("failed to release migration advisory lock: {e}"),

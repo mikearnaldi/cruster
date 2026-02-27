@@ -52,13 +52,13 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// ```text
 /// use sqlx::postgres::PgPool;
-/// use cruster::storage::sql_workflow_runtime::SqlWorkflowRuntimeEngine;
+/// use cruster::storage::sql_workflow_runtime::SqlWorkflowEngine;
 ///
 /// let pool = PgPool::connect("postgres://...").await?;
 /// cruster::storage::migrate(&pool).await?;
-/// let engine = SqlWorkflowRuntimeEngine::new(pool);
+/// let engine = SqlWorkflowEngine::new(pool);
 /// ```
-pub struct SqlWorkflowRuntimeEngine {
+pub struct SqlWorkflowEngine {
     pool: PgPool,
     /// Poll interval for database checks
     poll_interval: Duration,
@@ -69,7 +69,7 @@ pub struct SqlWorkflowRuntimeEngine {
     timer_notifiers: DashMap<(String, String, String), Arc<Notify>>,
 }
 
-impl SqlWorkflowRuntimeEngine {
+impl SqlWorkflowEngine {
     /// Create a new SQL workflow runtime engine with the given connection pool.
     ///
     /// Run [`crate::storage::migrate`] before using SQL storage backends.
@@ -172,7 +172,7 @@ impl SqlWorkflowRuntimeEngine {
 }
 
 #[async_trait]
-impl WorkflowEngine for SqlWorkflowRuntimeEngine {
+impl WorkflowEngine for SqlWorkflowEngine {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn sleep(
         &self,
@@ -408,7 +408,7 @@ impl WorkflowEngine for SqlWorkflowRuntimeEngine {
     }
 }
 
-impl SqlWorkflowRuntimeEngine {
+impl SqlWorkflowEngine {
     /// Wait for a timer to fire, polling the database.
     #[tracing::instrument(level = "debug", skip(self))]
     async fn wait_for_timer(
@@ -506,6 +506,6 @@ mod tests {
     #[test]
     fn sql_workflow_engine_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<SqlWorkflowRuntimeEngine>();
+        assert_send_sync::<SqlWorkflowEngine>();
     }
 }

@@ -18,7 +18,7 @@ use cruster::error::ClusterError;
 use cruster::prelude::*;
 use cruster::snowflake::SnowflakeGenerator;
 use cruster::storage::sql_message::SqlMessageStorage;
-use cruster::storage::sql_workflow_journal::SqlWorkflowJournalStorage as SqlWorkflowStorage;
+use cruster::storage::sql_workflow_journal::SqlWorkflowStorage;
 
 use cruster::types::{EntityAddress, EntityId, EntityType, RunnerAddress, ShardId};
 

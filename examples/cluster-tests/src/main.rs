@@ -22,8 +22,8 @@ use cruster::sharding::Sharding;
 use cruster::sharding_impl::ShardingImpl;
 use cruster::storage::etcd_runner::EtcdRunnerStorage;
 use cruster::storage::sql_message::SqlMessageStorage;
-use cruster::storage::sql_workflow_journal::SqlWorkflowJournalStorage;
-use cruster::storage::sql_workflow_runtime::SqlWorkflowRuntimeEngine;
+use cruster::storage::sql_workflow_journal::SqlWorkflowStorage;
+use cruster::storage::sql_workflow_runtime::SqlWorkflowEngine;
 use cruster::transport::grpc::{GrpcRunnerHealth, GrpcRunnerServer, GrpcRunners};
 use cruster::types::RunnerAddress;
 use opentelemetry::trace::TracerProvider;
@@ -128,8 +128,8 @@ async fn create_cluster(
     let message_storage = Arc::new(SqlMessageStorage::new(pool.clone()));
     cruster::storage::migrate(&pool).await?;
 
-    let state_storage = Arc::new(SqlWorkflowJournalStorage::new(pool.clone()));
-    let workflow_engine = Arc::new(SqlWorkflowRuntimeEngine::new(pool.clone()));
+    let state_storage = Arc::new(SqlWorkflowStorage::new(pool.clone()));
+    let workflow_engine = Arc::new(SqlWorkflowEngine::new(pool.clone()));
 
     // Parse etcd endpoints
     let endpoints: Vec<String> = etcd_endpoints

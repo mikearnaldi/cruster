@@ -49,11 +49,11 @@ fn increment_last_byte(prefix: &str) -> Option<String> {
 }
 
 /// PostgreSQL-backed workflow journal storage.
-pub struct SqlWorkflowJournalStorage {
+pub struct SqlWorkflowStorage {
     pool: PgPool,
 }
 
-impl SqlWorkflowJournalStorage {
+impl SqlWorkflowStorage {
     /// Create a new SQL workflow journal storage with the given connection pool.
     ///
     /// Run [`crate::storage::migrate`] before using SQL storage backends.
@@ -63,7 +63,7 @@ impl SqlWorkflowJournalStorage {
 }
 
 #[async_trait]
-impl WorkflowStorage for SqlWorkflowJournalStorage {
+impl WorkflowStorage for SqlWorkflowStorage {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn load(&self, key: &str) -> Result<Option<Vec<u8>>, ClusterError> {
         let row = sqlx::query("SELECT value FROM cluster_workflow_journal WHERE key = $1")
@@ -219,7 +219,7 @@ impl WorkflowStorage for SqlWorkflowJournalStorage {
     fn as_arc(&self) -> Arc<dyn WorkflowStorage> {
         // This is only called by the default begin_transaction impl,
         // which we override above. So this should never be called.
-        panic!("SqlWorkflowJournalStorage::as_arc() should not be called")
+        panic!("SqlWorkflowStorage::as_arc() should not be called")
     }
 
     fn sql_pool(&self) -> Option<&PgPool> {
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn sql_workflow_storage_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<SqlWorkflowJournalStorage>();
+        assert_send_sync::<SqlWorkflowStorage>();
     }
 
     #[test]

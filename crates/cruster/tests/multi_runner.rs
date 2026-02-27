@@ -29,7 +29,7 @@ use cruster::sharding_impl::ShardingImpl;
 use cruster::snowflake::Snowflake;
 use cruster::storage::etcd_runner::EtcdRunnerStorage;
 use cruster::storage::sql_message::SqlMessageStorage;
-use cruster::storage::sql_workflow_journal::SqlWorkflowJournalStorage as SqlWorkflowStorage;
+use cruster::storage::sql_workflow_journal::SqlWorkflowStorage;
 use cruster::transport::grpc::{GrpcRunnerHealth, GrpcRunnerServer, GrpcRunners};
 use cruster::types::{EntityAddress, EntityId, EntityType, RunnerAddress, ShardId};
 
@@ -160,9 +160,8 @@ impl TestRunner {
             Arc::new(SqlWorkflowStorage::new(pool.clone()));
 
         // Workflow engine
-        let workflow_engine: Arc<dyn cruster::__internal::WorkflowEngine> = Arc::new(
-            cruster::__internal::SqlWorkflowRuntimeEngine::new(pool.clone()),
-        );
+        let workflow_engine: Arc<dyn cruster::__internal::WorkflowEngine> =
+            Arc::new(cruster::__internal::SqlWorkflowEngine::new(pool.clone()));
 
         // etcd runner storage
         let etcd_client = etcd_client::Client::connect([etcd_endpoint], None)

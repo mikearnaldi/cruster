@@ -3226,7 +3226,7 @@ fn activity_group_impl_inner(
                         };
                         #journal_body
                     } else {
-                        panic!("SQL storage is required for workflow activities; configure SqlWorkflowJournalStorage")
+                        panic!("SQL storage is required for workflow activities; configure SqlWorkflowStorage")
                     }
                 }
             }
@@ -4729,7 +4729,7 @@ fn workflow_impl_inner(
                         };
                         #journal_body
                     } else {
-                        panic!("SQL storage is required for workflow activities; configure SqlWorkflowJournalStorage")
+                        panic!("SQL storage is required for workflow activities; configure SqlWorkflowStorage")
                     }
                 }
             }

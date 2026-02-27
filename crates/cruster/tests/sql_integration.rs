@@ -1,9 +1,9 @@
 //! Integration tests for SQL storage backends using testcontainers.
 //!
 //! These tests spin up a real PostgreSQL container and exercise:
-//! - `SqlWorkflowJournalStorage`: journal save/load/delete/list_keys/cleanup
+//! - `SqlWorkflowStorage`: journal save/load/delete/list_keys/cleanup
 //! - `SqlMessageStorage`: save/ack/poll/dead-letter/reset_shards
-//! - `SqlWorkflowRuntimeEngine`: sleep/deferred/resolve/cleanup
+//! - `SqlWorkflowEngine`: sleep/deferred/resolve/cleanup
 //! - Transaction atomicity: journal + user SQL commit/rollback
 //! - Concurrent dispatch: `FOR UPDATE SKIP LOCKED` correctness
 //!
@@ -21,8 +21,8 @@ use cruster::message_storage::{MessageStorage, SaveResult};
 use cruster::reply::{ExitResult, Reply, ReplyChunk, ReplyWithExit};
 use cruster::snowflake::{Snowflake, SnowflakeGenerator};
 use cruster::storage::sql_message::SqlMessageStorage;
-use cruster::storage::sql_workflow_journal::SqlWorkflowJournalStorage as SqlWorkflowStorage;
-use cruster::storage::sql_workflow_runtime::SqlWorkflowRuntimeEngine as SqlWorkflowEngine;
+use cruster::storage::sql_workflow_journal::SqlWorkflowStorage;
+use cruster::storage::sql_workflow_runtime::SqlWorkflowEngine;
 use cruster::types::{EntityAddress, EntityId, EntityType, ShardId};
 
 use sqlx::Row;

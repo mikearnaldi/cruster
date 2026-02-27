@@ -52,12 +52,13 @@ impl SingleRunner {
     ///
     /// Runs database migrations before starting.
     pub async fn with_config(pool: PgPool, config: ShardingConfig) -> Result<Self, ClusterError> {
+        crate::storage::migrate(&pool).await?;
+
         let message_storage = Arc::new(
             SqlMessageStorage::with_max_retries(pool, config.storage_message_max_retries)
                 .with_batch_limit(config.storage_inbox_size as u32)
                 .with_last_read_guard_interval(config.last_read_guard_interval),
         );
-        message_storage.migrate().await?;
 
         let config = Arc::new(config);
         let runners = Arc::new(NoopRunners);

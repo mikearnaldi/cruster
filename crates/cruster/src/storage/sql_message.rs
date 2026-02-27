@@ -81,17 +81,6 @@ impl SqlMessageStorage {
         self
     }
 
-    /// Run database migrations.
-    pub async fn migrate(&self) -> Result<(), ClusterError> {
-        sqlx::migrate!()
-            .run(&self.pool)
-            .await
-            .map_err(|e| ClusterError::PersistenceError {
-                reason: format!("migration failed: {e}"),
-                source: Some(Box::new(e)),
-            })
-    }
-
     /// Save an envelope (request or fire-and-forget) to the database.
     /// Returns `SaveResult::Duplicate` if the request_id already exists.
     #[tracing::instrument(level = "debug", skip(self, envelope), fields(

@@ -1,4 +1,4 @@
-//! SQL-backed workflow engine using PostgreSQL via sqlx.
+//! SQL-backed workflow runtime engine using PostgreSQL via sqlx.
 //!
 //! Provides durable `sleep()` and `await_deferred()`/`resolve_deferred()` operations
 //! that survive entity restarts and runner crashes.
@@ -43,7 +43,7 @@ use crate::error::ClusterError;
 /// Poll interval for checking timer/deferred status in the database.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// PostgreSQL-backed workflow engine.
+/// PostgreSQL-backed workflow runtime engine.
 ///
 /// Provides durable implementations of `sleep()`, `await_deferred()`, and
 /// `resolve_deferred()` that persist to the database and survive restarts.
@@ -52,11 +52,11 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// ```text
 /// use sqlx::postgres::PgPool;
-/// use cruster::storage::sql_workflow_engine::SqlWorkflowEngine;
+/// use cruster::storage::sql_workflow_runtime::SqlWorkflowEngine;
 ///
 /// let pool = PgPool::connect("postgres://...").await?;
+/// cruster::storage::migrate(&pool).await?;
 /// let engine = SqlWorkflowEngine::new(pool);
-/// engine.migrate().await?;
 /// ```
 pub struct SqlWorkflowEngine {
     pool: PgPool,
@@ -70,10 +70,9 @@ pub struct SqlWorkflowEngine {
 }
 
 impl SqlWorkflowEngine {
-    /// Create a new SQL workflow engine with the given connection pool.
+    /// Create a new SQL workflow runtime engine with the given connection pool.
     ///
-    /// **Important:** You must call [`migrate()`](Self::migrate) before using this engine,
-    /// or ensure that migrations have already been run.
+    /// Run [`crate::storage::migrate`] before using SQL storage backends.
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -83,7 +82,7 @@ impl SqlWorkflowEngine {
         }
     }
 
-    /// Create a new SQL workflow engine with a custom poll interval.
+    /// Create a new SQL workflow runtime engine with a custom poll interval.
     ///
     /// The poll interval controls how often the engine checks the database
     /// for timer/deferred state changes. Lower values provide faster response
@@ -95,20 +94,6 @@ impl SqlWorkflowEngine {
             deferred_notifiers: DashMap::new(),
             timer_notifiers: DashMap::new(),
         }
-    }
-
-    /// Run database migrations to create the workflow engine tables.
-    ///
-    /// This runs all cluster migrations (shared with other SQL storage types).
-    /// It is safe to call multiple times - migrations are idempotent.
-    pub async fn migrate(&self) -> Result<(), ClusterError> {
-        sqlx::migrate!()
-            .run(&self.pool)
-            .await
-            .map_err(|e| ClusterError::PersistenceError {
-                reason: format!("workflow engine migration failed: {e}"),
-                source: Some(Box::new(e)),
-            })
     }
 
     /// Get or create a notifier for a deferred key.

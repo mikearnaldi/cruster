@@ -18,7 +18,7 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -29,7 +29,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: arduino/setup-protoc@v3
@@ -46,7 +46,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: arduino/setup-protoc@v3
@@ -63,7 +63,7 @@ jobs:
 
   docs:
     name: Docs
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: arduino/setup-protoc@v3
@@ -81,7 +81,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: arduino/setup-protoc@v3
@@ -103,37 +103,37 @@ jobs:
   e2e:
     name: E2E Tests
     needs: [fmt, clippy, test, docs, build]
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Download cluster-tests binary
         uses: actions/download-artifact@v4
         with:
           name: cluster-tests
           path: examples/cluster-tests
-      
+
       - name: Build Docker image
         working-directory: examples/cluster-tests
         run: |
           chmod +x cluster-tests
           docker build --target ci -t cluster-tests:latest .
-      
+
       - name: Start cluster
         working-directory: examples/cluster-tests
         run: docker compose up -d --no-build --wait
-      
+
       - name: Run E2E tests
         working-directory: examples/cluster-tests
         run: ./tests/e2e.sh
         env:
           CLUSTER_TESTS_URL: http://localhost:8080
-      
+
       - name: Show logs on failure
         if: failure()
         working-directory: examples/cluster-tests
         run: docker compose logs
-      
+
       - name: Cleanup
         if: always()
         working-directory: examples/cluster-tests
@@ -146,7 +146,7 @@ jobs:
       github.event_name == 'push' && 
       github.ref == 'refs/heads/main' &&
       !contains(github.event.head_commit.message, 'chore: prepare release')
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
@@ -155,17 +155,17 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-      
+
       - name: Install knope
         uses: knope-dev/action@v2.1.0
         with:
           version: 0.22.1
-      
+
       - name: Prepare release
         run: knope prepare-release --verbose || echo "No changes to release"
         env:
@@ -178,9 +178,9 @@ jobs:
       github.event_name == 'push' && 
       github.ref == 'refs/heads/main' &&
       contains(github.event.head_commit.message, 'chore: prepare release')
-    runs-on: namespace-profile-default
+    runs-on: ubuntu-latest
     permissions:
-      contents: write  # Required for creating releases and tags
+      contents: write # Required for creating releases and tags
     steps:
       - uses: actions/checkout@v4
       - uses: arduino/setup-protoc@v3
@@ -188,28 +188,28 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      
+
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
-      
+
       - name: Publish cruster-macros
         run: cargo publish -p cruster-macros --all-features
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      
+
       - name: Wait for crates.io indexing
         run: sleep 30
-      
+
       - name: Publish cruster
         run: cargo publish -p cruster --all-features
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      
+
       - name: Install knope
         uses: knope-dev/action@v2.1.0
         with:
           version: 0.22.1
-      
+
       - name: Create GitHub release and tag
         run: knope release
         env:

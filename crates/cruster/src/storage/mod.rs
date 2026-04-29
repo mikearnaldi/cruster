@@ -1,8 +1,6 @@
 pub mod noop_health;
 pub mod noop_runners;
 
-pub(crate) mod sql_migrations;
-
 pub mod sql_message;
 
 pub mod sql_workflow_journal;
@@ -41,7 +39,18 @@ impl<'a> Storage<'a> {
 
     /// Run all framework SQL migrations for cruster storage backends.
     pub async fn migrate(&self) -> Result<(), ClusterError> {
-        sql_migrations::run_cruster_migrations(self.pool, self.migrations_table).await
+        let mut migrator = sqlx::migrate!();
+        if let Some(migrations_table) = self.migrations_table {
+            migrator.dangerous_set_table_name(migrations_table.to_owned());
+        }
+
+        migrator
+            .run(self.pool)
+            .await
+            .map_err(|e| ClusterError::PersistenceError {
+                reason: format!("failed to run framework SQL migrations: {e}"),
+                source: Some(Box::new(e)),
+            })
     }
 }
 

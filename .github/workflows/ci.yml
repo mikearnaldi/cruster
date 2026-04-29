@@ -167,7 +167,7 @@ jobs:
           version: 0.22.1
 
       - name: Prepare release
-        run: knope prepare-release --verbose || echo "No changes to release"
+        run: knope prepare-release --verbose
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -13,7 +13,7 @@ versioned_files = [
 changelog = "CHANGELOG.md"
 
 [github]
-owner = "mikearnaldi"
+owner = "Effectful-Tech"
 repo = "cruster"
 
 # Workflow to prepare a release (creates/updates PR)

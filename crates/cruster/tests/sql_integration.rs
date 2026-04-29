@@ -117,7 +117,7 @@ async fn migrations_can_use_custom_tracking_table() {
     assert_eq!(custom_table.as_deref(), Some("_custom_cruster_migrations"));
 
     let default_table: Option<String> =
-        sqlx::query_scalar("SELECT to_regclass('public._cruster_migrations')::text")
+        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations')::text")
             .fetch_one(&pool)
             .await
             .expect("failed to check default migrations table");

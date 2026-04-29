@@ -15,7 +15,7 @@ use cruster::error::ClusterError;
 use cruster::sharding::Sharding;
 use cruster::singleton::{register_singleton, SingletonContext};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use std::sync::Arc;
 
 /// The name used for the singleton registration.
@@ -55,7 +55,7 @@ impl SingletonManager {
 
     /// Ensure the singleton state table exists.
     pub async fn init_schema(&self) -> Result<(), ClusterError> {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             r#"
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
                 id INTEGER PRIMARY KEY DEFAULT 1,
@@ -67,7 +67,7 @@ impl SingletonManager {
                 CONSTRAINT singleton_single_row CHECK (id = 1)
             )
             "#
-        ))
+        )))
         .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -76,12 +76,12 @@ impl SingletonManager {
         })?;
 
         // Add graceful_shutdown_at column if it doesn't exist (migration for existing tables)
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             r#"
             ALTER TABLE {TABLE_NAME} 
             ADD COLUMN IF NOT EXISTS graceful_shutdown_at TIMESTAMPTZ
             "#
-        ))
+        )))
         .execute(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -117,7 +117,7 @@ impl SingletonManager {
 
                 // Initialize or take over leadership (clear any previous graceful_shutdown_at)
                 let now = Utc::now();
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     r#"
                     INSERT INTO {TABLE_NAME} (id, runner_id, tick_count, last_tick_at, became_leader_at, graceful_shutdown_at)
                     VALUES (1, $1, 0, $2, $2, NULL)
@@ -127,7 +127,7 @@ impl SingletonManager {
                         last_tick_at = $2,
                         graceful_shutdown_at = NULL
                     "#
-                ))
+                )))
                 .bind(&runner_id)
                 .bind(now)
                 .execute(&pool)
@@ -147,13 +147,13 @@ impl SingletonManager {
                                 "SingletonTest singleton shutting down gracefully"
                             );
                             let now = Utc::now();
-                            if let Err(e) = sqlx::query(&format!(
+                            if let Err(e) = sqlx::query(AssertSqlSafe(format!(
                                 r#"
                                 UPDATE {TABLE_NAME}
                                 SET graceful_shutdown_at = $1
                                 WHERE id = 1
                                 "#
-                            ))
+                            )))
                             .bind(now)
                             .execute(&pool)
                             .await
@@ -170,7 +170,7 @@ impl SingletonManager {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                             let now = Utc::now();
                             // Use UPSERT to handle case where row was deleted by reset
-                            if let Err(e) = sqlx::query(&format!(
+                            if let Err(e) = sqlx::query(AssertSqlSafe(format!(
                                 r#"
                                 INSERT INTO {TABLE_NAME} (id, runner_id, tick_count, last_tick_at, became_leader_at, graceful_shutdown_at)
                                 VALUES (1, $1, 1, $2, $2, NULL)
@@ -178,7 +178,7 @@ impl SingletonManager {
                                     tick_count = {TABLE_NAME}.tick_count + 1,
                                     last_tick_at = $2
                                 "#
-                            ))
+                            )))
                             .bind(&runner_id)
                             .bind(now)
                             .execute(&pool)
@@ -211,13 +211,13 @@ impl SingletonManager {
                 DateTime<Utc>,
                 Option<DateTime<Utc>>,
             ),
-        >(&format!(
+        >(AssertSqlSafe(format!(
             r#"
             SELECT runner_id, tick_count, last_tick_at, became_leader_at, graceful_shutdown_at
             FROM {TABLE_NAME}
             WHERE id = 1
             "#
-        ))
+        )))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -258,13 +258,15 @@ impl SingletonManager {
 
     /// Reset the singleton state (for testing).
     pub async fn reset(&self) -> Result<(), ClusterError> {
-        sqlx::query(&format!("DELETE FROM {TABLE_NAME} WHERE id = 1"))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| ClusterError::PersistenceError {
-                reason: format!("failed to reset singleton state: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+        sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM {TABLE_NAME} WHERE id = 1"
+        )))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ClusterError::PersistenceError {
+            reason: format!("failed to reset singleton state: {e}"),
+            source: Some(Box::new(e)),
+        })?;
 
         Ok(())
     }

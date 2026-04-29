@@ -567,6 +567,19 @@ The generated typed clients provide ergonomic methods. The underlying `EntityCli
 
 ## Production Deployment
 
+### Single-Node Runner
+
+```rust
+use cruster::single_runner::SingleRunner;
+
+let runner = SingleRunner::builder(pool.clone())
+    .migrations_table("_custom_cruster_migrations")
+    .build()
+    .await?;
+
+let counter = runner.register(Counter { pool: pool.clone() }).await?;
+```
+
 ### Cluster Setup
 
 ```rust
@@ -581,8 +594,12 @@ use cruster::transport::grpc::{GrpcRunnerHealth, GrpcRunnerServer, GrpcRunners};
 
 // 1. Storage backends
 let pool = PgPoolOptions::new().max_connections(10).connect(&postgres_url).await?;
+cruster::storage::Storage::builder(&pool)
+    .migrations_table("_custom_cruster_migrations")
+    .migrate()
+    .await?;
+
 let message_storage = Arc::new(SqlMessageStorage::new(pool.clone()));
-message_storage.migrate().await?;
 let state_storage = Arc::new(SqlWorkflowStorage::new(pool.clone()));
 let workflow_engine = Arc::new(SqlWorkflowEngine::new(pool.clone()));
 

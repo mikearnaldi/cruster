@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use sqlx::migrate::Migrator;
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use crate::error::ClusterError;
 
@@ -29,13 +29,17 @@ struct RunSummary {
     applied_now: usize,
 }
 
-pub(crate) async fn run_cruster_migrations(pool: &PgPool) -> Result<(), ClusterError> {
+pub(crate) async fn run_cruster_migrations(
+    pool: &PgPool,
+    migrations_table: Option<&str>,
+) -> Result<(), ClusterError> {
+    let migrations_table = migrations_table.unwrap_or(CRUSTER_MIGRATIONS_TABLE);
     let status = run_sqlx_migrations_with_table(
         pool,
         &sqlx::migrate!(),
         PostgresMigrationOptions {
             chain: CRUSTER_MIGRATION_CHAIN,
-            tracking_table: CRUSTER_MIGRATIONS_TABLE,
+            tracking_table: migrations_table,
             advisory_lock: true,
         },
     )
@@ -118,7 +122,7 @@ async fn run_locked(
             installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )"#,
     );
-    sqlx::query(&create_table)
+    sqlx::query(AssertSqlSafe(create_table))
         .execute(pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -128,7 +132,7 @@ async fn run_locked(
 
     let applied_query =
         format!(r#"SELECT version, checksum FROM {tracking_table} ORDER BY version"#,);
-    let applied_rows = sqlx::query(&applied_query)
+    let applied_rows = sqlx::query(AssertSqlSafe(applied_query))
         .fetch_all(pool)
         .await
         .map_err(|e| ClusterError::PersistenceError {
@@ -175,18 +179,19 @@ async fn run_locked(
             })?;
 
         for stmt in split_sql_statements(migration.sql.as_ref()) {
-            sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
-                ClusterError::PersistenceError {
+            sqlx::query(AssertSqlSafe(stmt))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ClusterError::PersistenceError {
                     reason: format!("failed to execute migration {version}: {e}"),
                     source: Some(Box::new(e)),
-                }
-            })?;
+                })?;
         }
 
         let insert = format!(
             r#"INSERT INTO {tracking_table} (version, description, checksum) VALUES ($1, $2, $3)"#,
         );
-        sqlx::query(&insert)
+        sqlx::query(AssertSqlSafe(insert))
             .bind(version)
             .bind(migration.description.as_ref())
             .bind(migration.checksum.as_ref())

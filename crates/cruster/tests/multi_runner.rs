@@ -108,7 +108,8 @@ async fn setup_postgres() -> (ContainerAsync<Postgres>, sqlx::PgPool) {
         .expect("failed to connect to postgres");
 
     // Run migrations once
-    cruster::storage::migrate(&pool)
+    cruster::storage::Storage::builder(&pool)
+        .migrate()
         .await
         .expect("migration failed");
 

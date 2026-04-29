@@ -58,7 +58,7 @@ parking_lot = "0.12"
 chrono = { workspace = true }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "chrono"] }
+sqlx = { version = "0.9.0-alpha.1", features = ["runtime-tokio", "postgres", "tls-rustls", "migrate", "chrono"] }
 
 # Metrics
 prometheus = { workspace = true }

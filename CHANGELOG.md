@@ -1,3 +1,15 @@
+## 0.0.27 (2026-04-29)
+
+### Fixes
+
+#### refactor: rely on sqlx migration tracking
+
+Removes the custom migration tracking implementation, uses sqlx's migrator directly for framework migrations, and fixes release PR creation to target the correct GitHub repository.
+
+#### breaking: upgrade sqlx and move single runner construction to a builder
+
+Upgrades `sqlx` to `0.9.0-alpha.1`, adds configurable migration tracking tables through the storage and single-runner builders, and removes the old `SingleRunner::new` and `SingleRunner::with_config` constructors.
+
 ## 0.0.26 (2026-02-27)
 
 ### Fixes

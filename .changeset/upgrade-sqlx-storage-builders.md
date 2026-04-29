@@ -1,5 +1,5 @@
 ---
-default: major
+default: minor
 ---
 
 breaking: upgrade sqlx and move single runner construction to a builder

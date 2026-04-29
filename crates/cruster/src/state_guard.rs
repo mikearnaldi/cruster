@@ -101,13 +101,13 @@ impl<'c> sqlx::Executor<'c> for &'c ActivityTx {
         })
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: sqlx::SqlStr,
         parameters: &'e [<sqlx::Postgres as sqlx::Database>::TypeInfo],
     ) -> futures::future::BoxFuture<
         'e,
-        Result<<sqlx::Postgres as sqlx::Database>::Statement<'q>, sqlx::Error>,
+        Result<<sqlx::Postgres as sqlx::Database>::Statement, sqlx::Error>,
     >
     where
         'c: 'e,
@@ -118,9 +118,9 @@ impl<'c> sqlx::Executor<'c> for &'c ActivityTx {
         })
     }
 
-    fn describe<'e, 'q: 'e>(
+    fn describe<'e>(
         self,
-        sql: &'q str,
+        sql: sqlx::SqlStr,
     ) -> futures::future::BoxFuture<'e, Result<sqlx::Describe<sqlx::Postgres>, sqlx::Error>>
     where
         'c: 'e,
@@ -323,9 +323,9 @@ pub struct SqlTransactionHandle {
 
 impl SqlTransactionHandle {
     /// Execute a SQL query within the transaction.
-    pub async fn execute<'q>(
+    pub async fn execute(
         &self,
-        query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+        query: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
     ) -> Result<sqlx::postgres::PgQueryResult, ClusterError> {
         let mut guard = self.transaction.lock().await;
         let tx = guard

@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! let pool = PgPool::connect("postgres://localhost/cluster").await?;
-//! let runner = SingleRunner::new(pool).await?;
+//! let runner = SingleRunner::builder(pool).build().await?;
 //! let client = runner.register(MyEntity).await?;
 //! let response: String = client.send(&EntityId::new("e-1"), "greet", &"hello").await?;
 //! runner.shutdown().await?;
@@ -40,27 +40,53 @@ pub struct SingleRunner {
     config: Arc<ShardingConfig>,
 }
 
-impl SingleRunner {
-    /// Create a single-node durable cluster with default configuration.
-    ///
-    /// Runs database migrations before starting.
-    pub async fn new(pool: PgPool) -> Result<Self, ClusterError> {
-        Self::with_config(pool, ShardingConfig::default()).await
+/// Builder for configuring a single-node durable cluster.
+pub struct SingleRunnerBuilder {
+    pool: PgPool,
+    config: ShardingConfig,
+    migrations_table: Option<String>,
+}
+
+impl SingleRunnerBuilder {
+    /// Create a builder using default configuration.
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            config: ShardingConfig::default(),
+            migrations_table: None,
+        }
     }
 
-    /// Create a single-node durable cluster with custom configuration.
-    ///
-    /// Runs database migrations before starting.
-    pub async fn with_config(pool: PgPool, config: ShardingConfig) -> Result<Self, ClusterError> {
-        crate::storage::migrate(&pool).await?;
+    /// Use a custom sharding configuration.
+    pub fn config(mut self, config: ShardingConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Use a custom table to track applied framework migrations.
+    pub fn migrations_table(mut self, migrations_table: impl Into<String>) -> Self {
+        self.migrations_table = Some(migrations_table.into());
+        self
+    }
+
+    /// Create the single-node durable cluster.
+    pub async fn build(self) -> Result<SingleRunner, ClusterError> {
+        {
+            let storage = crate::storage::Storage::builder(&self.pool);
+            if let Some(migrations_table) = self.migrations_table.as_deref() {
+                storage.migrations_table(migrations_table).migrate().await?;
+            } else {
+                storage.migrate().await?;
+            }
+        }
 
         let message_storage = Arc::new(
-            SqlMessageStorage::with_max_retries(pool, config.storage_message_max_retries)
-                .with_batch_limit(config.storage_inbox_size as u32)
-                .with_last_read_guard_interval(config.last_read_guard_interval),
+            SqlMessageStorage::with_max_retries(self.pool, self.config.storage_message_max_retries)
+                .with_batch_limit(self.config.storage_inbox_size as u32)
+                .with_last_read_guard_interval(self.config.last_read_guard_interval),
         );
 
-        let config = Arc::new(config);
+        let config = Arc::new(self.config);
         let runners = Arc::new(NoopRunners);
         let metrics = Arc::new(ClusterMetrics::unregistered());
         let sharding = ShardingImpl::new(
@@ -73,7 +99,14 @@ impl SingleRunner {
         )?;
         sharding.acquire_all_shards().await;
 
-        Ok(Self { sharding, config })
+        Ok(SingleRunner { sharding, config })
+    }
+}
+
+impl SingleRunner {
+    /// Start configuring a single-node durable cluster.
+    pub fn builder(pool: PgPool) -> SingleRunnerBuilder {
+        SingleRunnerBuilder::new(pool)
     }
 
     /// Register an entity and return a client for it.

@@ -53,7 +53,8 @@ async fn setup_postgres() -> (testcontainers::ContainerAsync<Postgres>, sqlx::Pg
         .expect("failed to connect to postgres");
 
     // Run migrations once for all SQL backends.
-    cruster::storage::migrate(&pool)
+    cruster::storage::Storage::builder(&pool)
+        .migrate()
         .await
         .expect("migration failed");
 
@@ -82,6 +83,45 @@ fn test_envelope(request_id: i64, entity_id: &str) -> EnvelopeRequest {
         uninterruptible: Default::default(),
         deliver_at: None,
     }
+}
+
+#[tokio::test]
+async fn migrations_can_use_custom_tracking_table() {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start postgres container");
+
+    let host = container.get_host().await.expect("failed to get host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get port");
+
+    let url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("failed to connect to postgres");
+
+    cruster::storage::Storage::builder(&pool)
+        .migrations_table("_custom_cruster_migrations")
+        .migrate()
+        .await
+        .expect("migration failed");
+
+    let custom_table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public._custom_cruster_migrations')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("failed to check custom migrations table");
+    assert_eq!(custom_table.as_deref(), Some("_custom_cruster_migrations"));
+
+    let default_table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public._cruster_migrations')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("failed to check default migrations table");
+    assert_eq!(default_table, None);
 }
 
 // ============================================================================

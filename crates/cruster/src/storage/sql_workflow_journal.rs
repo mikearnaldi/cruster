@@ -348,9 +348,9 @@ impl SqlJournalTransaction {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn execute<'q>(
+    pub async fn execute(
         &self,
-        query: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+        query: sqlx::query::Query<'_, Postgres, sqlx::postgres::PgArguments>,
     ) -> Result<PgQueryResult, ClusterError> {
         let mut guard = self.tx.lock().await;
         let tx = guard
